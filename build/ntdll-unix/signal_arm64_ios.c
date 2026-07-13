@@ -1587,6 +1587,29 @@ static void *ios_mach_exception_thread( void *arg )
                                 (unsigned long long)stk[4], (unsigned long long)stk[5],
                                 (unsigned long long)stk[6], (unsigned long long)stk[7]);
                         }
+                        /* task #34: reverse_translate returns 0 for a TOMBSTONED
+                         * pool copy (owner cleared on unload/reclaim). That's the
+                         * jsproxy-wall signature — the child pseudo-proc executing
+                         * a pool copy its parent created and that's since been
+                         * tombstoned. Name the owner directly so the parent/child
+                         * ownership bug is unambiguous. */
+                        if (!pe)
+                        {
+                            extern void *ios_jit_rx_base_global;
+                            extern size_t ios_jit_pool_size_global;
+                            extern void *ios_jit_pool_copy_owner(const void *addr, void **pe_base_out);
+                            uint64_t rx = (uint64_t)(uintptr_t)ios_jit_rx_base_global;
+                            if (rx && state_rip_q >= rx && state_rip_q < rx + ios_jit_pool_size_global)
+                            {
+                                void *tpe = NULL;
+                                void *towner = ios_jit_pool_copy_owner( (void *)(uintptr_t)state_rip_q, &tpe );
+                                dprintf(STDERR_FILENO,
+                                    "[rip-tomb] guest RIP 0x%llx in POOL (off 0x%llx) but NO live mapping — copy_owner=%p pe=%p (tombstoned/foreign pool copy; cross-ref [jit-pool] image name)\n",
+                                    (unsigned long long)state_rip_q,
+                                    (unsigned long long)(state_rip_q - rx),
+                                    towner, tpe);
+                            }
+                        }
                     }
                 }
                 if (cnt <= 5 || (cnt % 100) == 0 || terminal_pc)

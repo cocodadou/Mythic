@@ -119,28 +119,54 @@ enum StikJITHelper {
 
         // Ask debugger to allocate RX pages (x0=0 triggers _M allocation).
         // With pin chunks claimed, this should land at a higher address.
-        guard let rxPtr = jit26_prepare_region(nil, poolSize), rxPtr != UnsafeMutableRawPointer(bitPattern: 0) else {
-            LogStore.shared.log("Debugger failed to allocate RX memory", level: .error)
-            return nil
+        //
+        // Two placement constraints (violating either bricks the session):
+        // - LOW BOUND: FEX has a position-dependent emit bug below
+        //   0x119000000 (mode A: dispatcher branches to zero memory before
+        //   block 0 runs; higher-address mode B is runtime-patched in
+        //   signal_arm64_ios.c init_syscall_frame).
+        // - GUEST WINDOW (ml78, 2026-07-13): with the 896MB pool the kernel
+        //   often places the region at 0x7000000000 — inside the guest
+        //   x86-64 64GB window [0x70,0x80)G where Wine packs PE images and
+        //   the fault handlers classify PCs as guest addresses. Executing
+        //   pool code there hangs the first pool call silently (black
+        //   screen / wallpaper-only desktop).
+        // Reject bad placements and re-roll: a bad region is freed when the
+        // kernel allows, otherwise kept alive as a pin — either way the next
+        // jit26 pick must land elsewhere.
+        let goodLow = 0x119000000
+        let guestLo = 0x7000000000
+        let guestHi = 0x8000000000
+        var rxPtrOpt: UnsafeMutableRawPointer? = nil
+        for attempt in 0..<3 {
+            guard let p = jit26_prepare_region(nil, poolSize), p != UnsafeMutableRawPointer(bitPattern: 0) else {
+                LogStore.shared.log("Debugger failed to allocate RX memory (attempt \(attempt))", level: .error)
+                break
+            }
+            let a = Int(bitPattern: p)
+            let inGuestWindow = a + poolSize > guestLo && a < guestHi
+            if a >= goodLow && !inGuestWindow {
+                rxPtrOpt = p
+                break
+            }
+            LogStore.shared.log(String(format: "BAD POOL placement 0x%lx (%@) — re-rolling (attempt %d)",
+                                       a, a < goodLow ? "mode A low" : "guest 64G window",
+                                       attempt), level: .error)
+            let dkr = vm_deallocate(mach_task_self_, vm_address_t(a), vm_size_t(poolSize))
+            LogStore.shared.log(dkr == KERN_SUCCESS
+                ? "  bad region freed"
+                : "  bad region kept as pin (vm_deallocate kr=\(dkr))")
         }
-
-        let rxAddr = Int(bitPattern: rxPtr)
-        LogStore.shared.log("RX pool at \(String(format: "%p", rxAddr))")
-        // FEX has a position-dependent emit bug at low pool addresses (mode A:
-        // dispatcher branches to zero memory before block 0 ever runs). The
-        // signal_arm64_ios.c init_syscall_frame applies a runtime patch that
-        // fixes the higher-address mode B (SpillStaticRegs literal-pool
-        // corruption), so any pool ≥ 0x119000000 should now work. Below that,
-        // fast-fail to save Wine-init time.
-        let goodLow: Int = 0x119000000
-        if rxAddr < goodLow {
-            LogStore.shared.log("BAD POOL (mode A): 0x\(String(rxAddr, radix: 16)) < 0x\(String(goodLow, radix: 16)). Killing in 10s — please relaunch.", level: .error)
+        guard let rxPtr = rxPtrOpt else {
+            LogStore.shared.log("BAD POOL: no valid placement after retries. Killing in 10s — please relaunch.", level: .error)
             DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 10) {
                 LogStore.shared.log("BAD POOL — exiting now. Relaunch the app.", level: .error)
                 exit(0)
             }
             return nil
         }
+        let rxAddr = Int(bitPattern: rxPtr)
+        LogStore.shared.log("RX pool at \(String(format: "%p", rxAddr))")
 
         // Create RW mapping via vm_remap
         var rwAddr: vm_address_t = 0

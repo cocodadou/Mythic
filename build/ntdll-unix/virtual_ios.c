@@ -3603,6 +3603,225 @@ static NTSTATUS get_vprot_flags( DWORD protect, unsigned int *vprot, BOOL image 
 }
 
 
+/* task #34 [jit-name]: read a mapped PE's own name from its export directory
+ * (Name field), so the pool-copy log lines name the DLL instead of a bare
+ * base address — needed to identify which module a pseudo-proc wrongly
+ * executes across a self-relaunch. Bounds-checked against image_size; returns
+ * "?" on any malformed/absent header. `image_base` must be the READABLE
+ * mapped PE (RVA==offset). Not thread-safe on the returned pointer's contents,
+ * but names live in the image's read-only .rdata so they're stable. */
+const char *ios_pe_module_name( const void *image_base, size_t image_size )
+{
+    const unsigned char *b = image_base;
+    uint32_t lfanew, exp_rva, name_rva;
+    const unsigned char *pe;
+
+    if (!b || image_size < 0x100) return "?";
+    if (b[0] != 'M' || b[1] != 'Z') return "?";
+    lfanew = *(const uint32_t *)(b + 0x3c);
+    if ((size_t)lfanew + 0x90 > image_size) return "?";
+    pe = b + lfanew;
+    if (pe[0] != 'P' || pe[1] != 'E') return "?";
+    if (*(const uint16_t *)(pe + 0x18) != 0x20b) return "?";   /* PE32+ only */
+    exp_rva = *(const uint32_t *)(pe + 0x88);                  /* DataDir[0] Export VA */
+    if (!exp_rva || (size_t)exp_rva + 0x10 > image_size) return "?";
+    name_rva = *(const uint32_t *)(b + exp_rva + 0x0c);        /* IMAGE_EXPORT_DIRECTORY.Name */
+    if (!name_rva || (size_t)name_rva + 1 > image_size) return "?";
+    /* Ensure NUL within the image so the %s can't run off the mapping. */
+    {
+        size_t i, cap = image_size - name_rva;
+        if (cap > 64) cap = 64;
+        for (i = 0; i < cap; i++) if (b[name_rva + i] == 0) return (const char *)(b + name_rva);
+        return "?";
+    }
+}
+
+
+/* task #34 .text sharing: pre-scan a SOURCE PE (before the pool memcpy) for
+ * the x18 trampoline budget, so the trampoline region can be folded into the
+ * image's own pool allocation at a FIXED image-relative offset. Fixed-offset
+ * tramps make the patched .text and the trampolines byte-identical across
+ * pool copies of the same DLL (both branch directions are PC-relative), which
+ * is the precondition for page-sharing copies. Returns the page-aligned tramp
+ * bytes to reserve, or 0 when the x18 patcher will skip this image (pure
+ * x86_64: Machine!=ARM64 and no .a64xrm section — mirrors the skip logic in
+ * the patch stage; scanning x64 bytes would count garbage matches). */
+static size_t ios_x18_tramp_prealloc_scan( const char *image, size_t image_size )
+{
+    extern size_t ios_jit_x18_tramp_need( const char *text, size_t text_size );
+    const size_t pg = 0x4000;
+    unsigned int pe_off;
+    unsigned short machine, num_sec, opt_sz;
+    const char *sec;
+    size_t text_off = 0, text_sz = 0;
+    int s, is_arm64ec = 0;
+
+    if (!image || image_size < 0x400) return 0;
+    if (image[0] != 'M' || image[1] != 'Z') return 0;
+    pe_off = *(const unsigned int *)(image + 0x3C);
+    if ((size_t)pe_off + 0x18 > image_size) return 0;
+    machine = *(const unsigned short *)(image + pe_off + 4);
+    num_sec = *(const unsigned short *)(image + pe_off + 6);
+    opt_sz  = *(const unsigned short *)(image + pe_off + 0x14);
+    sec = image + pe_off + 0x18 + opt_sz;
+    if ((size_t)(sec - image) + (size_t)num_sec * 40 > image_size) return 0;
+    for (s = 0; s < num_sec; s++, sec += 40)
+    {
+        unsigned int chars = *(const unsigned int *)(sec + 36);
+        unsigned int rva   = *(const unsigned int *)(sec + 12);
+        unsigned int vsz   = *(const unsigned int *)(sec + 8);
+        if (!memcmp(sec, ".a64xrm", 7)) is_arm64ec = 1;
+        /* Largest exec section = the .text the patcher walks (same rule as
+         * ios_jit_set_text_section). */
+        if ((chars & 0x20000000) && vsz > text_sz) { text_off = rva; text_sz = vsz; }
+    }
+    if (machine != IMAGE_FILE_MACHINE_ARM64 && !is_arm64ec) return 0;
+    if (!text_sz || text_off + text_sz > image_size) return 0;
+    return (ios_jit_x18_tramp_need(image + text_off, text_sz) + pg - 1) & ~(pg - 1);
+}
+
+
+/* task #34 [share-probe] — one-shot go/no-go for one-RX-copy-per-DLL page
+ * sharing: does the StikDebug execute blessing survive vm_remap(copy=FALSE)
+ * of a blessed pool RX page to a SECOND in-pool VA, and does the dual-map
+ * stay coherent through the share? Log-only; leaks 2×16KB pool slots (kept
+ * mapped so the remapped pages are never recycled under someone else). */
+static void ios_share_probe(void)
+{
+    extern void *ios_jit_rw_base_global;
+    extern void *ios_jit_rx_base_global;
+    extern size_t ios_jit_pool_size_global;
+    typedef int (*probe_fn)(void);
+    const size_t pg = 0x4000;
+    size_t off1, off2;
+    char *rx1, *rw1, *rx2, *rw2;
+    vm_prot_t cur = 0, max = 0;
+    kern_return_t kr;
+    int r;
+
+    if (!ios_jit_rx_base_global || !ios_jit_rw_base_global) return;
+    dprintf(2, "[share-probe] start (rx_base=%p rw_base=%p)\n",
+            ios_jit_rx_base_global, ios_jit_rw_base_global);
+    off1 = ios_pool_alloc_range(pg, ios_jit_pool_size_global - ios_jit_tail_reserved);
+    off2 = ios_pool_alloc_range(pg, ios_jit_pool_size_global - ios_jit_tail_reserved);
+    if (off1 == (size_t)-1 || off2 == (size_t)-1)
+    {
+        dprintf(2, "[share-probe] pool alloc failed — probe skipped\n");
+        return;
+    }
+    rx1 = (char *)ios_jit_rx_base_global + off1;
+    rw1 = (char *)ios_jit_rw_base_global + off1;
+    rx2 = (char *)ios_jit_rx_base_global + off2;
+    rw2 = (char *)ios_jit_rw_base_global + off2;
+    dprintf(2, "[share-probe] slots off1=0x%lx off2=0x%lx — writing code via master RW\n",
+            (unsigned long)off1, (unsigned long)off2);
+
+    ((uint32_t *)rw1)[0] = 0x52800540;  /* mov w0, #42 */
+    ((uint32_t *)rw1)[1] = 0xD65F03C0;  /* ret */
+    __asm__ __volatile__("dsb sy" ::: "memory");
+    sys_icache_invalidate(rx1, pg);
+    /* Read back through the RX alias BEFORE executing — a mismatch means
+     * the dual-map is broken for this placement and executing would run
+     * garbage (ml78: silent hang was the first pool execution at a toxic
+     * pool base; never execute blind). */
+    if (*(volatile uint32_t *)rx1 != 0x52800540)
+    {
+        dprintf(2, "[share-probe] ABORT: RX readback 0x%08x != written code (dual-map broken here)\n",
+                *(volatile uint32_t *)rx1);
+        return;
+    }
+    dprintf(2, "[share-probe] readback OK — executing at master %p\n", rx1);
+    r = ((probe_fn)rx1)();
+    dprintf(2, "[share-probe] exec at master %p -> %d (expect 42)\n", rx1, r);
+
+    /* ml77: OVERWRITE-remap into the pool RX region fails kr=2 — the
+     * jit26_prepare_region entry refuses replacement. Two viable mechanisms:
+     * A) punch a hole (deallocate the target slot) then remap FIXED without
+     *    OVERWRITE — keeps all existing rw-alias offset math if it works;
+     * B) remap ANYWHERE outside the pool (the anon-RWX path FEX CodeBuffers
+     *    use daily) — fallback design, mapping entries then carry their own
+     *    rw base. Probe BOTH for full data. */
+    {
+        vm_address_t target = (vm_address_t)rx2;
+        kr = mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)rx2, pg);
+        dprintf(2, "[share-probe] A: deallocate pool hole %p kr=%d\n", rx2, kr);
+        if (kr == KERN_SUCCESS)
+        {
+            kr = vm_remap(mach_task_self(), &target, pg, 0, VM_FLAGS_FIXED,
+                          mach_task_self(), (vm_address_t)rx1, FALSE,
+                          &cur, &max, VM_INHERIT_DEFAULT);
+            dprintf(2, "[share-probe] A: vm_remap RX %p -> %p (into hole) kr=%d cur=0x%x max=0x%x\n",
+                    rx1, rx2, kr, cur, max);
+        }
+        if (kr != KERN_SUCCESS)
+        {
+            /* If A's deallocate succeeded but the remap didn't, rx2 is now an
+             * unmapped hole in the pool — harmless only because both probe
+             * slots are ledgered under the early-boot NULL peb, which no
+             * process-exit reclaim ever matches, so the allocator never hands
+             * this offset out again. */
+            /* Variant B: kernel-picked VA outside the pool. */
+            vm_address_t anyv = 0;
+            kern_return_t kb = vm_remap(mach_task_self(), &anyv, pg, 0,
+                                        VM_FLAGS_ANYWHERE, mach_task_self(),
+                                        (vm_address_t)rx1, FALSE, &cur, &max,
+                                        VM_INHERIT_DEFAULT);
+            dprintf(2, "[share-probe] B: vm_remap RX %p -> ANYWHERE %p kr=%d cur=0x%x max=0x%x\n",
+                    rx1, (void *)anyv, kb, cur, max);
+            if (kb != KERN_SUCCESS)
+            {
+                dprintf(2, "[share-probe] VERDICT: NO-GO (both A and B remaps failed)\n");
+                return;
+            }
+            rx2 = (char *)anyv;  /* continue the exec + dual-map test at the B alias */
+        }
+    }
+    kr = vm_protect(mach_task_self(), (vm_address_t)rx2, pg, FALSE,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    dprintf(2, "[share-probe] vm_protect(alias, RX) kr=%d\n", kr);
+    {
+        mach_vm_address_t qa = (mach_vm_address_t)(uintptr_t)rx2;
+        mach_vm_size_t qs = 0;
+        vm_region_basic_info_data_64_t qi = {0};
+        mach_msg_type_number_t qc = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t qo = MACH_PORT_NULL;
+        if (mach_vm_region(mach_task_self(), &qa, &qs, VM_REGION_BASIC_INFO_64,
+                           (vm_region_info_t)&qi, &qc, &qo) != KERN_SUCCESS ||
+            (char *)(uintptr_t)qa > rx2 || !(qi.protection & VM_PROT_EXECUTE))
+        {
+            dprintf(2, "[share-probe] VERDICT: NO-GO (alias lacks EXEC: prot=0x%x max=0x%x)\n",
+                    qi.protection, qi.max_protection);
+            return;
+        }
+        dprintf(2, "[share-probe] alias region prot=0x%x max_prot=0x%x — executing\n",
+                qi.protection, qi.max_protection);
+    }
+    sys_icache_invalidate(rx2, pg);
+    r = ((probe_fn)rx2)();
+    dprintf(2, "[share-probe] exec at ALIAS %p -> %d (expect 42)%s\n",
+            rx2, r, r == 42 ? " OK" : " WRONG");
+    if (r != 42) { dprintf(2, "[share-probe] VERDICT: NO-GO (alias executed wrong bytes)\n"); return; }
+
+    /* Dual-map through the share: remap the RW alias too, rewrite via the
+     * MASTER's RW view, and re-execute at the alias — proves one physical
+     * page serves master-RW writes and alias-RX fetches (the invariant the
+     * sharing design keeps). */
+    {
+        vm_address_t target = (vm_address_t)rw2;
+        kr = vm_remap(mach_task_self(), &target, pg, 0,
+                      VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+                      (vm_address_t)rw1, FALSE, &cur, &max, VM_INHERIT_DEFAULT);
+        dprintf(2, "[share-probe] vm_remap RW %p -> %p kr=%d\n", rw1, rw2, kr);
+    }
+    ((uint32_t *)rw1)[0] = 0x52800560;  /* mov w0, #43 */
+    __asm__ __volatile__("dsb sy" ::: "memory");
+    sys_icache_invalidate(rx2, pg);
+    r = ((probe_fn)rx2)();
+    dprintf(2, "[share-probe] rewrite-via-master, exec at alias -> %d (expect 43) — VERDICT: %s\n",
+            r, r == 43 ? "GO" : "NO-GO (dual-map incoherent through share)");
+}
+
+
 /***********************************************************************
  *           mprotect_exec
  *
@@ -3918,9 +4137,18 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 return 0;
             }
 
-            /* Align to 16KB page boundary */
+            /* Align to 16KB page boundary.
+             * task #34 .text sharing: fold the x18 trampoline region into
+             * the image's own allocation at a FIXED image-relative offset
+             * (right after the aligned image). Every copy of the same DLL
+             * then patches identical PC-relative branches → patched .text
+             * and tramps are byte-identical across copies (precondition for
+             * page sharing). Also kills the 80MB-anchor dance: worst-case
+             * text→tramp distance is now ≤ image size, far under ±128MB. */
             size_t page_size = 0x4000;
-            size_t alloc_size = (image_size + page_size - 1) & ~(page_size - 1);
+            size_t image_alloc = (image_size + page_size - 1) & ~(page_size - 1);
+            size_t tramp_prealloc = ios_x18_tramp_prealloc_scan(image_base, image_size);
+            size_t alloc_size = image_alloc + tramp_prealloc;
             size_t offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
 
             if (offset == (size_t)-1)
@@ -3952,9 +4180,24 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 image_base, (unsigned long)image_size, (char *)jit_rx_base + offset,
                 (unsigned long)offset,
                 (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size);
-            dprintf(2, "[jit-pool] image %p+0x%lx → pool %p used=0x%lx/0x%lx\n",
-                    image_base, (unsigned long)image_size, (char *)jit_rx_base + offset,
-                    (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size);
+            dprintf(2, "[jit-pool] image %p+0x%lx (%s) → pool %p used=0x%lx/0x%lx tramp+0x%lx\n",
+                    image_base, (unsigned long)image_size,
+                    ios_pe_module_name( image_base, image_size ), (char *)jit_rx_base + offset,
+                    (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size,
+                    (unsigned long)tramp_prealloc);
+
+            /* task #34 [share-probe]: DEFAULT-OFF (set MYTHIC_SHARE_PROBE=1).
+             * ml79 VERDICT recorded — executing at a vm_remap'd alias of a
+             * blessed pool page WEDGES the calling thread (StikDebug exec
+             * blessing does not transfer to a remapped VA), which black-
+             * screens the desktop when it runs on explorer's boot thread.
+             * Kept gated for future mechanism experiments, never on the
+             * boot path by default. */
+            {
+                static int ios_share_probed;
+                if (!ios_share_probed && getenv("MYTHIC_SHARE_PROBE"))
+                { ios_share_probed = 1; ios_share_probe(); }
+            }
 
             /* Mark the JIT-pool range as ARM64EC code in the EcCodeBitMap —
              * but ONLY for ARM64EC hybrid PEs. ARM64EC binaries have
@@ -4297,12 +4540,21 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         extern size_t ios_jit_x18_tramp_need( const char *text, size_t text_size );
                         size_t tramp_budget = ios_jit_x18_tramp_need((char *)jit_rw_base + offset + text_off, text_sz);
                         size_t tramp_alloc = (tramp_budget + page_size - 1) & ~(page_size - 1);
-                        /* Anchored within B/BL imm26 reach of the image (root
-                         * cause of the Steam run 7-11 crash family: tramps
-                         * 230MB from .text → silently truncated branches). */
-                        size_t tramp_pool_off = ios_pool_alloc_range_ex(tramp_alloc,
-                                jit_pool_size - ios_jit_tail_reserved,
-                                offset, 0x5000000 /* 80MB; text ≤32MB keeps worst case <128MB */);
+                        /* task #34: fixed image-relative offset — the region
+                         * pre-reserved in this image's own allocation. The
+                         * pre-scan ran on the SOURCE image (identical bytes),
+                         * so the budgets must agree; a mismatch means the
+                         * copy diverged from the source and patching it
+                         * would emit copy-specific branches — refuse (x18
+                         * insns degrade to recoverable runtime faults). */
+                        size_t tramp_pool_off = offset + image_alloc;
+                        if (tramp_alloc > tramp_prealloc)
+                        {
+                            dprintf(2, "[x18-tramp] REFUSED: budget 0x%lx > prealloc 0x%lx (source/copy divergence?)\n",
+                                    (unsigned long)tramp_alloc, (unsigned long)tramp_prealloc);
+                            tramp_pool_off = (size_t)-1;
+                        }
+                        if (!tramp_alloc) tramp_pool_off = (size_t)-1;  /* no x18 refs — nothing to patch */
 
                         if (tramp_pool_off != (size_t)-1)
                         {
@@ -4444,6 +4696,7 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
     const size_t pg = 0x4000;
     struct ios_jit_mapping *m = NULL;
     size_t alloc_size, offset;
+    size_t child_tramp_prealloc = 0;
     char *rw_dest, *rx_dest, *src;
     uint64_t pe_image_base;
     intptr_t child_delta;
@@ -4479,6 +4732,17 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
     }
 
     alloc_size = (m->size + pg - 1) & ~(pg - 1);
+    /* task #34: reserve the x18 trampoline region inside this allocation at
+     * a fixed image-relative offset (mirrors the parent path — see the
+     * mprotect_exec copy pipeline). Budget from the SOURCE bytes; identical
+     * to what the post-memcpy scan would compute. */
+    {
+        extern size_t ios_jit_x18_tramp_need( const char *text, size_t text_size );
+        child_tramp_prealloc = m->text_size
+            ? ((ios_jit_x18_tramp_need((const char *)m->pe_base + m->text_offset, m->text_size) + pg - 1) & ~(pg - 1))
+            : 0;
+    }
+    alloc_size += child_tramp_prealloc;
     offset = ios_pool_alloc_range(alloc_size, ios_jit_pool_size_global - ios_jit_tail_reserved);
     if (offset == (size_t)-1)
     {
@@ -4584,25 +4848,19 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
 
     /* x18-patch the child's .text with its own trampolines (fresh from the
      * unix view — the parent's patches live only in the parent's copy). */
-    if (m->text_size)
+    if (m->text_size && child_tramp_prealloc)
     {
-        extern size_t ios_jit_x18_tramp_need( const char *text, size_t text_size );
-        size_t tramp_need = ios_jit_x18_tramp_need(rw_dest + m->text_offset, m->text_size);
-        size_t tramp_alloc = (tramp_need + pg - 1) & ~(pg - 1);
-        size_t tramp_off = ios_pool_alloc_range_ex(tramp_alloc,
-                ios_jit_pool_size_global - ios_jit_tail_reserved,
-                (size_t)(rx_dest - (char *)ios_jit_rx_base_global),
-                0x5000000 /* B/BL imm26 reach — see ios_pool_alloc_range_ex */);
-        if (tramp_off != (size_t)-1)
-        {
-            int patched = ios_jit_patch_x18(
-                rw_dest + m->text_offset, rx_dest + m->text_offset, m->text_size,
-                (char *)ios_jit_rw_base_global + tramp_off,
-                (char *)ios_jit_rx_base_global + tramp_off, tramp_alloc);
-            sys_icache_invalidate((char *)ios_jit_rx_base_global + tramp_off, tramp_alloc);
-            dprintf(2, "[child-ntdll] x18-patched %d instructions\n", patched);
-        }
-        else dprintf(2, "[child-ntdll] no pool space for x18 trampolines!\n");
+        /* task #34: trampolines live in the fixed image-relative region
+         * pre-reserved above — same offset in every copy, so patched .text
+         * and tramps are byte-identical across copies (page-shareable). */
+        size_t tramp_off = offset + (alloc_size - child_tramp_prealloc);
+        int patched = ios_jit_patch_x18(
+            rw_dest + m->text_offset, rx_dest + m->text_offset, m->text_size,
+            (char *)ios_jit_rw_base_global + tramp_off,
+            (char *)ios_jit_rx_base_global + tramp_off, child_tramp_prealloc);
+        sys_icache_invalidate((char *)ios_jit_rx_base_global + tramp_off, child_tramp_prealloc);
+        dprintf(2, "[child-ntdll] x18-patched %d instructions (tramps at image-relative +0x%lx)\n",
+                patched, (unsigned long)(alloc_size - child_tramp_prealloc));
     }
 
     ios_jit_mark_ec_ranges_for_copy(rw_dest, rx_dest, m->size);

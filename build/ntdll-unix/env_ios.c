@@ -1956,6 +1956,21 @@ static void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
  */
 static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
 {
+    /* iOS-Mythic (ml111, task #35 fallout): write to the BOOTING THREAD's PEB,
+     * not the file-scope `peb` global. Pseudo-process children boot through
+     * this same code, and with two children booting concurrently the global
+     * points at (at most) one of them — the other keeps the NULL that
+     * loader_ios.c seeded, and its PE-side init_user_process_params then
+     * dereferences params==NULL (fault at +0x3f0 = EnvironmentSize, followed
+     * by the ml111 infinite memcpy loop that wedged the whole desktop). The
+     * furniture-ceiling layout only re-ordered boot timing; the race is the
+     * standing "unix globals hold per-proc state" hazard. Shadowing the global
+     * is a no-op for the first process, where thread PEB == global peb. */
+    PEB *global_peb_snapshot = peb;               /* still the global here */
+    PEB *peb = NtCurrentTeb()->Peb;               /* shadow from here on */
+    dprintf(2, "[init-peb] thread_peb=%p global_peb=%p params=%p module=%p%s\n",
+            (void *)peb, (void *)global_peb_snapshot, (void *)params, module,
+            peb == global_peb_snapshot ? "" : "  <-- MISMATCH (raced child; old code dropped params)");
     peb->ImageBaseAddress           = module;
     peb->ProcessParameters          = params;
     peb->OSMajorVersion             = 10;

@@ -173,6 +173,76 @@ enum StikJITHelper {
         var curProt: vm_prot_t = 0
         var maxProt: vm_prot_t = 0
 
+        // task #35: place the RW alias BELOW the 64GB carveout floor.
+        // With VM_FLAGS_ANYWHERE the kernel picks the first free address above
+        // the GPU carveout [64G,448G) — which is 0x7000000000 exactly. That is
+        // the base of a 16GB jumbo slot, so this 896MB data-only mapping was
+        // sterilizing a whole slot that CEF's PartitionAlloc needs. The top
+        // window [448G,512G) holds only four such slots and CEF wants at least
+        // four pools, so we cannot afford to spend one on ourselves.
+        // Data-only (never executed — exec always goes through the RX alias),
+        // so placement is unconstrained; fall back to ANYWHERE if all candidates
+        // are taken, which restores the previous behaviour exactly.
+        // ml91: six hand-picked candidates (8/12/16/24/32/48G) ALL failed —
+        // sub-64G is far more crowded than assumed. Sweep the whole region on a
+        // 1GB stride instead of guessing. Each failed vm_remap(FIXED) is cheap,
+        // so ~58 probes at startup costs nothing and finds any real hole.
+        // ml92 measured the real map: there is NO sub-64G space at all. The only
+        // "free" region down there (0..0x102454000) is __PAGEZERO, and 4G-64G is
+        // fully reserved (malloc xzone) — 58 probes on a 1GB stride found nothing.
+        // Usable VA is exactly one ~63GB window, 0x7038000000..0x7fffdf0000.
+        //
+        // That window holds four 16GB-aligned slots (448/464/480/496G) and CEF's
+        // PartitionAlloc wants one pool per slot. Landing here at 0x7000000000
+        // spends the 448G slot on an 896MB mapping. Slot 496G is ALREADY ruined
+        // by Wine furniture (PE images at ~0x7e874c0000 = 505.8G), so parking at
+        // the very top costs nothing that isn't already lost and hands 448G back
+        // to PartitionAlloc intact.
+        // ml91/ml92/ml93: relocating this alias was tried and REVERTED. The map
+        // says usable VA is a single ~63GB window (0x7038000000..0x7fffdf0000);
+        // sub-64G is __PAGEZERO plus a fully-reserved 4G-64G band, so 58 probes
+        // on a 1GB stride found nothing (ml92). Parking at the top of space
+        // instead (0x7fc8000000) DID place, but Wine allocates its furniture
+        // top-down — the TEB landed 1.25MB below us at 0x7fc7ec0000, pool copies
+        // came out zero-filled, and libarm64ecfex died on 8 exec faults before
+        // CEF was even reached (ml93). There is nowhere to put an 896MB mapping
+        // that does not cost either a 16GB PartitionAlloc slot or Wine's own
+        // furniture. The kernel pick (0x7000000000, base of the window) is the
+        // least harmful: it spends the 448G slot but leaves the top — where Wine
+        // clusters — alone.
+        // ml96 census: CEF needs THREE 16GB pools (48GB), not the 144GB a naive
+        // sum suggested — #3/#4/#5 are one pool re-rolling its hint, and the two
+        // 32GB requests are that same pool over-reserving for 16GB ALIGNMENT.
+        // 48GB fits in the 63GB window, so the third pool fails only because no
+        // 16GB-ALIGNED slot is left: 464G and 480G are taken, 496G is broken by
+        // Wine furniture, and 448G is spent on this 896MB alias.
+        //
+        // Freeing 448G should let pool 3 land. ml93 tried that and failed by
+        // parking at 0x7fc8000000 — the extreme top, exactly where Wine
+        // allocates its furniture top-down (the TEB landed 1.25MB below us and
+        // pool copies came back zeroed). The map says 0x7c00000000..0x7e874c0000
+        // is free, so take the BOTTOM of the already-broken 496G slot instead
+        // and leave the top for Wine.
+        // DO NOT relocate this alias without new evidence. Three placements were
+        // measured against the default kernel pick (0x7000000000, which the
+        // kernel picks because it is the first free address above the GPU
+        // carveout):
+        //   0x7000000000 (default)  ml94=8, ml96=1  exec faults, reaches libcef
+        //   0x7fc8000000 (top)      ml93=8          exec faults, dies before CEF
+        //   0x7c00000000 (496G)     ml97=16, ml98=16 exec faults, dies before CEF
+        // Same fault class in every case (pool page loses content/exec, on a
+        // recycled range) — relocation makes an EXISTING intermittent bug worse
+        // rather than introducing a new one. Two mechanisms were proposed and
+        // BOTH disproven: Wine furniture collision (ml93) and the reclaim-recover
+        // band claiming the alias (ml97; the band exclusion landed in
+        // signal_arm64_ios.c and did NOT change the count). Whatever couples the
+        // alias base to pool stability is still unidentified.
+        //
+        // Cost of staying here: the alias occupies the base of the 448G slot, so
+        // PartitionAlloc gets only two of the three 16GB-aligned pools it needs
+        // (see the ml96 [jumbo#N] census). Freeing that slot is worth doing —
+        // but by moving WINE's furniture out of 496G, not by moving this.
+        rwAddr = 0
         let kr1 = vm_remap(
             mach_task_self_,
             &rwAddr,

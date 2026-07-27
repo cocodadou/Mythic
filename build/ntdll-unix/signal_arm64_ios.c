@@ -1455,6 +1455,27 @@ static void *ios_mach_exception_thread( void *arg )
                  * the same still-volatile page 5+ times; MADV_FREE_REUSE makes
                  * recovery permanent, the higher cap is a belt for residual
                  * volatility. */
+                /* Correctness guard, NOT a fix for anything observed: this band
+                 * ([496G,512G)) must never claim the JIT pool's own RW alias,
+                 * because pool writes have their own STR-emulation path and this
+                 * one "recovers" by mapping fresh ZERO pages. It is a no-op at
+                 * the default alias placement (0x7000000000 is outside the
+                 * band) and exists so a future relocation can't silently couple
+                 * to this handler.
+                 * HONEST NOTE: this was added on the theory that the band was
+                 * why relocating the alias into it caused exec faults. It was
+                 * NOT — ml98 kept the exclusion, kept the alias at
+                 * 0x7c00000000, and still took 16 faults (ml97 also 16). The
+                 * real coupling is still unidentified; do not cite this as the
+                 * explanation. */
+                {
+                    extern void *ios_jit_rw_base_global;
+                    extern size_t ios_jit_pool_size_global;
+                    uintptr_t rwb = (uintptr_t)ios_jit_rw_base_global;
+                    if (rwb && ios_jit_pool_size_global &&
+                        fa >= rwb && fa < rwb + ios_jit_pool_size_global)
+                        goto skip_reclaim_band;
+                }
                 if (!handled && fa != (uint64_t)fault_pc &&
                     fa >= 0x7C00000000ULL && fa < 0x8000000000ULL)
                 {
@@ -1471,14 +1492,40 @@ static void *ios_mach_exception_thread( void *arg )
                     else { rr_pg[s] = pg; rr_n[s] = 1; }
                     if (!giveup)
                     {
+                        /* ml95 (task #34): the "FEX host-arena band" assumption
+                         * behind the zero-fill below is STALE. Wine's PE images
+                         * now cluster in this same [496G,512G) band — ml95 took
+                         * a fault on pg=0x7ed1be0000 (507.1G) which is a loaded
+                         * MODULE BASE, and images were measured at 505.8G. For a
+                         * FEX cache page a fresh zero page is correct (reads
+                         * "empty" -> recompile); for a module it silently
+                         * DESTROYS the code, and the thread then executes zeros
+                         * or leaks a pool address into the guest RIP
+                         * ([rip-leak] named exactly that module, rva 0x109835).
+                         * Never zero-fill a page that belongs to a loaded image:
+                         * restore protection if the mapping survives, otherwise
+                         * surface the fault instead of corrupting it away. */
+                        extern unsigned long long ios_jit_module_base_for_va( unsigned long long va,
+                                                                              unsigned long long *size_out );
+                        unsigned long long mod_size = 0;
+                        unsigned long long mod_base = ios_jit_module_base_for_va( pg, &mod_size );
                         int mpr = mprotect( (void *)(uintptr_t)pg, RR_PAGE, PROT_READ | PROT_WRITE );
                         int errno_save = errno;
                         int used_mmap = 0;
-                        if (mpr != 0)   /* page may be UNMAPPED, not just PROT_NONE — remap fresh */
+                        if (mpr != 0 && !mod_base)  /* scratch page: fresh zeros ARE the contract */
                         {
                             void *r = mmap( (void *)(uintptr_t)pg, RR_PAGE, PROT_READ | PROT_WRITE,
                                             MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0 );
                             used_mmap = (r == (void *)(uintptr_t)pg);
+                        }
+                        else if (mpr != 0)
+                        {
+                            static volatile int mrc = 0;
+                            if (__sync_fetch_and_add(&mrc, 1) < 24)
+                                dprintf(STDERR_FILENO,
+                                    "[reclaim-recover] REFUSED zero-fill of LOADED MODULE page pg=0x%llx module=0x%llx+0x%llx rva=0x%llx errno=%d — zeros would destroy code, surfacing fault\n",
+                                    (unsigned long long)pg, mod_base, mod_size,
+                                    (unsigned long long)(pg - mod_base), errno_save);
                         }
                         int reuse = madvise( (void *)(uintptr_t)pg, RR_PAGE, MADV_FREE_REUSE );
                         static volatile int rc = 0;
@@ -1491,6 +1538,7 @@ static void *ios_mach_exception_thread( void *arg )
                         if (mpr == 0 || used_mmap) handled = 1;
                     }
                 }
+skip_reclaim_band: ;
             }
 
             if (handled)
@@ -1612,7 +1660,14 @@ static void *ios_mach_exception_thread( void *arg )
                         }
                     }
                 }
-                if (cnt <= 5 || (cnt % 100) == 0 || terminal_pc)
+                /* ml125: a runaway exec-fault storm hit 7.26 MILLION faults;
+                 * at one line per 100 that alone wrote 72k lines and a 314k-line
+                 * log, which costs device I/O and buries everything useful.
+                 * After the first 200 reports the rate drops to 1-in-100000 —
+                 * still enough to prove a storm is running and show where it
+                 * ends, without the flood. terminal_pc always reports. */
+                if (cnt <= 5 || terminal_pc ||
+                    (cnt <= 20000 ? (cnt % 100) == 0 : (cnt % 100000) == 0))
                 {
                     uint64_t fault_pc = fault_pc_check;
                     dprintf(STDERR_FILENO, "[mach_exc] UNHANDLED #%d pc=%p addr=%p x18=%p type=%d lr=%p sp=%p x16=%p x17=%p\n",

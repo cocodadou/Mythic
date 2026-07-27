@@ -203,10 +203,394 @@ struct ios_pool_free
 };
 static struct ios_pool_free ios_pool_freelist[IOS_POOL_FREE_MAX];
 static int ios_pool_free_count;
+/* task #34: 1 if the most recent ios_pool_alloc_range served from the freelist,
+ * 0 if it came off the virgin bump. Read immediately after the call by the
+ * copy-verify probe so a failed copy can be attributed to reuse or not. */
+static int ios_pool_last_alloc_reused;
+
+/* Defined next to decommit_pages; declared here so the allocator can check a
+ * range against the LIVE ledger before handing it out (task #34 double-handout
+ * detector). */
+static int ios_pool_live_overlap( uintptr_t rw_start, size_t size,
+                                  size_t *off_out, void **peb_out );
 
 void *ios_jit_current_peb(void);
 extern void *ios_jit_rw_base_global;  /* defined below */
 extern void *ios_jit_rx_base_global;  /* defined below */
+
+/* ml90 (task #35): walk the Mach map and report every free gap >= 1GB, so we
+ * size the jumbo-reserve problem against real numbers instead of guesses.
+ * CEF asks for ~144GB (4x PartitionAlloc 16GB pools + a 32GB region) and only
+ * two land; this says exactly what is left and where. Gaps inside the GPU
+ * carveout [64G,448G) are flagged — they are reported free by the map but are
+ * CPU-walled (maxprot=0), so they can never satisfy a reserve. */
+/* task #34 POOL WARMER — the compressor countermeasure (ml104 finding).
+ *
+ * The faulting pool page's content is BYTE-IDENTICAL to the on-disk DLL
+ * (libarm64ecfex RVA 0xd0820, verified against FEX/build-arm64ec/Bin —
+ * the "zeros" in earlier fault dumps were inter-function padding present in
+ * the file, misread as corruption). So content is never destroyed; only
+ * EXECUTABILITY is lost, deterministically on a COLD page (copied via the RW
+ * alias, not yet executed), only under CEF memory pressure. That is the
+ * signature of the compressor: a cold dirty anon page is compressed, the
+ * first exec touch decompresses it into a FRESH physical page, and TXM's
+ * exec blessing does not survive the frame replacement. It also explains the
+ * reuse correlation as a time confound: late copies land on freelist ranges
+ * AND under peak pressure.
+ *
+ * Countermeasure: touch every used pool page every ~2s so none ever reaches
+ * the inactive queue. ~40k pages at 650MB = a few ms per cycle. Reads via the
+ * RW alias keep the shared physical page active for the RX view too. This is
+ * both the experiment (faults vanish => theory confirmed) and the mitigation. */
+static volatile size_t ios_jit_tail_reserved;   /* defined below (tail EC_CODE carve) */
+extern size_t ios_jit_pool_size_global;         /* defined below */
+/* task #35 THE MEASUREMENT THAT DECIDES THE WHOLE PLAN.
+ *
+ * Everything else about the furniture ceiling is instrumentation of a means to
+ * an end; this reports the END directly. CEF needs three 16GB-ALIGNED
+ * PartitionAlloc pools, and PA's own slot walk tries these three addresses. So
+ * the only question that matters is whether they are still free by the time PA
+ * asks. The ml119 noise (111 relaxed placements, hundreds of Wine views) is
+ * irrelevant if the answer stays "all three CLEAR" -- and if a slot is dirty,
+ * this names the exact first occupant instead of leaving us to infer it from a
+ * pool count. Called periodically, so we see WHEN a slot goes bad, not just
+ * that it did. */
+static void ios_slot_probe( const char *why )
+{
+    static const mach_vm_address_t slots[3] = { 0x7400000000ULL, 0x7800000000ULL, 0x7C00000000ULL };
+    const mach_vm_size_t SLOT = 0x400000000ULL;   /* 16GB */
+    int i;
+
+    for (i = 0; i < 3; i++)
+    {
+        mach_vm_address_t lo = slots[i], hi = slots[i] + SLOT, addr = lo;
+        mach_vm_size_t occupied = 0;
+        mach_vm_address_t first_occ = 0;
+        mach_vm_size_t first_sz = 0;
+        int regions = 0;
+
+        while (addr < hi)
+        {
+            mach_vm_size_t size = 0;
+            vm_region_basic_info_data_64_t info;
+            mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t obj = MACH_PORT_NULL;
+            mach_vm_address_t q = addr;
+
+            if (mach_vm_region( mach_task_self(), &q, &size, VM_REGION_BASIC_INFO_64,
+                                (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS)
+                break;
+            if (q >= hi) break;                    /* nothing left inside the slot */
+            if (q + size > hi) size = hi - q;
+            if (!first_occ) { first_occ = q; first_sz = size; }
+            occupied += size;
+            regions++;
+            addr = q + size;
+        }
+        if (occupied)
+            dprintf(2, "[slot#%d] 0x%llx+16GB DIRTY regions=%d occupied=%llu MB first=0x%llx+0x%llx (%s)\n",
+                    i, (unsigned long long)lo, regions, (unsigned long long)(occupied >> 20),
+                    (unsigned long long)first_occ, (unsigned long long)first_sz, why);
+        else
+            dprintf(2, "[slot#%d] 0x%llx+16GB CLEAR (%s)\n",
+                    i, (unsigned long long)lo, why);
+    }
+}
+
+/* task #35 THE LAST UNKNOWN: what is actually IN the furniture window?
+ *
+ * ml120 proved the window's 15.1GB is fully consumed, which is what makes three
+ * pools impossible (48 + 17 > 63). But "consumed" does not distinguish genuine
+ * demand from waste, and that distinction decides whether 3 pools are reachable
+ * at all: if this is ~480 arenas of 32MB that nobody frees, reclaiming them
+ * unlocks the third slot; if it is thread stacks and images, 2 pools is the
+ * hard ceiling and CEF has to run on two. The 2GB that poisoned slot#0 was 64
+ * regions of ~32MB, so a size histogram should be conclusive. Bucket by size
+ * class, then name the biggest tenants. */
+static void ios_window_inventory( const char *why, unsigned long long lo_arg, unsigned long long hi_arg )
+{
+    static const char *names[6] = { "<=64K", "<=1M", "<=8M", "<=64M", "<=512M", ">512M" };
+    mach_vm_address_t addr = (mach_vm_address_t)lo_arg;
+    const mach_vm_address_t hi = (mach_vm_address_t)hi_arg;
+    mach_vm_size_t bytes[6] = { 0 }, big_sz[8] = { 0 };
+    unsigned counts[6] = { 0 };
+    mach_vm_address_t big_at[8] = { 0 };
+    int big_pr[8] = { 0 };
+    mach_vm_size_t total = 0;
+    unsigned regions = 0;
+    /* ml123: the 130 x 128MB regions are NOT one-per-thread (31 threads, 130
+     * regions) and they come in CONTIGUOUS runs, so they are almost certainly
+     * one large mapping each that mach reports split into 128MB map entries.
+     * Individual entries therefore tell us nothing; coalesce adjacent entries
+     * into RUNS and report the largest runs, plus Darwin's user_tag, which
+     * names the allocator directly instead of leaving us to infer it. */
+    mach_vm_address_t run_at = 0;
+    mach_vm_size_t run_sz = 0;
+    int run_tag = -1, run_pr = 0;
+    mach_vm_size_t tagb[8] = { 0 };
+    int tagid[8];
+    int i, j, ntag = 0;
+
+    for (i = 0; i < 8; i++) tagid[i] = -1;
+
+    while (addr < hi)
+    {
+        mach_vm_size_t size = 0;
+        vm_region_extended_info_data_t einfo;
+        mach_msg_type_number_t cnt = VM_REGION_EXTENDED_INFO_COUNT;
+        mach_port_t obj = MACH_PORT_NULL;
+        mach_vm_address_t q = addr;
+        int tag, prot;
+
+        if (mach_vm_region( mach_task_self(), &q, &size, VM_REGION_EXTENDED_INFO,
+                            (vm_region_info_t)&einfo, &cnt, &obj ) != KERN_SUCCESS)
+            break;
+        if (q >= hi) break;
+        if (q + size > hi) size = hi - q;
+        tag = einfo.user_tag;
+        prot = einfo.protection;
+
+        i = size <= 0x10000 ? 0 : size <= 0x100000 ? 1 : size <= 0x800000 ? 2
+          : size <= 0x4000000 ? 3 : size <= 0x20000000 ? 4 : 5;
+        counts[i]++;
+        bytes[i] += size;
+        total += size;
+        regions++;
+
+        /* bytes-by-tag histogram (first 8 distinct tags seen) */
+        for (j = 0; j < ntag; j++) if (tagid[j] == tag) break;
+        if (j == ntag && ntag < 8) { tagid[ntag] = tag; ntag++; }
+        if (j < 8) tagb[j] += size;
+
+        /* coalesce into runs of same tag+prot */
+        if (run_sz && q == run_at + run_sz && tag == run_tag && prot == run_pr)
+            run_sz += size;
+        else
+        {
+            if (run_sz)
+                for (j = 0; j < 8; j++)
+                    if (run_sz > big_sz[j])
+                    {
+                        int k;
+                        for (k = 7; k > j; k--)
+                        {
+                            big_sz[k] = big_sz[k-1]; big_at[k] = big_at[k-1]; big_pr[k] = big_pr[k-1];
+                        }
+                        big_sz[j] = run_sz; big_at[j] = run_at;
+                        big_pr[j] = (run_pr << 8) | (run_tag & 0xff);
+                        break;
+                    }
+            run_at = q; run_sz = size; run_tag = tag; run_pr = prot;
+        }
+        addr = q + size;
+        if (regions > 4000) break;   /* backstop */
+    }
+    if (run_sz)
+        for (j = 0; j < 8; j++)
+            if (run_sz > big_sz[j])
+            {
+                int k;
+                for (k = 7; k > j; k--)
+                {
+                    big_sz[k] = big_sz[k-1]; big_at[k] = big_at[k-1]; big_pr[k] = big_pr[k-1];
+                }
+                big_sz[j] = run_sz; big_at[j] = run_at;
+                big_pr[j] = (run_pr << 8) | (run_tag & 0xff);
+                break;
+            }
+
+    dprintf(2, "[window] 0x%llx..0x%llx regions=%u occupied=%llu MB of %llu MB (%s)\n",
+            lo_arg, hi_arg, regions, (unsigned long long)(total >> 20),
+            (unsigned long long)((hi_arg - lo_arg) >> 20), why);
+    for (i = 0; i < 6; i++)
+        if (counts[i])
+            dprintf(2, "[window]   %-7s n=%-5u %llu MB\n",
+                    names[i], counts[i], (unsigned long long)(bytes[i] >> 20));
+    for (i = 0; i < 8 && big_sz[i]; i++)
+        dprintf(2, "[window]   run#%d 0x%llx +0x%llx (%llu MB) prot=%x tag=%d\n",
+                i, (unsigned long long)big_at[i], (unsigned long long)big_sz[i],
+                (unsigned long long)(big_sz[i] >> 20), big_pr[i] >> 8, big_pr[i] & 0xff);
+    for (i = 0; i < ntag; i++)
+        dprintf(2, "[window]   tag%-4d %llu MB\n", tagid[i], (unsigned long long)(tagb[i] >> 20));
+}
+
+static void *ios_pool_warmer_thread( void *arg )
+{
+    unsigned cycle = 0;
+    for (;;)
+    {
+        volatile const char *rw = (volatile const char *)ios_jit_rw_base_global;
+        /* ml121: warm the RX ALIAS TOO. The warmer only ever touched the RW
+         * alias, but execution faults on the RX one -- they are two separate
+         * mach mappings of the same object, so residency established through RW
+         * need not hold for RX. ml121 died exactly this way: [exec-recover]
+         * pg=0x1243d8000 lost execute while the warmer was running, mprotect_rx
+         * failed EACCES (as it ALWAYS does on blessed pool memory -- never
+         * evidence), and the unrecoverable fault killed the CEF child. Reading
+         * through an RX mapping is permitted and is the only touch that can
+         * establish residency for the alias that actually executes. */
+        volatile const char *rx = (volatile const char *)ios_jit_rx_base_global;
+        size_t total = ios_jit_pool_size_global;
+        if (rw && total)
+        {
+            size_t head = jit_pool_offset;               /* snapshot; only grows */
+            size_t tail = ios_jit_tail_reserved;
+            size_t o, touched = 0;
+            volatile char sink = 0;
+            if (head > total) head = total;
+            if (tail > total) tail = total;
+            for (o = 0; o < head; o += 0x4000) { sink += rw[o]; touched++; }
+            for (o = total - tail; o < total; o += 0x4000) { sink += rw[o]; touched++; }
+            if (rx)
+            {
+                for (o = 0; o < head; o += 0x4000) { sink += rx[o]; touched++; }
+                for (o = total - tail; o < total; o += 0x4000) { sink += rx[o]; touched++; }
+            }
+            (void)sink;
+            cycle++;
+            if (cycle == 1 || (cycle % 30) == 0)
+                dprintf(2, "[pool-warmer] cycle=%u touched=%lu pages (head=0x%lx tail=0x%lx)\n",
+                        cycle, (unsigned long)touched, (unsigned long)head, (unsigned long)tail);
+            /* task #35: report the three pool slots every ~30s on this existing
+             * timer — see ios_slot_probe. Cheap (a few mach queries) and it is
+             * the only signal that says whether the ceiling is doing its job. */
+            if (cycle == 1 || (cycle % 15) == 0)
+            {
+                ios_slot_probe( "periodic" );
+                /* ml121 probe-design fix: the inventory was wired ONLY to the
+                 * jumbo-failure sites, and ml121 died before any jumbo call, so
+                 * the one measurement that decides whether a 3rd pool is
+                 * reachable never fired. Put it on the periodic timer too. */
+                ios_window_inventory( "periodic", 0x7038000000ULL, 0x77ffff0000ULL );
+            }
+        }
+        usleep( 2000000 );
+    }
+    return NULL;
+}
+
+/* task #34: WAS THE POOL COPY EVER CORRECT?
+ *
+ * Every diagnosis so far assumed the copy succeeded and something destroyed it
+ * afterwards — four hypotheses, none confirmed. The untested alternative is
+ * that stores into the pool are silently dropped, so a REUSED range simply
+ * keeps whatever it held before (stale bytes, or zeros once the previous owner
+ * was swept). That would explain the reuse correlation directly, and it fits
+ * what the faults actually show: zeros in the instruction stream and the nls
+ * poison 0xdead1 still intact at offsets the copy should have overwritten.
+ *
+ * Read back through the RX alias immediately after the memcpy and compare
+ * against the source. Sampled (64 points) rather than a full compare, because
+ * this runs for every module copy of every pseudo-process. A mismatch here
+ * means the write path is at fault; a clean result means the content is
+ * destroyed later and the writer is still at large. */
+static void ios_jit_verify_copy( const char *src, const char *rx, size_t size,
+                                 const char *name, size_t offset, int reused )
+{
+    const int SAMPLES = 64;
+    size_t step = size / SAMPLES;
+    size_t i, first_bad = 0;
+    int bad = 0, zero = 0, checked = 0;
+
+    if (!src || !rx || size < 8) return;
+    if (step < 8) step = 8;
+
+    for (i = 0; i + 8 <= size; i += step)
+    {
+        uint64_t a, b;
+        memcpy( &a, src + i, 8 );
+        memcpy( &b, rx  + i, 8 );
+        checked++;
+        if (a != b)
+        {
+            if (!bad) first_bad = i;
+            bad++;
+            if (!b) zero++;
+        }
+    }
+    if (bad)
+        dprintf(2, "[copy-verify] MISMATCH %s pool_off=0x%lx size=0x%lx: %d/%d samples differ (%d read ZERO), first +0x%lx — THE COPY DID NOT STICK [%s]\n",
+                name ? name : "?", (unsigned long)offset, (unsigned long)size,
+                bad, checked, zero, (unsigned long)first_bad,
+                reused ? "REUSED range" : "virgin bump");
+}
+
+/* task #35 demand census — see NtAllocateVirtualMemory. One line per jumbo
+ * reserve, carrying enough context to tell a retry from a new reservation. */
+static unsigned          ios_jumbo_seq;
+static unsigned long long ios_jumbo_last_ms;
+static size_t            ios_jumbo_granted;      /* bytes actually handed out */
+static unsigned          ios_jumbo_ok, ios_jumbo_fail;
+
+static unsigned long long ios_now_ms( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)(ts.tv_nsec / 1000000);
+}
+
+static void ios_jumbo_census( void *hint, size_t size, void *result, unsigned st )
+{
+    unsigned long long now = ios_now_ms();
+    unsigned long long gap = ios_jumbo_last_ms ? now - ios_jumbo_last_ms : 0;
+
+    ios_jumbo_last_ms = now;
+    if (st) ios_jumbo_fail++;
+    else  { ios_jumbo_ok++; ios_jumbo_granted += size; }
+
+    dprintf(2, "[jumbo#%u] +%llums tid=%lx size=0x%lx (%lu MB) hint=%p -> %p st=0x%x | granted=%lu MB ok=%u fail=%u\n",
+            ++ios_jumbo_seq, gap, (unsigned long)(uintptr_t)pthread_self(),
+            (unsigned long)size, (unsigned long)(size >> 20), hint, result, st,
+            (unsigned long)(ios_jumbo_granted >> 20), ios_jumbo_ok, ios_jumbo_fail);
+}
+
+static void ios_va_gap_probe( const char *why )
+{
+    const mach_vm_address_t CARVE_LO = 0x1000000000ULL;   /* 64G  */
+    const mach_vm_address_t CARVE_HI = 0x7000000000ULL;   /* 448G */
+    const mach_vm_address_t VA_TOP   = 0x8000000000ULL;   /* 512G */
+    mach_vm_address_t addr = 0, prev_end = 0;
+    unsigned long long usable_mb = 0;
+    int gaps = 0;
+
+    dprintf(2, "[va-gaps] ==== map walk (%s) ====\n", why);
+    while (addr < VA_TOP)
+    {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        if (mach_vm_region( mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS)
+            break;
+        if (addr > prev_end)
+        {
+            mach_vm_size_t gap = addr - prev_end;
+            if (gap >= 0x40000000ULL)   /* >= 1GB is all we care about */
+            {
+                int carve = (prev_end >= CARVE_LO && prev_end < CARVE_HI);
+                if (!carve) usable_mb += (unsigned long long)(gap >> 20);
+                dprintf(2, "[va-gaps] FREE 0x%llx..0x%llx = %llu MB%s\n",
+                        (unsigned long long)prev_end, (unsigned long long)addr,
+                        (unsigned long long)(gap >> 20),
+                        carve ? "  <-- GPU CARVEOUT, unusable" : "");
+                if (++gaps >= 24) { dprintf(2, "[va-gaps] (truncated)\n"); break; }
+            }
+        }
+        prev_end = addr + size;
+        addr = prev_end;
+    }
+    if (prev_end < VA_TOP)
+    {
+        unsigned long long tail = (unsigned long long)((VA_TOP - prev_end) >> 20);
+        usable_mb += tail;
+        dprintf(2, "[va-gaps] FREE 0x%llx..0x%llx = %llu MB (top tail)\n",
+                (unsigned long long)prev_end, (unsigned long long)VA_TOP, tail);
+    }
+    dprintf(2, "[va-gaps] ==== end: %llu MB (%llu GB) usable outside the carveout ====\n",
+            usable_mb, usable_mb >> 10);
+}
 
 /* ml89: report the RX alias's protections for a pool range, WITHOUT touching
  * them. The first version of this guard probed with mprotect(RX) and dropped
@@ -363,6 +747,33 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
                 continue;
             }
         }
+        /* task #34 DOUBLE-HANDOUT DETECTOR. ml99 proved the copy itself is
+         * correct (66 reuses, 0 [copy-verify] mismatches), so a pool page that
+         * later reads back as zeros was overwritten AFTER it was written. The
+         * writer that would correlate exactly with reuse is the allocator
+         * handing this range to a second module while the first is still
+         * loaded — the second memcpy then lands on top of live code. ml87
+         * showed kernelbase and libarm64ecfex both reporting pool
+         * 0x122844000; that was explained away as the bump pointer not
+         * advancing on a freelist serve, which is true but does not rule this
+         * out. Freelist and ledger are disjoint BY DESIGN (free removes the
+         * ledger entry), so any overlap here is an accounting bug. Checked
+         * BEFORE the entry is split so a refused range stays intact. */
+        {
+            size_t l_off = 0;
+            void  *l_peb = NULL;
+            if (ios_jit_rw_base_global &&
+                ios_pool_live_overlap( (uintptr_t)ios_jit_rw_base_global + ios_pool_freelist[i].off,
+                                       alloc_size, &l_off, &l_peb ))
+            {
+                dprintf(2, "[pool-dup] DOUBLE HANDOUT REFUSED: freelist off=0x%lx size=0x%lx overlaps LIVE ledger off=0x%lx peb=%p — second copy would have overwritten loaded code\n",
+                        (unsigned long)ios_pool_freelist[i].off, (unsigned long)alloc_size,
+                        (unsigned long)l_off, l_peb);
+                ios_pool_freelist[i] = ios_pool_freelist[--ios_pool_free_count];
+                i--;
+                continue;
+            }
+        }
         off = ios_pool_freelist[i].off;
         if (ios_pool_freelist[i].size > alloc_size)
         {
@@ -383,13 +794,19 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
          * steam.exe died). MADV_FREE_REUSE is the documented cancel — apply
          * it BEFORE handing the range out so the new owner's writes stick. */
         {
-            int mr = -1;
-            if (ios_jit_rw_base_global)
-                mr = madvise( (char *)ios_jit_rw_base_global + off, alloc_size, MADV_FREE_REUSE );
-            dprintf(2, "[jit-pool] reused freed range off=0x%lx size=0x%lx (freelist %d ranges) reuse-cancel=%d%s\n",
-                    (unsigned long)off, (unsigned long)alloc_size, ios_pool_free_count,
-                    mr, mr ? " FAILED (still volatile!)" : "");
+            /* ml103: the MADV_FREE_REUSE that used to run here is GONE. It was
+             * the documented cancel for MADV_FREE_REUSABLE — but the sweep no
+             * longer marks anything reusable, so this call was unpaired. On
+             * Darwin an unpaired REUSE is at best a no-op and at worst touches
+             * the vm entry's reusable accounting itself. It is the last madvise
+             * left in the pool allocation path, and exec faults on recycled
+             * ranges persist with every other writer excluded (copy verifies
+             * clean, no double-handout, no stale-alias memset, no module
+             * zero-fill) — so this is the remaining single variable. */
+            dprintf(2, "[jit-pool] reused freed range off=0x%lx size=0x%lx (freelist %d ranges) no-madvise\n",
+                    (unsigned long)off, (unsigned long)alloc_size, ios_pool_free_count);
         }
+        ios_pool_last_alloc_reused = 1;
         break;
     }
 
@@ -400,6 +817,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
         {
             off = jit_pool_offset;
             jit_pool_offset += alloc_size;
+            ios_pool_last_alloc_reused = 0;
             /* ml89 CONTROL for the POISONED check above: report the same
              * max_prot for a range that has NEVER been freed. If virgin ranges
              * read max=0x7 while freed ranges read max=0x3, reuse really does
@@ -416,11 +834,10 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
                             (unsigned long)off, (unsigned long)alloc_size, cur, mx, ok);
                 }
             }
-            /* Same volatility belt as the freelist path — virgin pages
-             * shouldn't be MADV_FREE-marked, but under Steam-boot pressure
-             * we've seen freshly written pool content read back zero. */
-            if (ios_jit_rw_base_global)
-                madvise( (char *)ios_jit_rw_base_global + off, alloc_size, MADV_FREE_REUSE );
+            /* ml103: the matching unpaired MADV_FREE_REUSE is gone here too —
+             * see the freelist path above. Virgin pages were never marked
+             * volatile in the first place, so this one had even less reason to
+             * exist. No madvise now runs on any pool allocation path. */
         }
     }
 #undef IOS_POOL_IN_REACH
@@ -1089,6 +1506,51 @@ unsigned long long ios_jit_module_base_for_va(unsigned long long va, unsigned lo
     return 0;
 }
 
+/* task #34 [x86-ptr]: is `va` a GUEST INSTRUCTION address — a pointer into the
+ * executable section of an x86-64 module?
+ *
+ * The iat-sync rewrites every image-looking pointer to its pool copy. Three
+ * cases hide behind that:
+ *   - pointer to DATA (any module)      -> translating is CORRECT, the pool
+ *                                          copy is the live one
+ *   - pointer to ARM64EC code (0xAA64)  -> translating is CORRECT, EC calls
+ *                                          must land in the pool copy
+ *   - pointer to x86-64 code (0x8664)   -> translating is POISON. FEX must see
+ *                                          the guest PE address; a pool address
+ *                                          in guest control flow is the
+ *                                          [rip-leak] death (ml95, ml100).
+ * A first attempt used peb->EcCodeBitMap as the discriminator and reported
+ * 100.0% "non-EC" — useless, because that bitmap reads 0 for plain data too,
+ * so it lumped the correct case in with the poison one. Section bounds plus the
+ * PE machine word separate them properly. */
+static int ios_va_is_x86_code( uint64_t va )
+{
+    int i;
+
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t b  = (uintptr_t)ios_jit_mappings[i].pe_base;
+        size_t    sz = ios_jit_mappings[i].size;
+        size_t    t_off, t_sz;
+        uint64_t  off;
+        const unsigned char *img;
+        unsigned int e_lfanew;
+
+        if (!b || sz < 0x40 || va < b || va >= b + sz) continue;
+
+        t_off = ios_jit_mappings[i].text_offset;
+        t_sz  = ios_jit_mappings[i].text_size;
+        off   = va - b;
+        if (!t_sz || off < t_off || off >= t_off + t_sz) return 0;   /* data, not code */
+
+        img = (const unsigned char *)b;
+        e_lfanew = *(const unsigned int *)(img + 0x3C);
+        if (e_lfanew + 6 > sz) return 0;
+        return *(const unsigned short *)(img + e_lfanew + 4) == 0x8664;  /* IMAGE_FILE_MACHINE_AMD64 */
+    }
+    return 0;
+}
+
 /* [xlate-exec] forensics: which mapping's pool range contains `addr`, and
  * who owns it. Names the COPY a thread is executing (session vs child),
  * which reverse_translate alone can't — copies share PE VAs. */
@@ -1610,6 +2072,211 @@ static void *address_space_start = (void *)0x10000;
 #ifdef _WIN64
 static void *address_space_limit = (void *)0x7fffffff0000;  /* top of the total available address space */
 static void *user_space_limit    = (void *)0x7fffffff0000;  /* top of the user address space */
+
+/* task #35 (ml105): FURNITURE CEILING — keep the top 16GB [0x7C00000000,
+ * 0x8000000000) free of Wine furniture so PartitionAlloc's third 16GB pool can
+ * land there. The ml96/ml105 census is deterministic: pools 1-2 take the 480G
+ * and 464G slots (pool 2's guard-before layout also poisons the top 64KB of the
+ * 448G slot, so evicting our RW alias would NOT help pool 3), and pool 3's
+ * offset-0 slot walk tries 0x7C00000000 FIRST — it fails only because Wine's
+ * top-down placement packs images/TEBs/stacks into [0x7e874c0000, top). Total
+ * furniture there is ~6GB, and [0x7038000000, 0x73ffff0000) = 15.1GB is free to
+ * hold it. Applied ONLY to kernel-pick placements smaller than 1GB with no
+ * caller-imposed limits — jumbo reserves and explicit/fixed requests are
+ * untouched. NOTE: the [reclaim-recover] data-fault band in signal_arm64_ios.c
+ * watches this same [496G,512G) range for FEX arena recovery; if arenas move
+ * below the ceiling, that band goes quiet — watch Thumper-under-pressure for a
+ * regression and move the band with them if needed.
+ *
+ * ml106 REVISED: the first ceiling (0x7C00000000, 1GB size gate) backfired two
+ * ways. (1) Furniture packed top-down to JUST under the ceiling, so the last
+ * 64KB below 0x7C00000000 was always occupied and the 480G slot's top was
+ * poisoned. (2) A 4GB guard-style tenant that does NOT go through
+ * NtAllocateVirtualMemory (absent from the [jumbo#] census; likely a section
+ * view or similar) landed at [0x7effff0000, 0x7fffff0000) and broke the 496G
+ * slot. Result: ONE pool instead of two, chrome_elf died earlier. Fix: ceiling
+ * at 464G-64KB so the guard pool's under-boundary bite lands on free space, and
+ * a 16GB size gate so the 4GB tenant is clamped below too. Leaves
+ * [0x73ffff0000, 0x8000000000) = 3 slots + guard margin exclusively for the
+ * three PartitionAlloc pools.
+ *
+ * ml107-ml109 DISABLED (= 0): with the ceiling active, EVERY x64 EC child dies
+ * at boot — Steam's children AND Thumper's (ml109: the baseline regressed from
+ * 2s-to-splash to ~1min then app death). Mechanism fully identified: some FEX
+ * boot-path error fires under the new layout → FEX LogMan::Msg::MFmtImpl
+ * formats the message → FEXCore::Allocator::aligned_alloc returns NULL on that
+ * thread (rpmalloc not thread-initialized) → unchecked memmove(NULL, msg, len)
+ * → c0000005 in ntdll memcpy rva 0x5a4d4 (disassembly-confirmed at FEX rva
+ * 0x10bd48). The crash is the LOGGER; the actual FEX complaint is unknown and
+ * unknowable until the logger survives allocation failure. PREREQUISITE to
+ * re-enabling: patch FEX's MFmtImpl to drop the message on alloc failure (or
+ * fix rpmalloc thread-init on wine loader threads), THEN re-enable to read
+ * what FEX is actually objecting to. The packing geometry itself (ceiling
+ * 464G-64K + direction-aware walk) remains correct on paper.
+ *
+ * ml110 RE-ENABLED: the prerequisite landed — FEXCore AllocatorHooks now
+ * lazily rpmalloc_thread_initialize at every hook (EnsureThreadHeap), so the
+ * logger survives on uninitialized threads. Thumper verified clean on the new
+ * FEX (ml110: ~10k frames, 0 faults) with the ceiling still off. This build
+ * turns the ceiling back on: either the FEX objection was a non-fatal warning
+ * and the three pools finally land, or the message prints and names it.
+ *
+ * ml120 THE ARITHMETIC CAME IN, AND 3 POOLS DO NOT FIT. Measured at the moment
+ * PartitionAlloc asked:
+ *   FREE 0x747fff0000..0x7800000000 = 14336 MB   (slot#0 poisoned from its base)
+ *   FREE 0x7c00000000..0x8000000000 = 16384 MB   (slot#2 pristine)
+ * and the 15.1GB furniture window was CONSUMED ENTIRELY -- absent from the free
+ * list. The occupied run begins at exactly 0x73ffff0000, this ceiling: once the
+ * window filled, the advisory relax valve handed out the next-lowest free
+ * addresses, which march straight up into slot#0 (64 regions x ~32MB = 2GB).
+ * So the valve that stops us dying is also what poisons the slots, and the
+ * furniture demand for Steam is >15GB (~17GB and climbing) rather than the
+ * ~6GB the ml105 census suggested. 48GB of pools + 17GB of furniture = 65GB in
+ * a 63GB window: THREE POOLS ARE ARITHMETICALLY IMPOSSIBLE unless furniture
+ * demand is cut, and whether it can be cut is unknown until we know what is in
+ * those 15GB (see ios_window_inventory).
+ *
+ * Pool #2 additionally failed for a 64KB reason: PA's guard-style pool asks for
+ * 0x400010000 = 16GB + 64KB, and slot#2 is EXACTLY 16GB with the top of the
+ * address space above it, so the guard cannot overhang. A guard pool can only
+ * sit at a slot that has 64KB free BELOW it.
+ *
+ * ml121 THEREFORE TARGETS TWO POOLS, DETERMINISTICALLY, instead of three
+ * accidentally. Raising the ceiling to 0x77ffff0000 gives furniture
+ * [0x7038000000, 0x77ffff0000) = 31GB (the 15GB it demonstrably needs plus 16GB
+ * of headroom, so the relax valve should never fire and never poison anything),
+ * and reserves [0x77ffff0000, 0x8000000000) = 32GB + 64KB, which fits exactly:
+ *   guard pool -> 0x7800000000 with its 64KB overhang at 0x77ffff0000
+ *   plain pool -> 0x7c00000000, exactly 16GB to the top of VA
+ * That is the maximum this address space can hold, and it is 2x what ml120
+ * achieved. Whether CEF runs on two pools is the next question; three needs a
+ * furniture reduction that ios_window_inventory has to justify first.
+ *
+ * ml124 THIRD POOL BACK ON THE TABLE. The [window] run/tag probe named the
+ * tenants at last: ~30 reservations of ~511MB (one per guest thread, 31 live)
+ * = 15.4GB, plus ONE 4.06GB read-only run = the ARM64EC code bitmap, which was
+ * sized for Windows' 128TB address space instead of iOS's 512GB. Sizing that
+ * bitmap from host_addr_space_limit (see alloc_arm64ec_map) drops it 4.06GB ->
+ * 16MB, taking furniture from 17.8GB to ~13.7GB -- under the 15.1GB that fits
+ * below 0x7400000000. So the ceiling comes back down to 0x73ffff0000 and slot#0
+ * is free again, giving the guard pool [0x73ffff0000, 0x7800000000) (its 64KB
+ * overhang landing exactly on the ceiling, which is exclusive for furniture)
+ * and the two plain pools 0x7800000000 and 0x7c00000000. Three pools.
+ *
+ * MARGIN IS THIN AND DOES NOT SCALE: 15.1 - 13.7 = ~1.4GB, and every further
+ * guest thread costs ~512MB, so roughly three more threads exhausts it. Watch
+ * [slot#0] -- if it goes DIRTY the relax valve has spilled into the pool slot
+ * again and the per-thread FEX LookupCache reservation is the next thing that
+ * has to shrink. */
+/* ml125 REVERTED TO 0x77ffff0000. The 3-pool geometry was tried and FAILED:
+ * with the window at 15.1GB, furniture (which the ml124 snapshot underestimated
+ * — it keeps growing after the jumbo-failure moment it was measured at) filled
+ * it to 99.5% (15403 of 15488 MB), the relax valve spilled into slot#0 AND
+ * slot#1, the extra pressure revived the #34 pool exec-fault, and it stormed
+ * 7.26 MILLION times. CEF never reached PartitionAlloc at all — strictly worse
+ * than the 2-pool runs. The EC-bitmap reclaim is KEPT (it is a real 4GB and
+ * gives this 31GB window more headroom than ml123 had), but a third pool needs
+ * the ~512MB-per-thread FEXCore LookupCache reservation to shrink first; VA
+ * freed elsewhere just gets absorbed by furniture growth. */
+static const ULONG_PTR ios_furniture_ceiling = 0x77ffff0000;
+
+/* ml116 ROOT CAUSE of the ceiling regressions (disassembly + code-path proof,
+ * no device run needed):
+ *
+ * With the ceiling active, map_view's kernel-pick branch sees
+ * end < host_addr_space_limit, which diverts EVERY anonymous placement off
+ * anon_mmap_alloc (kernel picks, essentially never fails) and onto Wine's own
+ * map_free_area linear scan. That scan starts at address_space_start =
+ * 0x100010000 and mmap-tryfixed steps by align_mask+1 until it reaches the
+ * first Wine view (~0x72a5000000): ~455GB of address space that the ml108 gap
+ * walk PROVED holds no free gap at all (iOS __PAGEZERO + the xzone/GPU
+ * reservation). At 64KB steps that is ~7.4 MILLION failing mach_vm_map calls
+ * for ONE allocation -- the ml107/ml109 "2s-to-splash became ~1min then death"
+ * regression, and the multi-minute Steam stalls. Worse, try_map_free_area
+ * bails out returning NULL on any errno that is not EEXIST/ENOMEM, so the
+ * grind can end in a silent STATUS_NO_MEMORY: that is the NULL rpmalloc
+ * returned to FEXCore::Context::ContextImpl::CreateThread in ml116
+ * (libarm64ecfex+0x16178 stp [x0=NULL], x0 = aligned_alloc(0x1000,0x2000)).
+ *
+ * The ceiling's packing geometry was never the problem -- its scan FLOOR was
+ * never raised to match. Nothing below this floor is mappable, so scanning it
+ * is pure waste; clamping both ends keeps the search inside the one real
+ * window and restores O(1) placement. */
+static const ULONG_PTR ios_usable_va_floor = 0x7038000000;
+
+/* [va-scan] probe: failing mmap-tryfixed attempts inside the current
+ * map_free_area call. virtual_mutex is held throughout, so a plain global is
+ * safe. Proves or refutes the grind above in one run. */
+static unsigned int ios_va_scan_tries;
+
+/* ml117: the grind is GONE (Thumper splash back to 2s) but a 512KB-aligned
+ * 512MB request still FAILED in the 15.1GB window with tries=0 — i.e.
+ * map_free_area rejected it on a structural guard without attempting a single
+ * mmap, then handed rpmalloc the NULL that killed FEX's CreateThread. tries=0
+ * narrows it to "no gap between Wine's own views was large enough", so record
+ * the geometry map_free_area actually saw: the base/end AFTER
+ * find_view_inside_range moved them, how many views were walked, the largest
+ * gap found, and which guard ended the search. */
+static void *ios_scan_base, *ios_scan_end;
+static unsigned int ios_scan_views;
+static size_t ios_scan_maxgap;
+static int ios_scan_stop;   /* see ios_scan_stop_name() */
+
+/* ml118 THE DISCRIMINATING QUESTION. The kernel's own walk reported ONE
+ * contiguous free hole 0x7038120000..0x73ffdf0000 = 15484 MB, yet Wine's scan
+ * reported 343 views with 2MB max gaps, and one failure showed 17 tryfixed
+ * calls ALL failing inside a gap Wine believed was free. Those cannot both be
+ * about occupancy. Two mutually exclusive explanations:
+ *   (a) the window really is full of mappings Wine's view tree cannot see, or
+ *   (b) the addresses are genuinely free and iOS is refusing the FIXED mapping
+ *       (mach_vm_map returning KERN_INVALID_ADDRESS/KERN_NO_SPACE — a hazard
+ *       try_map_free_area already documents for this platform).
+ * (a) means the ceiling needs a smaller furniture budget; (b) means Wine's
+ * fixed-address placement can never work here and the ceiling is unfixable, so
+ * the pools must instead be pre-reserved at startup. Capture the first failing
+ * address AND its errno, then ask the kernel what actually lives there. */
+static void *ios_scan_fail_addr;
+static int   ios_scan_fail_errno;
+
+/* Describe what the kernel believes is at addr: the enclosing region, or the
+ * hole it falls in. Non-destructive (query only). */
+static void ios_va_describe( void *addr, char *buf, size_t buflen )
+{
+    mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)addr;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+
+    if (mach_vm_region( mach_task_self(), &a, &size, VM_REGION_BASIC_INFO_64,
+                        (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS)
+    {
+        snprintf( buf, buflen, "no-region-above (free to end of VA)" );
+        return;
+    }
+    if (a > (mach_vm_address_t)(uintptr_t)addr)
+        snprintf( buf, buflen, "FREE hole, next region 0x%llx (+0x%llx away) <-- iOS REFUSED A FREE ADDRESS",
+                  (unsigned long long)a,
+                  (unsigned long long)(a - (mach_vm_address_t)(uintptr_t)addr) );
+    else
+        snprintf( buf, buflen, "OCCUPIED 0x%llx+0x%llx prot=%x/%x shared=%d",
+                  (unsigned long long)a, (unsigned long long)size,
+                  info.protection, info.max_protection, info.shared );
+}
+
+static const char *ios_scan_stop_name( int stop )
+{
+    switch (stop)
+    {
+    case 0: return "walked-all-views";
+    case 1: return "window<size@entry(bottom-up)";
+    case 2: return "gaps-exhausted(bottom-up)";
+    case 3: return "window<size@entry(top-down)";
+    case 4: return "gaps-exhausted(top-down)";
+    case 9: return "no-views-in-range";
+    default: return "?";
+    }
+}
 static void *working_set_limit   = (void *)0x7fffffff0000;  /* top of the current working set */
 #else
 static void *address_space_limit = (void *)0xc0000000;
@@ -3050,6 +3717,29 @@ void ios_jit_reclaim_process( void *peb )
 static void clear_arm64ec_range( const void *addr, size_t size )
 {
     UINT64 *map = arm64ec_view->base;
+    /* ml113 (task #35 fallout, but a pre-existing bug): commit the covering
+     * bitmap pages BEFORE writing, exactly as ios_jit_mark_ec_range does for
+     * the set path. This clear runs from ios_jit_reclaim_process for EVERY
+     * freed pool range — including copies whose EC bits were never set (pure
+     * x86-64 images), whose bitmap coverage is therefore still uncommitted
+     * reserve. The blind store then faults. It never crashed before only by
+     * accident: the bitmap's old home (0x7ef1dc0000) sat inside the
+     * [496G,512G) reclaim-recover band, which silently mprotect-committed
+     * such faults; the furniture ceiling moved the bitmap to 0x72f1dc0000,
+     * outside the band, and the first uncommitted clear killed a child at
+     * exit (ios_jit_reclaim_process+0x1d4, fault 0x72f1de3e68 = qword for
+     * pool VA ~0x11F340000). */
+    {
+        size_t bm_start = ((size_t)addr >> 12) / 8;
+        size_t bm_end   = (((size_t)addr + size) >> 12) / 8;
+        size_t bm_size  = ROUND_SIZE( bm_start, bm_end + 1 - bm_start, page_mask );
+        void *bm_page   = ROUND_ADDR( (char *)arm64ec_view->base + bm_start, page_mask );
+        /* set_vprot alone is the whole commit — it mprotects the covering
+         * pages RW without zeroing, exactly as the set path proves.
+         * (An mmap-over here would ZERO committed pages and wipe other
+         * modules' EC bits.) */
+        set_vprot( arm64ec_view, bm_page, bm_size, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED );
+    }
     const unsigned int ec_page_shift = 12;
     const size_t ec_page_mask = (1ULL << ec_page_shift) - 1;
     size_t idx = (size_t)addr >> ec_page_shift;
@@ -3065,6 +3755,21 @@ static void clear_arm64ec_range( const void *addr, size_t size )
     }
     else map[pos] &= ~maskbits( idx ) | maskbits( end );
 }
+
+/***********************************************************************
+ *           clear_arm64ec_range_committed
+ *
+ * ml113 (task #35 fallout): commit-aware clear for the EXIT-TIME reclaim.
+ * The EC bitmap is a sparse reservation — the set side commits covering
+ * pages before writing (ios_jit_mark_ec_range), but the reclaim cleared
+ * blindly and first-touched an uncommitted bitmap page inside
+ * process_exit_wrapper's mach-handler context.
+ *
+ * SUPERSEDED, NO SUCH FUNCTION: the commit was folded into
+ * clear_arm64ec_range itself (set_vprot before the clear). This header is all
+ * that was left, and it had lost its terminator, so it was swallowing the
+ * comment below it (-Wcomment). Kept for the ml113 rationale only.
+ */
 
 
 /***********************************************************************
@@ -3292,6 +3997,8 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
     {
         if (anon_mmap_tryfixed( start, size, unix_prot, 0 ) != MAP_FAILED) return start;
         TRACE( "Found free area is already mapped, start %p.\n", start );
+        ios_va_scan_tries++;
+        if (!ios_scan_fail_addr) { ios_scan_fail_addr = start; ios_scan_fail_errno = errno; }
 #ifdef WINE_IOS
         /* iOS: mach_vm_map can return KERN_INVALID_ADDRESS (→ ENOMEM) at certain
          * addresses due to ASLR/system mappings.  Keep scanning instead of aborting. */
@@ -3327,35 +4034,53 @@ static void *map_free_area( void *base, void *end, size_t size, int top_down, in
     ptrdiff_t step = top_down ? -(align_mask + 1) : (align_mask + 1);
     void *start;
 
+    /* [va-scan] geometry probe — see ios_scan_base. */
+    ios_scan_base = base;
+    ios_scan_end = end;
+    ios_scan_views = 0;
+    ios_scan_maxgap = 0;
+    ios_scan_stop = first ? 0 : 9;
+    ios_scan_fail_addr = NULL;
+    ios_scan_fail_errno = 0;
+
     if (top_down)
     {
         start = ROUND_ADDR( (char *)end - size, align_mask );
-        if (start >= end || start < base) return NULL;
+        if (start >= end || start < base) { ios_scan_stop = 3; return NULL; }
 
         while (first)
         {
             struct file_view *view = WINE_RB_ENTRY_VALUE( first, struct file_view, entry );
-            if ((start = try_map_free_area( (char *)view->base + view->size, (char *)start + size, step,
+            char *gap_lo = (char *)view->base + view->size;
+
+            ios_scan_views++;
+            if ((char *)start + size > gap_lo && (size_t)((char *)start + size - gap_lo) > ios_scan_maxgap)
+                ios_scan_maxgap = (char *)start + size - gap_lo;
+            if ((start = try_map_free_area( gap_lo, (char *)start + size, step,
                                             start, size, unix_prot ))) break;
             start = ROUND_ADDR( (char *)view->base - size, align_mask );
             /* stop if remaining space is not large enough */
-            if (!start || start >= end || start < base) return NULL;
+            if (!start || start >= end || start < base) { ios_scan_stop = 4; return NULL; }
             first = rb_prev( first );
         }
     }
     else
     {
         start = ROUND_ADDR( (char *)base + align_mask, align_mask );
-        if (!start || start >= end || (char *)end - (char *)start < size) return NULL;
+        if (!start || start >= end || (char *)end - (char *)start < size) { ios_scan_stop = 1; return NULL; }
 
         while (first)
         {
             struct file_view *view = WINE_RB_ENTRY_VALUE( first, struct file_view, entry );
+
+            ios_scan_views++;
+            if ((char *)view->base > (char *)start && (size_t)((char *)view->base - (char *)start) > ios_scan_maxgap)
+                ios_scan_maxgap = (char *)view->base - (char *)start;
             if ((start = try_map_free_area( start, view->base, step,
                                             start, size, unix_prot ))) break;
             start = ROUND_ADDR( (char *)view->base + view->size + align_mask, align_mask );
             /* stop if remaining space is not large enough */
-            if (!start || start >= end || (char *)end - (char *)start < size) return NULL;
+            if (!start || start >= end || (char *)end - (char *)start < size) { ios_scan_stop = 2; return NULL; }
             first = rb_next( first );
         }
     }
@@ -4101,6 +4826,23 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 ios_jit_rw_base_global = jit_rw_base;
                 ios_jit_pool_size_global = jit_pool_size;
 
+                /* ml91 (task #35): dump the VA map ONCE here, unconditionally.
+                 * The first cut only probed on jumbo-reserve failure, so a
+                 * Thumper run (which never issues one) produced no map at all —
+                 * exactly when we needed to know why all six sub-64G candidates
+                 * for the RW alias were refused. This is the baseline picture
+                 * before CEF asks for anything. */
+                ios_va_gap_probe( "jit pool init" );
+
+                /* task #34: start the pool warmer (see ios_pool_warmer_thread).
+                 * Keeps every used pool page off the inactive queue so the
+                 * compressor never gets to replace a blessed page's frame. */
+                {
+                    pthread_t warm;
+                    if (!pthread_create( &warm, NULL, ios_pool_warmer_thread, NULL ))
+                        pthread_detach( warm );
+                }
+
                 /* Write TEB restore trampoline at start of JIT pool.
                  * TEB value (0 for now, set later by signal code) at offset 0,
                  * executable trampoline at offset 8. */
@@ -4375,6 +5117,10 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
              * This preserves ADRP-based PC-relative references between sections. */
             memcpy((char *)jit_rw_base + offset, image_base, image_size);
             sys_icache_invalidate((char *)jit_rx_base + offset, image_size);
+            ios_jit_verify_copy( (const char *)image_base,
+                                 (const char *)jit_rx_base + offset,
+                                 image_size, ios_pe_module_name( image_base, image_size ),
+                                 offset, ios_pool_last_alloc_reused );
 
             /* Record mapping for the entire image */
             ios_jit_add_mapping(image_base, (char *)jit_rx_base + offset, image_size);
@@ -4964,6 +5710,13 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
     src = (char *)m->pe_base;
 
     memcpy(rw_dest, src, m->size);
+    /* task #34: verify HERE, before relocations/x18 patching legitimately
+     * diverge the copy from its source. This is the path that produces the
+     * per-pseudo-process copies that keep dying (libarm64ecfex, rpcrt4). */
+    sys_icache_invalidate(rx_dest, m->size);
+    ios_jit_verify_copy( src, rx_dest, m->size,
+                         ios_pe_module_name( src, m->size ),
+                         offset, ios_pool_last_alloc_reused );
 
     pe_off = *(unsigned int *)(rw_dest + 0x3C);
     pe_image_base = m->pe_image_base ? m->pe_image_base
@@ -5459,11 +6212,53 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
     {
         void *start = address_space_start;
         void *end = min( user_space_limit, host_addr_space_limit );
+        /* task #35 furniture ceiling — see its definition. Kernel-pick views
+         * below 16GB (TEBs, stacks, anon views, section views incl. the 4GB
+         * top-of-space tenant from ml106) stay below 464G-64K; only the PA
+         * 16GB/32GB pool reserves may use the slots above. */
+        int ceiling_relaxable = 0;
+        if (ios_furniture_ceiling && !limit_high && size < 0x400000000ULL &&
+            (void *)ios_furniture_ceiling < end)
+        {
+            end = (void *)ios_furniture_ceiling;
+            /* Relaxable when the only *effective* constraint is ours. ml119
+             * BUG: the first cut used !limit_low, so a caller passing a small
+             * non-zero limit_low (<= address_space_start, i.e. not actually
+             * constraining anything) disabled both the floor raise and the
+             * fallback. Those calls kept scanning from 0x100010000 and burned
+             * 21,875 failing mach_vm_map calls EACH — 1.42 MILLION across
+             * ml119's 65 [va-scan] SLOW lines. A limit_low at or below
+             * address_space_start is satisfied by any placement we would make
+             * anyway, so treat it as absent: the floor is above it, and
+             * relaxing reproduces exactly what a ceiling-disabled build does
+             * for the same call. (top_down is a hint, not a contract, and is
+             * knowingly dropped on the relax path.) */
+            ceiling_relaxable = (limit_low <= (ULONG_PTR)address_space_start);
+        }
         size_t host_size = ROUND_SIZE( 0, size, host_page_mask );
         size_t unmap_size, view_size = host_size + align_mask + 1;
 
         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
+
+        /* task #35 (ml116): raise the scan floor to match the ceiling — see
+         * ios_usable_va_floor. Gated on end already being at/below the ceiling,
+         * which is exactly the set of requests the ceiling put on the scan path
+         * (clamped kernel-picks, plus images via map_image_view's limit_high).
+         * Jumbo pool reserves keep end == host_addr_space_limit and so keep the
+         * kernel-pick placement the ml96/ml105 census measured, and genuinely
+         * low-limited callers (zero_bits / 4GB-capped) are far below the floor
+         * and untouched. The window must still be able to hold the request. */
+        /* ml118 BUG FIX: gate on ceiling_relaxable, not merely on end<=ceiling.
+         * The first cut raised the floor for limit_low/limit_high callers too,
+         * narrowing their window while giving them NO escape valve — a 1MB
+         * request then hit a hard STATUS_NO_MEMORY (ml118 line 2471) and killed
+         * Thumper with exit(3) two lines later. Never impose a constraint we
+         * cannot also withdraw. */
+        if (ceiling_relaxable && start < (void *)ios_usable_va_floor &&
+            (char *)end > (char *)ios_usable_va_floor &&
+            (size_t)((char *)end - (char *)ios_usable_va_floor) >= view_size)
+            start = (void *)ios_usable_va_floor;
 
         if ((ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )))
         {
@@ -5473,10 +6268,58 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
         if (start > address_space_start || end < host_addr_space_limit || top_down)
         {
-            if (!(ptr = map_free_area( start, end, host_size, top_down, unix_prot, align_mask )))
-                return STATUS_NO_MEMORY;
-            TRACE( "got mem with map_free_area %p-%p\n", ptr, (char *)ptr + size );
-            goto done;
+            unsigned int tries0 = ios_va_scan_tries;
+
+            ptr = map_free_area( start, end, host_size, top_down, unix_prot, align_mask );
+            /* [va-scan] the ml116/ml117 probe: a healthy scan costs a handful of
+             * tryfixed calls. Hundreds means we are grinding unmappable VA;
+             * ptr==NULL is the silent STATUS_NO_MEMORY that handed rpmalloc a
+             * NULL. Either is the ceiling regression, so say so out loud — with
+             * the geometry map_free_area actually saw, since ml117 failed with
+             * tries=0 (rejected on a guard, no mmap attempted). */
+            if (!ptr || ios_va_scan_tries - tries0 >= 64)
+            {
+                static int described;
+                char what[128];
+
+                /* ml118 discriminator — see ios_scan_fail_addr. Rate-limited:
+                 * the mach query is cheap but not free, and the first handful
+                 * of verdicts settle the question. */
+                what[0] = 0;
+                if (ios_scan_fail_addr && described++ < 12)
+                    ios_va_describe( ios_scan_fail_addr, what, sizeof(what) );
+
+                dprintf( 2, "[va-scan] %s window=%p..%p size=%p align=%p %s tries=%u"
+                            " | seen=%p..%p views=%u maxgap=%p stop=%s"
+                            " | firstfail=%p errno=%d(%s) %s%s\n",
+                         ptr ? "SLOW" : "FAILED", start, end, (void *)size,
+                         (void *)(align_mask + 1), top_down ? "top-down" : "bottom-up",
+                         ios_va_scan_tries - tries0,
+                         ios_scan_base, ios_scan_end, ios_scan_views,
+                         (void *)ios_scan_maxgap, ios_scan_stop_name( ios_scan_stop ),
+                         ios_scan_fail_addr, ios_scan_fail_errno,
+                         ios_scan_fail_errno ? strerror( ios_scan_fail_errno ) : "-", what,
+                         ptr ? "" : (ceiling_relaxable ? "  --> relaxing ceiling, retrying unclamped"
+                                                       : "  <-- STATUS_NO_MEMORY (callers see a NULL alloc)") );
+            }
+            if (ptr)
+            {
+                TRACE( "got mem with map_free_area %p-%p\n", ptr, (char *)ptr + size );
+                goto done;
+            }
+            /* ml117: THE CEILING IS ADVISORY, NEVER FATAL. It exists only to
+             * bias Wine's furniture low so the top 16GB-aligned slots stay free
+             * for PartitionAlloc; failing an allocation for it is strictly worse
+             * than landing one view in a pool slot (worst case = 2 pools instead
+             * of 3, versus a dead process). So when the clamped window cannot
+             * satisfy the request, drop our own constraints and fall through to
+             * the unclamped kernel pick below. Only constraints WE added are
+             * dropped — a caller-supplied limit_high never sets
+             * ceiling_relaxable, so its contract still holds. */
+            if (!ceiling_relaxable) return STATUS_NO_MEMORY;
+            start = address_space_start;
+            end = min( user_space_limit, host_addr_space_limit );
+            if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
         }
 
         for (;;)
@@ -5660,6 +6503,39 @@ static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max
  * Decommit some pages of a given view.
  * virtual_mutex must be held by caller.
  */
+/* task #34 tripwire (ml92/ml94): does [rw_start, rw_start+size) intersect a
+ * LIVE pool ledger range? The ledger tracks head allocations — loaded DLL
+ * copies — while legitimate anon-alias decommits target FEX CodeBuffers carved
+ * from the pool TAIL, which are not ledgered. So an overlap here is never
+ * legitimate: it means the alias is stale (its range was freed and recycled to
+ * a different module) and zeroing through it would blank live code. Returns the
+ * offending ledger entry so the log can name the victim. */
+static int ios_pool_live_overlap( uintptr_t rw_start, size_t size,
+                                  size_t *off_out, void **peb_out )
+{
+    uintptr_t rw_base = (uintptr_t)ios_jit_rw_base_global;
+    size_t s, e;
+    int j;
+
+    if (!rw_base || rw_start < rw_base) return 0;
+    s = rw_start - rw_base;
+    if (s >= ios_jit_pool_size_global) return 0;
+    e = s + size;
+
+    for (j = 0; j < ios_pool_ledger_count; j++)
+    {
+        size_t l_off = ios_pool_ledger[j].off;
+        size_t l_end = l_off + ios_pool_ledger[j].size;
+        if (l_off < e && l_end > s)
+        {
+            if (off_out) *off_out = l_off;
+            if (peb_out) *peb_out = ios_pool_ledger[j].peb;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size )
 {
     char *host_end, *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
@@ -5689,7 +6565,24 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
         uintptr_t rw_alias = ios_jit_anon_alias_lookup( (uintptr_t)base );
         if (rw_alias)
         {
-            memset( (void *)rw_alias, 0, size );
+            /* ml92/ml94 [alias-tomb]: the exec faults that survived removing the
+             * MADV sweep all landed on RECYCLED pool ranges whose instruction
+             * stream read back as ZEROS (insn_stream 00000000 00000000, and the
+             * nls poison 0xdead1 still intact) — the signature of this memset
+             * firing through a stale alias, not of iOS harvesting a page. The
+             * allocator's own comment predicted it: "any guest MEM_DECOMMIT of
+             * the old user VA memsets the NEW occupant to zero via
+             * decommit_pages' alias path -> blr into zeros -> fault storm."
+             * Refuse it: zeroing a loaded DLL copy is never the right answer,
+             * and the log names the victim so the claim is checkable. */
+            size_t l_off = 0;
+            void  *l_peb = NULL;
+            if (ios_pool_live_overlap( rw_alias, size, &l_off, &l_peb ))
+                dprintf(2, "[alias-tomb] STALE alias decommit REFUSED: user_va=%p size=0x%lx rw_alias=0x%lx -> pool off=0x%lx (LIVE, peb=%p) — would have zeroed a loaded module\n",
+                        base, (unsigned long)size, (unsigned long)rw_alias,
+                        (unsigned long)l_off, l_peb);
+            else
+                memset( (void *)rw_alias, 0, size );
         }
         else if (host_start < host_end)
         {
@@ -6012,7 +6905,20 @@ static void *get_host_addr_space_limit(void)
         else if (errno == EEXIST) break;
         addr >>= 1;
     }
-    return (void *)((addr << 1) - (granularity_mask + 1));
+    /* ml122 THE TOP-SLOT UNLOCK. Upstream subtracts one allocation granule
+     * here, which makes host_addr_space_limit 0x7fffff0000 on iOS: 64KB below
+     * the true 512GB boundary. is_beyond_limit() treats limit as EXCLUSIVE
+     * (addr + size > limit rejects), so that granule of conservatism rejects
+     * any mapping ending exactly at 0x8000000000 -- which is every possible
+     * 16GB reservation in the top slot [0x7c00000000, 0x8000000000). That is
+     * why PartitionAlloc's plain pool kept falling through 0x7c00000000 to
+     * 0x7800000000 (ml120, ml122), stealing the ONLY slot the guard-style pool
+     * can use (a guard pool needs 64KB free below its 16GB boundary, and the
+     * top slot has the end of the address space above it, so it can never host
+     * one). Net effect: one pool instead of two. (addr << 1) is already the
+     * first UNMAPPABLE address, which is exactly the exclusive bound
+     * is_beyond_limit wants, so return it unmodified. */
+    return (void *)(addr << 1);
 }
 
 #endif /* _WIN64 */
@@ -6025,7 +6931,25 @@ static void *get_host_addr_space_limit(void)
 static void alloc_arm64ec_map(void)
 {
     unsigned int status;
-    SIZE_T size = ((ULONG_PTR)address_space_limit + page_size) >> (page_shift + 3);  /* one bit per page */
+    /* ml124: size the EC bitmap from the address space that can actually EXIST,
+     * not Windows' theoretical one. Upstream uses address_space_limit =
+     * 0x7fffffff0000 (128TB), and at one bit per 4KB page that is a 4.06GB
+     * reservation -- measured as [window] run#0, the single largest tenant of
+     * the furniture window. Nothing on iOS can be mapped at or above
+     * host_addr_space_limit (0x8000000000 = 512GB), so every address that can
+     * ever be marked indexes below 0x8000000000 >> 15 = 16MB. That is a 256x
+     * cut for 4.06GB back, and unlike the ~512MB-per-thread FEX LookupCache
+     * reservations it does not scale with thread count.
+     *
+     * Safe because every other bitmap user derives its byte index from the
+     * ADDRESS being marked ((size_t)addr >> 12 / 8) and commits through
+     * set_vprot on this same view -- none of them recompute the size from
+     * address_space_limit, so none can index past the smaller view while the
+     * VA ceiling holds. */
+    ULONG_PTR ec_limit = (ULONG_PTR)address_space_limit;
+    if (host_addr_space_limit && (ULONG_PTR)host_addr_space_limit < ec_limit)
+        ec_limit = (ULONG_PTR)host_addr_space_limit;
+    SIZE_T size = (ec_limit + page_size) >> (page_shift + 3);  /* one bit per page */
 
     size = ROUND_SIZE( 0, size, host_page_mask );
     status = map_view( &arm64ec_view, NULL, size, MEM_TOP_DOWN, VPROT_READ | VPROT_COMMITTED, 0, 0, 0 );
@@ -6609,7 +7533,11 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
                     (image_info->image_flags & IMAGE_FLAGS_ImageDynamicallyRelocated);
 
     limit_low = max( limit_low, (ULONG_PTR)address_space_start );  /* make sure the DOS area remains free */
-    if (!limit_high) limit_high = (ULONG_PTR)user_space_limit;
+    /* task #35 furniture ceiling: images pack below it (inclusive limit).
+     * Disabled while ios_furniture_ceiling == 0 — see its definition. */
+    if (!limit_high)
+        limit_high = ios_furniture_ceiling ? min( (ULONG_PTR)user_space_limit, ios_furniture_ceiling - 1 )
+                                           : (ULONG_PTR)user_space_limit;
 
     /* first try the specified base */
 
@@ -8665,26 +9593,72 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
 #ifdef WINE_IOS
     {
         NTSTATUS st;
+        /* task #35 DEMAND CENSUS: is CEF's ~144GB real, or is it retries?
+         * The [jumbo] lines are one-per-call, and PartitionAlloc re-rolls a
+         * fresh random hint when a reserve fails — so three failed 16GB lines
+         * are equally consistent with ONE pool retried three times as with
+         * three distinct pools. 144GB is hopeless against a 63GB window; ~80GB
+         * (3 pools + one 32GB region) is closeable by freeing slots. Log every
+         * jumbo call with a sequence number, inter-call gap and thread so
+         * retries (same size, same tid, sub-ms apart) separate from distinct
+         * reservations — and so a caller that DEGRADES after failure (asks
+         * again smaller) shows up as a descending size run. */
+        void  *jumbo_hint = *ret;
+        size_t jumbo_size = *size_ptr;
+        int    is_jumbo   = (jumbo_size >= 0x40000000 && (type & MEM_RESERVE));
+        /* ml125 [bigres]: settle the furniture attribution WITHOUT an FEX build.
+         * The [window] probe found ~30 runs of ~511MB and I inferred FEXCore's
+         * per-thread LookupCache (TotalCacheSize = VirtualMemSize/4096*8 +
+         * CODE_SIZE + MAX_L1_SIZE) — but I have now mis-attributed this twice
+         * from size coincidences alone, so measure it instead: every reserve
+         * between 256MB and the 1GB jumbo threshold, with a running total and
+         * count. If ~31 of these land at exactly 0x1ff10000 the attribution is
+         * proven and the page-pointer array is the thing to shrink; if they are
+         * a mix of sizes it is something else entirely and the FEX redesign
+         * would have been wasted work. */
+        if (jumbo_size >= 0x10000000 && jumbo_size < 0x40000000 && (type & MEM_RESERVE))
+        {
+            static unsigned bigres_n;
+            static unsigned long long bigres_tot;
+            bigres_n++;
+            bigres_tot += jumbo_size;
+            dprintf(2, "[bigres] #%u size=0x%lx (%lu MB) hint=%p total=%llu MB\n",
+                    bigres_n, (unsigned long)jumbo_size,
+                    (unsigned long)(jumbo_size >> 20), jumbo_hint, bigres_tot >> 20);
+        }
         /* task#29 CEF: PartitionAlloc (chrome_elf DllMain) reserves multi-GB
-         * pools (16GB pool + 16GB align slack = one 32GB kernel-pick). iOS
-         * caps user VA at 0x8000000000 (39-bit; the extended-VA entitlement
-         * is not available to free personal teams), and wine's furniture
-         * (PE images, TEBs, stacks, EC bitmap) clusters at the TOP of that
-         * space, so jumbo kernel-picks die of top-of-space fragmentation
-         * (probe ml59: 0x800000000 reserve -> c0000017 twice -> chrome_elf
-         * OOM immediate-crash) — while ~200GB sits empty in the middle.
-         * Steer jumbo (>=1GB) kernel-pick reserves into the middle zone
-         * [0x4000000000, 0x7800000000); fall back to the default search if
-         * the zone ever fills. */
+         * pools. iOS caps user VA at 0x8000000000 (39-bit; extended-VA is not
+         * available to free personal teams) and wine's furniture (PE images,
+         * TEBs, stacks, EC bitmap) clusters at the TOP of that space. */
         if (!*ret && *size_ptr >= 0x40000000 && (type & MEM_RESERVE) && !limit)
         {
-            st = allocate_virtual_memory( ret, size_ptr, type, protect,
-                                          0x4000000000ULL, 0x77ffffffffULL, 0, 0 );
+            /* ml92 (task #35) MEASURED, replacing two generations of guesses.
+             * The original target was [256G,480G) — written before the GPU
+             * carveout was known, and 192GB of it is carveout, so it could
+             * never be served. The replacement target [8G,64G) is no better:
+             * the map walk shows the only free region below 64G is
+             * 0..0x102454000 = __PAGEZERO, and 4G-64G is fully reserved
+             * (malloc xzone). There is no middle zone. Usable VA is exactly
+             * one window, 0x7038000000..0x7fffdf0000 (~63GB), which is what
+             * the default search already targets — so skip the pointless
+             * pre-attempt and let the hinted-retry slot walk below do the
+             * work. Probe the map when we come up short. */
+            st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
             if (st)
             {
-                dprintf(2, "[jumbo] middle-zone place failed (0x%x) for size=0x%lx — falling back to default search\n",
+                static int probed;
+                dprintf(2, "[jumbo] kernel-pick reserve failed (0x%x) for size=0x%lx — top window is full\n",
                         (unsigned)st, (unsigned long)*size_ptr);
-                st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
+                if (probed++ < 2)
+                {
+                    ios_va_gap_probe( "jumbo reserve failed" );
+                    /* task #35: the gap walk says HOW MUCH is left; this says
+                     * WHAT ate the window, which is what decides whether a
+                     * third pool is reachable at all. */
+                    ios_window_inventory( "jumbo reserve failed",
+                                          ios_usable_va_floor, ios_furniture_ceiling );
+                    ios_slot_probe( "jumbo reserve failed" );
+                }
             }
         }
         else
@@ -8714,13 +9688,47 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                 ULONG_PTR align_unit = 0x400000000ULL;              /* 16GB */
                 ULONG_PTR off = (ULONG_PTR)hint & (align_unit - 1);
                 ULONG_PTR slot;
-                for (slot = 0x7C00000000ULL; slot >= 0x6800000000ULL && st2; slot -= align_unit)
+                /* ml106 packing rule: a guard-style reservation (off != 0,
+                 * PartitionAlloc's boundary-minus-64KB layout) overhangs 64KB
+                 * BELOW its slot, so placed high it poisons the slot beneath —
+                 * that single overhang is why only 2 of 3 pools ever fit. Fill
+                 * guard-style requests BOTTOM-UP from the ceiling (first cand
+                 * 0x73ffff0000, whose overhang lands on furniture-free space by
+                 * construction) and off=0 requests TOP-DOWN from 0x7C00000000.
+                 * Perfect packing: [0x73ffff0000,0x78) guard, [0x78,0x7C) and
+                 * [0x7C,0x8000000000) off=0 — all three pools fit. */
+                /* ml122: start the guard walk at the first slot AT OR ABOVE the
+                 * furniture ceiling. The old hardcoded 0x7400000000 base was
+                 * written for the 0x73ffff0000 ceiling; with the ceiling now at
+                 * 0x77ffff0000 that first candidate lands inside the furniture
+                 * window and is guaranteed to fail, wasting an attempt. By
+                 * construction ceiling == slot - 64KB, so the first viable
+                 * guard candidate is exactly the ceiling itself. */
+                ULONG_PTR guard_first = (ios_furniture_ceiling
+                                         ? ((ios_furniture_ceiling + align_unit) & ~(align_unit - 1))
+                                         : 0x7400000000ULL);
+                if (off)
                 {
-                    void *cand = (void *)(slot + off - (off ? align_unit : 0));
+                    for (slot = guard_first; slot <= 0x7C00000000ULL && st2; slot += align_unit)
+                    {
+                        void *cand = (void *)(slot + off - align_unit);
+                        SIZE_T csz = *size_ptr;
+                        pick = cand;
+                        st2 = allocate_virtual_memory( &pick, &csz, type, protect, 0, 0, 0, 0 );
+                        dprintf(2, "[jumbo] cand guard slot=0x%llx -> %p size=0x%lx st=0x%x\n",
+                                (unsigned long long)slot, cand, (unsigned long)csz, (unsigned)st2);
+                        if (!st2) sz = csz;
+                    }
+                }
+                else for (slot = 0x7C00000000ULL; slot >= 0x6800000000ULL && st2; slot -= align_unit)
+                {
+                    void *cand = (void *)slot;
                     SIZE_T csz = *size_ptr;
                     if ((ULONG_PTR)cand < 0x6000000000ULL) break;
                     pick = cand;
                     st2 = allocate_virtual_memory( &pick, &csz, type, protect, 0, 0, 0, 0 );
+                    dprintf(2, "[jumbo] cand plain slot=0x%llx size=0x%lx st=0x%x\n",
+                            (unsigned long long)slot, (unsigned long)csz, (unsigned)st2);
                     if (!st2) sz = csz;
                 }
                 if (st2)
@@ -8731,6 +9739,17 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                 }
                 dprintf(2, "[jumbo] hinted reserve %p size=0x%lx failed (0x%x) — offset-preserving retry -> %p (0x%x)\n",
                         hint, (unsigned long)*size_ptr, (unsigned)st, pick, (unsigned)st2);
+                if (st2)
+                {
+                    static int probed2;
+                    if (probed2++ < 2)
+                    {
+                        ios_va_gap_probe( "hinted jumbo retry exhausted" );
+                        ios_window_inventory( "hinted jumbo retry exhausted",
+                                              ios_usable_va_floor, ios_furniture_ceiling );
+                        ios_slot_probe( "hinted jumbo retry exhausted" );
+                    }
+                }
                 if (!st2)
                 {
                     *ret = pick;
@@ -8740,6 +9759,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
             }
         }
 
+        if (is_jumbo) ios_jumbo_census( jumbo_hint, jumbo_size, st ? NULL : *ret, (unsigned)st );
         return st;
     }
 #else
@@ -8977,22 +9997,40 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
 #ifdef WINE_IOS
     {
         NTSTATUS st;
-        /* task#29 CEF jumbo-reserve middle-zone steering — see
-         * NtAllocateVirtualMemory for the rationale. Only when the caller
-         * imposed no constraints of its own. */
-        if (!*ret && *size_ptr >= 0x40000000 && (type & MEM_RESERVE) &&
-            !align && !limit_low && !limit_high)
+        /* ml92: the middle-zone steering that used to live here targeted
+         * [256G,480G), which is 192GB GPU carveout — it could never succeed.
+         * There is no middle zone at all (see NtAllocateVirtualMemory), so go
+         * straight to the default search, and census jumbo calls the same way
+         * so PartitionAlloc's demand is counted no matter which entry point
+         * it uses. */
+        void  *jumbo_hint = *ret;
+        size_t jumbo_size = *size_ptr;
+        int    is_jumbo   = (jumbo_size >= 0x40000000 && (type & MEM_RESERVE));
+        /* ml125 [bigres]: settle the furniture attribution WITHOUT an FEX build.
+         * The [window] probe found ~30 runs of ~511MB and I inferred FEXCore's
+         * per-thread LookupCache (TotalCacheSize = VirtualMemSize/4096*8 +
+         * CODE_SIZE + MAX_L1_SIZE) — but I have now mis-attributed this twice
+         * from size coincidences alone, so measure it instead: every reserve
+         * between 256MB and the 1GB jumbo threshold, with a running total and
+         * count. If ~31 of these land at exactly 0x1ff10000 the attribution is
+         * proven and the page-pointer array is the thing to shrink; if they are
+         * a mix of sizes it is something else entirely and the FEX redesign
+         * would have been wasted work. */
+        if (jumbo_size >= 0x10000000 && jumbo_size < 0x40000000 && (type & MEM_RESERVE))
         {
-            st = allocate_virtual_memory( ret, size_ptr, type, protect,
-                                          0x4000000000ULL, 0x77ffffffffULL, 0, attributes );
-            if (st)
-                st = allocate_virtual_memory( ret, size_ptr, type, protect,
-                                              limit_low, limit_high, align, attributes );
+            static unsigned bigres_n;
+            static unsigned long long bigres_tot;
+            bigres_n++;
+            bigres_tot += jumbo_size;
+            dprintf(2, "[bigres] #%u size=0x%lx (%lu MB) hint=%p total=%llu MB\n",
+                    bigres_n, (unsigned long)jumbo_size,
+                    (unsigned long)(jumbo_size >> 20), jumbo_hint, bigres_tot >> 20);
         }
-        else
-            st = allocate_virtual_memory( ret, size_ptr, type, protect,
-                                          limit_low, limit_high, align, attributes );
 
+        st = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                      limit_low, limit_high, align, attributes );
+
+        if (is_jumbo) ios_jumbo_census( jumbo_hint, jumbo_size, st ? NULL : *ret, (unsigned)st );
         return st;
     }
 #else
@@ -9381,6 +10419,39 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                         uint64_t *p = (uint64_t *)jit_rw_dest;
                         uint64_t *end_p = (uint64_t *)(jit_rw_dest + (size & ~7));
                         int fixup_count = 0;
+                        /* task #34 [ec-poison] PROBE ONLY — changes nothing.
+                         *
+                         * This loop rewrites EVERY 8-byte word whose value looks
+                         * like a PE image address (24608 of them in
+                         * steamwebhelper.exe alone, ml100). That is correct for
+                         * an ARM64EC function pointer, which must reach the pool
+                         * copy — and WRONG for an x86 one, which must stay a
+                         * guest PE address so FEX can translate it. A poisoned
+                         * x86 pointer sends the guest into the pool, which is
+                         * exactly the [rip-leak] signature (ml95, ml100: guest
+                         * RIP holding a pool address that reverse-translates to
+                         * a real module+rva).
+                         *
+                         * peb->EcCodeBitMap already distinguishes the two. Count
+                         * how many translations target NON-EC (x86) code before
+                         * changing any behaviour — the sync fixed real bugs (the
+                         * rpcss milestone depends on it), so it does not get
+                         * narrowed on a hunch. */
+                        /* ml102 FIX: do NOT rewrite pointers into x86-64 code.
+                         * The probe measured 74985 of 133709 translations
+                         * (56.08%) landing on x86 .text — each one a pool
+                         * address planted where the guest expects a PE address,
+                         * which is the [rip-leak] death (ml95/ml100: guest RIP
+                         * holding a pool address that reverse-translates to a
+                         * real module+rva). Data pointers and ARM64EC code
+                         * pointers still translate, because for those the pool
+                         * copy IS the live one — this only removes the case that
+                         * is always wrong. Ratios varied per region (2/2,
+                         * 6006/18029, 161/2240), which is what distinguishes
+                         * this from the earlier EcCodeBitMap probe that reported
+                         * a meaningless 100%. */
+                        int x86skip = 0;
+                        uint64_t x86_first = 0;
                         while (p < end_p)
                         {
                             uint64_t val = *p;
@@ -9390,12 +10461,24 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                                         (void *)(uintptr_t)val, sync_owner);
                                 if (nv != (void *)(uintptr_t)val)
                                 {
-                                    *p = (uint64_t)(uintptr_t)nv;
-                                    fixup_count++;
+                                    if (ios_va_is_x86_code( val ))
+                                    {
+                                        if (!x86skip) x86_first = val;
+                                        x86skip++;
+                                    }
+                                    else
+                                    {
+                                        *p = (uint64_t)(uintptr_t)nv;
+                                        fixup_count++;
+                                    }
                                 }
                             }
                             p++;
                         }
+                        if (x86skip)
+                            dprintf(2, "[x86-ptr] region %p+0x%lx: KEPT %d guest x86-CODE pointers (first 0x%llx), translated %d others\n",
+                                    base, (unsigned long)size, x86skip,
+                                    (unsigned long long)x86_first, fixup_count);
                         /* dprintf, not ERR — the perf WINEDEBUG default mutes
                          * err+virtual and this is the owner-routing evidence. */
                         if (fixup_count)

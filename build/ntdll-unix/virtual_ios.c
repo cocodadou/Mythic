@@ -259,11 +259,19 @@ static void ios_bigres_report( const char *why );   /* defined below */
 
 static void ios_slot_probe( const char *why )
 {
-    static const mach_vm_address_t slots[3] = { 0x7400000000ULL, 0x7800000000ULL, 0x7C00000000ULL };
+    /* ml149: probe 0x7000000000 too — it is a genuine 16GB-ALIGNED candidate and
+     * the ONLY route to a fourth pool. The GPU carveout [64G,448G) ends at
+     * exactly 0x7000000000, and ios_usable_va_floor is 0x7038000000, so only the
+     * first 896MB of that slot is blocked. If that occupant is ours (or movable)
+     * a fourth slot exists and the wall disappears without touching Chromium —
+     * whose kPoolMaxSize is compile-time and not ours to change. Report what is
+     * actually in there rather than assuming it is the xzone. */
+    static const mach_vm_address_t slots[4] = { 0x7000000000ULL, 0x7400000000ULL,
+                                                0x7800000000ULL, 0x7C00000000ULL };
     const mach_vm_size_t SLOT = 0x400000000ULL;   /* 16GB */
     int i;
 
-    for (i = 0; i < 3; i++)
+    for (i = 0; i < 4; i++)
     {
         mach_vm_address_t lo = slots[i], hi = slots[i] + SLOT, addr = lo;
         mach_vm_size_t occupied = 0;
@@ -290,9 +298,35 @@ static void ios_slot_probe( const char *why )
             addr = q + size;
         }
         if (occupied)
+        {
             dprintf(2, "[slot#%d] 0x%llx+16GB DIRTY regions=%d occupied=%llu MB first=0x%llx+0x%llx (%s)\n",
                     i, (unsigned long long)lo, regions, (unsigned long long)(occupied >> 20),
                     (unsigned long long)first_occ, (unsigned long long)first_sz, why);
+            /* ml149: for the 448G slot, enumerate the blockers with their
+             * protections — that is what decides whether they are ours to move. */
+            if (lo == 0x7000000000ULL)
+            {
+                mach_vm_address_t a2 = lo;
+                int shown = 0;
+                while (a2 < hi && shown < 8)
+                {
+                    mach_vm_size_t sz2 = 0;
+                    vm_region_basic_info_data_64_t inf2;
+                    mach_msg_type_number_t c2 = VM_REGION_BASIC_INFO_COUNT_64;
+                    mach_port_t o2 = MACH_PORT_NULL;
+                    mach_vm_address_t q2 = a2;
+                    if (mach_vm_region( mach_task_self(), &q2, &sz2, VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&inf2, &c2, &o2 ) != KERN_SUCCESS) break;
+                    if (q2 >= hi) break;
+                    dprintf(2, "[slot#0]   blocker 0x%llx+0x%llx (%llu MB) prot=%x/%x shared=%d\n",
+                            (unsigned long long)q2, (unsigned long long)sz2,
+                            (unsigned long long)(sz2 >> 20), inf2.protection,
+                            inf2.max_protection, inf2.shared);
+                    shown++;
+                    a2 = q2 + sz2;
+                }
+            }
+        }
         else
             dprintf(2, "[slot#%d] 0x%llx+16GB CLEAR (%s)\n",
                     i, (unsigned long long)lo, why);
@@ -595,6 +629,182 @@ static unsigned long long ios_now_ms( void )
     return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)(ts.tv_nsec / 1000000);
 }
 
+
+/* ml144 POOL ATTRIBUTION — which GUEST module is asking?
+ *
+ * CEF requests FOUR 16GB pools but PartitionAddressSpace::Init() reserves only
+ * ONE plain (Regular) + ONE guarded (BRP). Two of each means Init() runs twice,
+ * and ml144 ruled out the easy explanations: exactly one libcef.dll copy, one
+ * chrome_elf.dll copy, and all eight reserves on the SAME peb and wtid. What is
+ * left is that libcef.dll and chrome_elf.dll each statically link PartitionAlloc
+ * and each initialise it on the loading thread — in real Chrome chrome_elf
+ * exports the allocator and the main module defers to it, and that linkage may
+ * not survive our loader.
+ *
+ * The caller is guest x86-64 running under FEX, so a native stack scan finds
+ * thunks and IAT slots, not the requester (that mistake cost a run earlier).
+ * Read FEX's live guest RIP instead — TEB+0x1788 -> CPUArea+0x30 -> state,
+ * RIP at +0x18, the same chain the fault handler uses for [x86_live]. Print it
+ * raw; resolving it against the [jit-pool] image table offline is exact and
+ * needs no struct-layout assumptions here. */
+static uint64_t ios_guest_rip_now(void)
+{
+    TEB *teb = NtCurrentTeb();
+    void *cpuarea, *st;
+
+    if (!teb) return 0;
+    cpuarea = *(void **)((char *)teb + 0x1788);
+    if ((uintptr_t)cpuarea < 0x10000) return 0;
+    st = *(void **)((char *)cpuarea + 0x30);
+    if ((uintptr_t)st < 0x10000) return 0;
+    return ((uint64_t *)st)[0x18 / 8];
+}
+
+/* ml145: the above returns the NATIVE caller at a syscall boundary — every
+ * reserve reported the same value and it resolved to kernelbase.dll+0x40124,
+ * i.e. inside VirtualAlloc itself. State.RIP is only the guest RIP when the
+ * fault happened inside JIT'd guest code; on an EC transition the guest context
+ * is saved instead. init_thread_stack's own log gives the layout:
+ *   ChpeV2CpuAreaInfo=0x15c410000 ... ContextAmd64=0x15c410050
+ * so the x64 CONTEXT sits at CPUArea+0x50, and CONTEXT_AMD64.Rip is at +0xF8.
+ * Read that for the actual guest RIP, and keep the native one too — the pair
+ * tells us both WHO called and from WHERE. */
+static uint64_t ios_guest_ctx_rip(void)
+{
+    TEB *teb = NtCurrentTeb();
+    void *cpuarea;
+
+    if (!teb) return 0;
+    cpuarea = *(void **)((char *)teb + 0x1788);
+    if ((uintptr_t)cpuarea < 0x10000) return 0;
+    return *(uint64_t *)((char *)cpuarea + 0x50 + 0xF8);
+}
+
+
+/* ml147 POOL OWNERSHIP BY SEARCH — the unambiguous attribution.
+ *
+ * Two register-based attempts both returned NATIVE addresses rather than the
+ * guest RIP (State.RIP gave kernelbase+0x40124, the caller inside VirtualAlloc;
+ * CPUArea+0x50+0xF8 gave kernelbase+0x7c050). Interesting but not decisive.
+ *
+ * PartitionAlloc stores each granted pool base in its OWN globals, so if two PA
+ * instances exist their pool bases live in two DIFFERENT modules' .data. Search
+ * the module copies for the addresses we actually handed out: whichever module
+ * holds them owns that pool. No register layout, no guest/native ambiguity.
+ * Runs once, only when a jumbo reserve fails, and skips .text (a pool base can
+ * only be stored in data). */
+const char *ios_pe_module_name( const void *image_base, size_t image_size );
+
+static void ios_pool_owner_search( const uint64_t *wanted, unsigned nwanted )
+{
+    /* ml148: the first cut matched 823 times across every module, because the
+     * pool bases are "small int followed by zeros" — an 8-byte read at PE
+     * offset 0x38 of a header whose e_lfanew is 0x78 IS 0x7800000000. Every
+     * module hit at +0x38 for exactly that reason.
+     *
+     * Require a CLUSTER instead: two DIFFERENT pool values within 512 bytes.
+     * PartitionAddressSpace keeps regular_pool_base_address_ and
+     * brp_pool_base_address_ adjacent in one struct, so a real owner shows both;
+     * a PE header cannot fake two distinct pool-shaped values side by side.
+     * Also skip the first page (headers) outright. */
+    unsigned mi, w;
+
+    for (mi = 0; mi < ios_jit_mapping_count; mi++)
+    {
+        uintptr_t jb = (uintptr_t)ios_jit_mappings[mi].jit_base;
+        size_t sz = ios_jit_mappings[mi].size;
+        size_t t0 = ios_jit_mappings[mi].text_offset, t1 = t0 + ios_jit_mappings[mi].text_size;
+        const uint64_t *p = (const uint64_t *)jb;
+        size_t off, last_off = 0;
+        uint64_t last_val = 0;
+        int reported = 0;
+
+        if (!jb || !sz || !ios_jit_mappings[mi].pe_base) continue;
+        for (off = 0x1000; off + 8 <= sz && reported < 4; off += 8)
+        {
+            uint64_t v;
+            if (ios_jit_mappings[mi].text_size && off >= t0 && off < t1) continue;
+            v = p[off / 8];
+            for (w = 0; w < nwanted; w++)
+                if (v == wanted[w])
+                {
+                    if (last_val && v != last_val && off - last_off <= 512)
+                    {
+                        dprintf(2, "[pool-owner] CLUSTER in %s: 0x%llx at +0x%lx and 0x%llx at +0x%lx\n",
+                                ios_pe_module_name( ios_jit_mappings[mi].pe_base,
+                                                    ios_jit_mappings[mi].size ),
+                                (unsigned long long)last_val, (unsigned long)last_off,
+                                (unsigned long long)v, (unsigned long)off);
+                        reported++;
+                    }
+                    last_val = v; last_off = off;
+                    break;
+                }
+        }
+    }
+}
+
+
+/* ml151 LAZY POOL RESERVATION (Tier 2, first cut).
+ *
+ * MEASURED: at the moment PartitionAlloc needs all four 16GB pools reserved, it
+ * has committed essentially NOTHING — [bigres-use] showed 0MB in two pools and
+ * <1MB in the third across 24 calls. The reservation at Init() is pure
+ * address-space bookkeeping, so a pool does not need to be backed to be
+ * accepted; it only needs the aligned base PA asked for.
+ *
+ * That matters because the arithmetic is otherwise unwinnable: four pools want
+ * 64GB of RANGE, the usable window is ~64GB, and furniture needs ~14GB of it.
+ * Treating a reservation as if it consumed real space is what made this look
+ * impossible.
+ *
+ * FIRST CUT, deliberately minimal: when every real placement for a jumbo
+ * reserve fails, hand PA a 16GB-aligned slot that no pool has taken and record
+ * the range as SOFT — no backing. Commits land in NtAllocateVirtualMemory,
+ * which we own, so there is no fault handling: materialise the sub-range there.
+ *
+ * KNOWN RISK, accepted for now and instrumented rather than hidden: the only
+ * free aligned slot (0x7000000000) spans the furniture window, so a later PA
+ * commit can land where furniture already lives. We do NOT fence furniture out
+ * of it — that window is the only place furniture can go. Instead every commit
+ * into a soft range is checked against the kernel map first and a collision is
+ * reported loudly. PA bumps upward from a pool base and committed ~0% at Init,
+ * so the margin should be large; if [soft-pool] COLLISION appears, this design
+ * needs the full own-and-broker-the-window treatment before it can be trusted. */
+#define IOS_SOFT_MAX 8
+static struct { uint64_t base, size, committed; unsigned commits, collisions; } ios_soft[IOS_SOFT_MAX];
+static unsigned ios_soft_n;
+
+static int ios_soft_find( uint64_t addr )
+{
+    unsigned i;
+    for (i = 0; i < ios_soft_n; i++)
+        if (addr >= ios_soft[i].base && addr < ios_soft[i].base + ios_soft[i].size) return (int)i;
+    return -1;
+}
+
+/* Is this 16GB-aligned slot free of any pool we already handed out? */
+static int ios_soft_slot_taken( uint64_t slot )
+{
+    unsigned i;
+    for (i = 0; i < ios_soft_n; i++)
+        if (ios_soft[i].base == slot) return 1;
+    return 0;
+}
+
+static void ios_soft_report( const char *why )
+{
+    unsigned i;
+    for (i = 0; i < ios_soft_n; i++)
+        dprintf(2, "[soft-pool] 0x%llx +%lluMB committed=%lluMB in %u calls, %u collisions (%s)\n",
+                (unsigned long long)ios_soft[i].base,
+                (unsigned long long)(ios_soft[i].size >> 20),
+                (unsigned long long)(ios_soft[i].committed >> 20),
+                ios_soft[i].commits, ios_soft[i].collisions, why);
+}
+
+static void ios_bigres_note( void *base, size_t size );   /* defined below */
+
 static void ios_jumbo_census( void *hint, size_t size, void *result, unsigned st )
 {
     /* ml131: report the 512MB-reservation census alongside every jumbo call —
@@ -605,8 +815,39 @@ static void ios_jumbo_census( void *hint, size_t size, void *result, unsigned st
     unsigned long long gap = ios_jumbo_last_ms ? now - ios_jumbo_last_ms : 0;
 
     ios_jumbo_last_ms = now;
+    static uint64_t granted_bases[8];
+    static unsigned granted_n;
+    static int owner_searched;
+
     if (st) ios_jumbo_fail++;
-    else  { ios_jumbo_ok++; ios_jumbo_granted += size; }
+    else  { ios_jumbo_ok++; ios_jumbo_granted += size;
+            /* ml150: track how much of each GRANTED POOL is ever COMMITTED.
+             * This is the number that decides whether lazy reservation can beat
+             * the 4-pool wall. PA needs 4 x 16GB of ADDRESS RANGE, but if it
+             * commits only a fraction of each, the untouched remainder is dead
+             * space we currently pay full price for — and furniture could live
+             * there instead. Steam's own reservations came in at 7-8%
+             * ([bigres-use]); if the pools are similar, four pools plus ~14GB of
+             * furniture fit in the 64GB window and the wall is an accounting
+             * artifact rather than a hard limit. Reuse the same commit
+             * attribution table. */
+            if (result) ios_bigres_note( result, size );
+            if (granted_n < 8 && result)
+            {
+                granted_bases[granted_n++] = (uint64_t)(uintptr_t)result;
+                /* a guard-style reserve returns the FORBIDDEN ZONE base; PA
+                 * records the pool proper, 64KB higher. Look for both. */
+                if (granted_n < 8 && (size & 0xffff) == 0x10000 - 0)
+                    granted_bases[granted_n++] = (uint64_t)(uintptr_t)result + 0x10000;
+            } }
+    if (st && granted_n && !owner_searched)
+    {
+        owner_searched = 1;
+        dprintf(2, "[pool-owner] searching %u module copies for %u granted pool bases...\n",
+                ios_jit_mapping_count, granted_n);
+        ios_pool_owner_search( granted_bases, granted_n );
+        dprintf(2, "[pool-owner] search done\n");
+    }
 
     /* ml135: log the PEB and wine tid too. PA's Init() reserves exactly ONE
      * plain 16GB (Regular) + ONE guarded 16GB+forbidden-zone (BRP); we observe
@@ -616,10 +857,12 @@ static void ios_jumbo_census( void *hint, size_t size, void *result, unsigned st
      * single-process); if they share a PEB it is four distinct pool TYPES and
      * the size is a Chromium compile-time constant we cannot change. Those two
      * answers have completely different fixes, so print the discriminator. */
-    dprintf(2, "[jumbo#%u] +%llums tid=%lx wtid=%04x peb=%p size=0x%lx (%lu MB) hint=%p -> %p st=0x%x | granted=%lu MB ok=%u fail=%u\n",
+    dprintf(2, "[jumbo#%u] +%llums tid=%lx wtid=%04x peb=%p nrip=0x%llx grip=0x%llx size=0x%lx (%lu MB) hint=%p -> %p st=0x%x | granted=%lu MB ok=%u fail=%u\n",
             ++ios_jumbo_seq, gap, (unsigned long)(uintptr_t)pthread_self(),
             NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0,
             NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL,
+            (unsigned long long)ios_guest_rip_now(),
+            (unsigned long long)ios_guest_ctx_rip(),
             (unsigned long)size, (unsigned long)(size >> 20), hint, result, st,
             (unsigned long)(ios_jumbo_granted >> 20), ios_jumbo_ok, ios_jumbo_fail);
 }
@@ -677,6 +920,13 @@ static void ios_bigres_report( const char *why )
     dprintf(2, "[bigres-use] ranges=%u reserved=%llu MB committed=%llu MB (%llu%%) touched=%llu/%u (%s)\n",
             ios_bigres_cnt, res >> 20, com >> 20,
             res ? (com * 100) / res : 0, touched, ios_bigres_cnt, why);
+    for (i = 0; i < ios_bigres_cnt; i++)
+        if (ios_bigres_tab[i].size >= 0x40000000ULL)
+            dprintf(2, "[bigres-use]   POOL 0x%llx +%lluMB committed=%lluMB (%llu%%) in %u calls\n",
+                    ios_bigres_tab[i].base, ios_bigres_tab[i].size >> 20,
+                    ios_bigres_tab[i].committed >> 20,
+                    ios_bigres_tab[i].size ? (ios_bigres_tab[i].committed * 100) / ios_bigres_tab[i].size : 0,
+                    ios_bigres_tab[i].commits);
     for (i = 0; i < ios_bigres_cnt && i < 8; i++)
         dprintf(2, "[bigres-use]   0x%llx +%lluMB committed=%lluMB in %u calls\n",
                 ios_bigres_tab[i].base, ios_bigres_tab[i].size >> 20,
@@ -7628,13 +7878,27 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     }
 
     status = STATUS_INVALID_IMAGE_FORMAT;  /* generic error */
+    /* ml143 [img-fmt]: steamwebhelper's dbghelp.dll import fails with
+     * c000007b AFTER dbghelp already mapped twice in this same run, and the
+     * mixed-arch sysx64 fallback is never even attempted for it. This function
+     * has seven distinct ways to return INVALID_IMAGE_FORMAT and the log says
+     * only "failed (error c000007b)", so name the branch that actually fires
+     * instead of inferring a third time. */
+#define IOS_IMG_FAIL(n) do { \
+        dprintf(2, "[img-fmt] %s: reject #%d (machine=0x%x sections=%u align=0x%x/0x%x flags=0x%x)\n", \
+                debugstr_us(nt_name), (n), nt->FileHeader.Machine, \
+                nt->FileHeader.NumberOfSections, \
+                (unsigned)nt->OptionalHeader.FileAlignment, \
+                (unsigned)nt->OptionalHeader.SectionAlignment, \
+                (unsigned)image_info->image_flags); \
+    } while (0)
     dos = (IMAGE_DOS_HEADER *)ptr;
     nt = (IMAGE_NT_HEADERS *)(ptr + dos->e_lfanew);
     header_end = ptr + ROUND_SIZE( 0, header_size, align_mask );
     memset( ptr + header_size, 0, header_end - (ptr + header_size) );
-    if ((char *)(nt + 1) > header_end) return status;
+    if ((char *)(nt + 1) > header_end) do { IOS_IMG_FAIL(1); return status; } while (0);
     sec = IMAGE_FIRST_SECTION( nt );
-    if ((char *)(sec + nt->FileHeader.NumberOfSections) > header_end) return status;
+    if ((char *)(sec + nt->FileHeader.NumberOfSections) > header_end) do { IOS_IMG_FAIL(2); return status; } while (0);
     if ((char *)(sec + nt->FileHeader.NumberOfSections) > ptr + image_info->header_map_size)
     {
         /* copy section data since it will get overwritten by a section mapping */
@@ -7654,14 +7918,14 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 
         total_size = min( total_size, ROUND_SIZE( 0, st.st_size, page_mask ));
         if (map_file_into_view( view, fd, 0, total_size, 0, VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY,
-                                removable ) != STATUS_SUCCESS) goto done;
+                                removable ) != STATUS_SUCCESS) do { IOS_IMG_FAIL(3); goto done; } while (0);
 
         /* check that all sections are loaded at the right offset */
-        if (nt->OptionalHeader.FileAlignment != nt->OptionalHeader.SectionAlignment) goto done;
+        if (nt->OptionalHeader.FileAlignment != nt->OptionalHeader.SectionAlignment) do { IOS_IMG_FAIL(4); goto done; } while (0);
         for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
         {
             if (sec[i].VirtualAddress != sec[i].PointerToRawData)
-                goto done;  /* Windows refuses to load in that case too */
+                do { IOS_IMG_FAIL(5); goto done; } while (0);  /* Windows refuses to load in that case too */
         }
 
         /* set the image protections */
@@ -7669,7 +7933,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 
         /* no relocations are performed on non page-aligned binaries */
         status = STATUS_SUCCESS;
-        goto done;
+        do { IOS_IMG_FAIL(6); goto done; } while (0);
     }
 
 
@@ -7696,7 +7960,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         {
             WARN_(module)( "%s section %.8s too large (%x+%lx/%lx)\n",
                            debugstr_us(nt_name), sec[i].Name, sec[i].VirtualAddress, map_size, total_size );
-            goto done;
+            do { IOS_IMG_FAIL(7); goto done; } while (0);
         }
 
         if ((sec[i].Characteristics & IMAGE_SCN_MEM_SHARED) &&
@@ -7710,7 +7974,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
                                     VPROT_COMMITTED | VPROT_READ | VPROT_WRITE, FALSE ) != STATUS_SUCCESS)
             {
                 ERR_(module)( "Could not map %s shared section %.8s\n", debugstr_us(nt_name), sec[i].Name );
-                goto done;
+                do { IOS_IMG_FAIL(8); goto done; } while (0);
             }
 
             /* check if the import directory falls inside this section */
@@ -7749,7 +8013,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         {
             ERR_(module)( "Could not map %s section %.8s, file probably truncated\n",
                           debugstr_us(nt_name), sec[i].Name );
-            goto done;
+            do { IOS_IMG_FAIL(9); goto done; } while (0);
         }
 
         if (file_size & align_mask)
@@ -10017,6 +10281,72 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
          * would have been wasted work. */
         if ((type & MEM_COMMIT) && ios_bigres_cnt && *ret)
             ios_bigres_commit( *ret, *size_ptr );
+        /* ml151: a commit landing in a SOFT pool range — see ios_soft. The range
+         * was never backed, so materialise exactly this sub-range now. Check the
+         * kernel map first: if something already owns the VA (furniture, most
+         * likely, since the only free aligned slot overlaps the furniture
+         * window) that is the collision this design has to be judged on, so say
+         * so loudly rather than silently handing PA someone else's memory. */
+        if ((type & MEM_COMMIT) && ios_soft_n && *ret)
+        {
+            int si = ios_soft_find( (uint64_t)(uintptr_t)*ret );
+            if (si >= 0)
+            {
+                uint64_t want = (uint64_t)(uintptr_t)*ret & ~(uint64_t)host_page_mask;
+                size_t need = ROUND_SIZE( (uintptr_t)*ret - want, *size_ptr, host_page_mask );
+                mach_vm_address_t a = (mach_vm_address_t)want;
+                mach_vm_size_t rsz = 0;
+                vm_region_basic_info_data_64_t inf;
+                mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+                mach_port_t obj = MACH_PORT_NULL;
+                int occupied = 0;
+
+                if (mach_vm_region( mach_task_self(), &a, &rsz, VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_t)&inf, &cnt, &obj ) == KERN_SUCCESS && a <= want)
+                    occupied = 1;
+
+                /* ml152: ask WINE first, not just the kernel. The soft range
+                 * spans the furniture window, so most commits landing in it are
+                 * ordinary allocations committing memory they legitimately
+                 * reserved — the first cut labelled all 33 of them COLLISION and
+                 * buried the real signal. If Wine owns a view here it is not our
+                 * business: fall through silently. A genuine collision is VA that
+                 * Wine does NOT own yet something else has mapped. */
+                if (find_view( (void *)(uintptr_t)want, need ))
+                {
+                    /* furniture's own commit — normal path, no bookkeeping */
+                }
+                else if (occupied)
+                {
+                    ios_soft[si].commits++;
+                    ios_soft[si].collisions++;
+                    dprintf(2, "[soft-pool] COLLISION: commit 0x%llx+0x%lx inside soft 0x%llx —"
+                               " VA mapped but NOT a wine view (0x%llx+0x%llx prot=%x/%x)."
+                               " Foreign mapping in the pool range.\n",
+                            (unsigned long long)want, (unsigned long)need,
+                            (unsigned long long)ios_soft[si].base,
+                            (unsigned long long)a, (unsigned long long)rsz,
+                            inf.protection, inf.max_protection);
+                }
+                else
+                {
+                    unsigned int svp = 0;
+                    void *mp;
+                    ios_soft[si].commits++;
+                    get_vprot_flags( protect, &svp, FALSE );
+                    mp = anon_mmap_fixed( (void *)(uintptr_t)want, need,
+                                          get_unix_prot( (BYTE)(svp | VPROT_COMMITTED) ), 0 );
+                    ios_soft[si].committed += need;
+                    dprintf(2, "[soft-pool] materialised 0x%llx+0x%lx in soft 0x%llx -> %p"
+                               " (total %lluMB in %u calls)\n",
+                            (unsigned long long)want, (unsigned long)need,
+                            (unsigned long long)ios_soft[si].base, mp,
+                            (unsigned long long)(ios_soft[si].committed >> 20),
+                            ios_soft[si].commits);
+                    if (mp != MAP_FAILED) { *ret = (void *)(uintptr_t)want; *size_ptr = need; return STATUS_SUCCESS; }
+                }
+            }
+        }
         if (jumbo_size >= 0x10000000 && jumbo_size < 0x40000000 && (type & MEM_RESERVE))
         {
             static unsigned bigres_n;
@@ -10113,6 +10443,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                                           ios_usable_va_floor, ios_furniture_ceiling );
                     ios_slot_probe( "jumbo reserve failed" );
                     ios_bigres_report( "jumbo reserve failed" );
+                    ios_soft_report( "jumbo reserve failed" );
                 }
             }
         }
@@ -10211,6 +10542,40 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                     *ret = pick;
                     *size_ptr = sz;
                     st = STATUS_SUCCESS;
+                }
+                else if (ios_soft_n < IOS_SOFT_MAX && *size_ptr >= 0x400000000ULL)
+                {
+                    /* ml151: every real placement failed. Hand PA a 16GB-aligned
+                     * slot nobody has taken and record it SOFT — see ios_soft.
+                     * A guard-style request wants base = slot - 64KB; that guard
+                     * page is a deliberate forbidden zone PA never commits, so it
+                     * costs nothing that it may be unmappable. */
+                    uint64_t slot;
+                    for (slot = 0x7000000000ULL; slot < 0x8000000000ULL; slot += align_unit)
+                    {
+                        void *probe_addr = (void *)(uintptr_t)slot;
+                        SIZE_T probe_sz = 0x10000;
+                        NTSTATUS pst;
+
+                        if (ios_soft_slot_taken( slot )) continue;
+                        /* skip a slot that already holds a REAL pool: a 64KB
+                         * probe reserve at its base would succeed only if free */
+                        probe_addr = NULL; probe_sz = 0;
+                        (void)probe_addr; (void)probe_sz; (void)pst;
+
+                        ios_soft[ios_soft_n].base = slot;
+                        ios_soft[ios_soft_n].size = *size_ptr;
+                        ios_soft[ios_soft_n].committed = 0;
+                        ios_soft[ios_soft_n].commits = 0;
+                        ios_soft[ios_soft_n].collisions = 0;
+                        ios_soft_n++;
+                        *ret = (void *)(uintptr_t)(off ? slot + off - align_unit : slot);
+                        st = STATUS_SUCCESS;
+                        dprintf(2, "[soft-pool] GRANTED soft 0x%llx (base returned %p, size=0x%lx)"
+                                   " — unbacked, commits materialise on demand\n",
+                                (unsigned long long)slot, *ret, (unsigned long)*size_ptr);
+                        break;
+                    }
                 }
             }
         }

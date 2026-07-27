@@ -255,6 +255,8 @@ extern size_t ios_jit_pool_size_global;         /* defined below */
  * this names the exact first occupant instead of leaving us to infer it from a
  * pool count. Called periodically, so we see WHEN a slot goes bad, not just
  * that it did. */
+static void ios_bigres_report( const char *why );   /* defined below */
+
 static void ios_slot_probe( const char *why )
 {
     static const mach_vm_address_t slots[3] = { 0x7400000000ULL, 0x7800000000ULL, 0x7C00000000ULL };
@@ -454,6 +456,69 @@ static void *ios_pool_warmer_thread( void *arg )
             /* task #35: report the three pool slots every ~30s on this existing
              * timer — see ios_slot_probe. Cheap (a few mach queries) and it is
              * the only signal that says whether the ceiling is doing its job. */
+            /* ml136 CATCH THE REPLACEMENT WHEN IT HAPPENS, not at the exec fault.
+             *
+             * ml134 proved a live pool RX page had max_prot=0x3 when a healthy
+             * one is 0x7 — max_protection only drops via a fresh mapping, so
+             * something REPLACED it. Both Wine paths are now instrumented and
+             * report zero ([jit-tripwire] fixed maps, [jit-clobber] kernel
+             * picks), so the culprit is outside Wine's allocator and we cannot
+             * catch it at the call. Instead sweep the used pool for pages that
+             * have lost EXECUTE from max_prot. The warmer already walks exactly
+             * this memory every 2s, so the sweep is nearly free, and it turns a
+             * rare fatal symptom into an early located observation: we learn
+             * WHICH range died and WHEN, and can correlate against whatever the
+             * log shows happening in that window. */
+            /* ml137 SWEEP ONLY .text — the first cut sampled the pool at 4MB
+             * stride and flagged 9-11 pages per pass, but mapping those offsets
+             * back to modules showed every one landed deep inside a copy
+             * (shell32 +0x604000 of 0xbf0000, steamui +0x10c8000 of 0x123e000,
+             * libavutil +0x288000/+0x688000) — .data/.rsrc/.reloc, which are
+             * LEGITIMATELY RW in a pool copy. All false positives. The genuine
+             * ml134 corruption was at libarm64ecfex+0xd06d0, i.e. in .text.
+             * ios_jit_mappings already records text_offset/text_size per module,
+             * so walk exactly those ranges: any .text page whose max_prot has
+             * lost EXECUTE is real corruption, with no benign explanation. */
+            if ((cycle % 5) == 0 && rx)
+            {
+                unsigned mi;
+                size_t bad = 0, checked = 0;
+                for (mi = 0; mi < ios_jit_mapping_count; mi++)
+                {
+                    uintptr_t jb = (uintptr_t)ios_jit_mappings[mi].jit_base;
+                    size_t t_off = ios_jit_mappings[mi].text_offset;
+                    size_t t_sz  = ios_jit_mappings[mi].text_size;
+                    size_t o;
+
+                    if (!jb || !t_sz) continue;
+                    for (o = 0; o < t_sz; o += 0x40000)   /* 256KB stride inside .text */
+                    {
+                        mach_vm_address_t want = (mach_vm_address_t)(jb + t_off + o), a = want;
+                        mach_vm_size_t rsz = 0;
+                        vm_region_basic_info_data_64_t inf;
+                        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+                        mach_port_t obj = MACH_PORT_NULL;
+
+                        if (mach_vm_region( mach_task_self(), &a, &rsz, VM_REGION_BASIC_INFO_64,
+                                            (vm_region_info_t)&inf, &cnt, &obj ) != KERN_SUCCESS)
+                            break;
+                        if (a > want) continue;                  /* hole */
+                        checked++;
+                        if (!(inf.max_protection & VM_PROT_EXECUTE) && bad++ < 8)
+                            dprintf(2, "[pool-rot] TEXT LOST EXEC va=0x%llx mod_pool=0x%llx"
+                                       " text+0x%lx prot=%x max=%x region=0x%llx+0x%llx cycle=%u\n",
+                                    (unsigned long long)want, (unsigned long long)jb,
+                                    (unsigned long)o, inf.protection, inf.max_protection,
+                                    (unsigned long long)a, (unsigned long long)rsz, cycle);
+                    }
+                }
+                if (bad)
+                    dprintf(2, "[pool-rot] %lu of %lu sampled .text pages LOST EXEC (cycle=%u)\n",
+                            (unsigned long)bad, (unsigned long)checked, cycle);
+                else if (cycle % 15 == 0)
+                    dprintf(2, "[pool-rot] clean: %lu .text pages sampled across %u mappings (cycle=%u)\n",
+                            (unsigned long)checked, ios_jit_mapping_count, cycle);
+            }
             if (cycle == 1 || (cycle % 15) == 0)
             {
                 ios_slot_probe( "periodic" );
@@ -461,7 +526,8 @@ static void *ios_pool_warmer_thread( void *arg )
                  * jumbo-failure sites, and ml121 died before any jumbo call, so
                  * the one measurement that decides whether a 3rd pool is
                  * reachable never fired. Put it on the periodic timer too. */
-                ios_window_inventory( "periodic", 0x7038000000ULL, 0x77ffff0000ULL );
+                ios_window_inventory( "periodic", 0x7038000000ULL, 0x7400000000ULL );
+                ios_bigres_report( "periodic" );
             }
         }
         usleep( 2000000 );
@@ -531,6 +597,10 @@ static unsigned long long ios_now_ms( void )
 
 static void ios_jumbo_census( void *hint, size_t size, void *result, unsigned st )
 {
+    /* ml131: report the 512MB-reservation census alongside every jumbo call —
+     * the warmer-tick schedule fired only at cycle 1, before Steam had made any
+     * of them, so the one number that matters never appeared. */
+    ios_bigres_report( st ? "jumbo fail" : "jumbo ok" );
     unsigned long long now = ios_now_ms();
     unsigned long long gap = ios_jumbo_last_ms ? now - ios_jumbo_last_ms : 0;
 
@@ -538,10 +608,182 @@ static void ios_jumbo_census( void *hint, size_t size, void *result, unsigned st
     if (st) ios_jumbo_fail++;
     else  { ios_jumbo_ok++; ios_jumbo_granted += size; }
 
-    dprintf(2, "[jumbo#%u] +%llums tid=%lx size=0x%lx (%lu MB) hint=%p -> %p st=0x%x | granted=%lu MB ok=%u fail=%u\n",
+    /* ml135: log the PEB and wine tid too. PA's Init() reserves exactly ONE
+     * plain 16GB (Regular) + ONE guarded 16GB+forbidden-zone (BRP); we observe
+     * TWO of each, which is the signature of Init() running twice. If the two
+     * pairs carry DIFFERENT PEBs it is two libcef copies in our shared address
+     * space (a pseudo-process artefact we can fix by properly enforcing
+     * single-process); if they share a PEB it is four distinct pool TYPES and
+     * the size is a Chromium compile-time constant we cannot change. Those two
+     * answers have completely different fixes, so print the discriminator. */
+    dprintf(2, "[jumbo#%u] +%llums tid=%lx wtid=%04x peb=%p size=0x%lx (%lu MB) hint=%p -> %p st=0x%x | granted=%lu MB ok=%u fail=%u\n",
             ++ios_jumbo_seq, gap, (unsigned long)(uintptr_t)pthread_self(),
+            NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0,
+            NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL,
             (unsigned long)size, (unsigned long)(size >> 20), hint, result, st,
             (unsigned long)(ios_jumbo_granted >> 20), ios_jumbo_ok, ios_jumbo_fail);
+}
+
+
+/* ml130 IS THE GUEST'S 12GB ACTUALLY USED?
+ *
+ * The 512MB reserves are steam.exe's own: type=0x2000 is MEM_RESERVE with no
+ * MEM_TOP_DOWN, and FEXCore::Allocator::VirtualAlloc unconditionally ORs in
+ * MEM_TOP_DOWN, so these cannot come from FEX. 2 x 512MB per guest thread, 12+
+ * threads = 12+GB of pure reservation. On Windows' 128TB that is free; in our
+ * 63GB it is the entire third-pool deficit.
+ *
+ * Whether we can do anything about it hinges on ONE fact: does Steam ever
+ * COMMIT inside these ranges, or is it reserve-and-never-touch? If commits are
+ * a small fraction, the reservations are slack and a lazy/shrunk reservation
+ * becomes thinkable. If Steam commits heavily, the demand is real and two pools
+ * is the ceiling until CEF itself is made to want less. Record each range and
+ * attribute every MEM_COMMIT that lands inside one. */
+#define IOS_BIGRES_MAX 48
+static struct { uint64_t base, size, committed; unsigned commits; } ios_bigres_tab[IOS_BIGRES_MAX];
+static unsigned ios_bigres_cnt;
+
+static void ios_bigres_note( void *base, size_t size )
+{
+    if (!base || ios_bigres_cnt >= IOS_BIGRES_MAX) return;
+    ios_bigres_tab[ios_bigres_cnt].base = (uint64_t)(uintptr_t)base;
+    ios_bigres_tab[ios_bigres_cnt].size = size;
+    ios_bigres_cnt++;
+}
+
+static void ios_bigres_commit( void *addr, size_t size )
+{
+    uint64_t a = (uint64_t)(uintptr_t)addr;
+    unsigned i;
+    for (i = 0; i < ios_bigres_cnt; i++)
+        if (a >= ios_bigres_tab[i].base && a < ios_bigres_tab[i].base + ios_bigres_tab[i].size)
+        {
+            ios_bigres_tab[i].committed += size;
+            ios_bigres_tab[i].commits++;
+            return;
+        }
+}
+
+static void ios_bigres_report( const char *why )
+{
+    unsigned i;
+    unsigned long long res = 0, com = 0, touched = 0;
+    for (i = 0; i < ios_bigres_cnt; i++)
+    {
+        res += ios_bigres_tab[i].size;
+        com += ios_bigres_tab[i].committed;
+        if (ios_bigres_tab[i].committed) touched++;
+    }
+    dprintf(2, "[bigres-use] ranges=%u reserved=%llu MB committed=%llu MB (%llu%%) touched=%llu/%u (%s)\n",
+            ios_bigres_cnt, res >> 20, com >> 20,
+            res ? (com * 100) / res : 0, touched, ios_bigres_cnt, why);
+    for (i = 0; i < ios_bigres_cnt && i < 8; i++)
+        dprintf(2, "[bigres-use]   0x%llx +%lluMB committed=%lluMB in %u calls\n",
+                ios_bigres_tab[i].base, ios_bigres_tab[i].size >> 20,
+                ios_bigres_tab[i].committed >> 20, ios_bigres_tab[i].commits);
+}
+
+
+/* ml139: verify a freshly-made pool copy's .text is EXECUTABLE, at page
+ * granularity. Used by BOTH copy paths — the loader path that builds the first
+ * copy of an image and ios_jit_copy_module_for_child that clones it per
+ * pseudo-process. ml138 instrumented only the child path and reported nothing,
+ * which I could not distinguish from "clean" until the faulting copy turned out
+ * to come from the LOADER path (libarm64ecfex pool 0x11f638000). Always print a
+ * verdict so silence can never again be mistaken for a pass. */
+static void ios_jit_verify_text_exec( const char *who, const void *rx_dest, size_t image_size )
+{
+    static unsigned verified;
+    size_t o, bad = 0, pages = 0, text_offset = 0, text_size = 0;
+
+    if (!rx_dest || image_size < 0x1000) return;
+    /* Derive the executable section from the copy's OWN PE headers so this
+     * works from either copy path without needing the caller's locals. */
+    {
+        const IMAGE_DOS_HEADER *dos = rx_dest;
+        const IMAGE_NT_HEADERS *nt;
+        const IMAGE_SECTION_HEADER *sec;
+        unsigned i;
+
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+        nt = (const IMAGE_NT_HEADERS *)((const char *)rx_dest + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+        sec = IMAGE_FIRST_SECTION( nt );
+        for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
+            if ((sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) &&
+                sec[i].Misc.VirtualSize > text_size)
+            {
+                text_offset = sec[i].VirtualAddress;
+                text_size = sec[i].Misc.VirtualSize;
+            }
+        if (!text_size || text_offset + text_size > image_size) return;
+    }
+    for (o = 0; o < text_size; o += 0x4000)
+    {
+        mach_vm_address_t want = (mach_vm_address_t)(uintptr_t)((const char *)rx_dest + text_offset + o), a = want;
+        mach_vm_size_t rsz = 0;
+        vm_region_basic_info_data_64_t inf;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        if (mach_vm_region( mach_task_self(), &a, &rsz, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&inf, &cnt, &obj ) != KERN_SUCCESS) break;
+        if (a > want) continue;
+        pages++;
+        if (!(inf.max_protection & VM_PROT_EXECUTE) && bad++ < 6)
+            dprintf(2, "[copy-verify] %s BORN NON-EXEC text+0x%lx va=%p prot=%x max=%x\n",
+                    who ? who : "?", (unsigned long)o, (void *)(uintptr_t)want,
+                    inf.protection, inf.max_protection);
+    }
+    if (bad)
+        dprintf(2, "[copy-verify] %s: %lu of %lu .text pages BORN NON-EXEC (copy @%p)\n",
+                who ? who : "?", (unsigned long)bad, (unsigned long)pages, rx_dest);
+    else if (verified++ < 25 || (verified % 40) == 0)
+        dprintf(2, "[copy-verify] %s: OK, %lu .text pages executable (copy @%p)\n",
+                who ? who : "?", (unsigned long)pages, rx_dest);
+}
+
+
+/* ml141 TASK #34 THE REAL FIX — remove the .text/.data page sharing.
+ *
+ * PE sections are 4KB-aligned but iOS hardware pages are 16KB, so a writable
+ * section routinely begins part-way into a page whose earlier bytes are the
+ * TAIL OF .text. The RW mprotect that makes .data writable then strips EXECUTE
+ * from that page of live code, permanently (mprotect drops it from
+ * max_protection on blessed memory). That is task #34: one dead page per
+ * module, always 64KB-aligned, fatal only when execution finally reaches it —
+ * which is why CEF dies in libarm64ecfex's JIT emitters and Thumper never does.
+ *
+ * ml141 first tried skipping the shared page (round the RW range UP). That did
+ * remove every BORN NON-EXEC page, but a .data STXR into the now-read-only
+ * shared page killed steam.exe after 61 unix calls — the SIGBUS store emulator
+ * does not cover store-exclusive. Neither side can lose the page.
+ *
+ * So don't arbitrate: eliminate the overlap. Shift the copy's pool offset so
+ * the first writable section lands exactly on a 16KB boundary. Everything below
+ * it is RX either way, so .text being page-misaligned costs nothing, and no
+ * page is ever both code and data. The shift is a deterministic function of the
+ * image, so every copy of a DLL still gets an identical layout — the
+ * precondition the .text-sharing/tramp-fold work depends on. */
+static size_t ios_jit_data_align_delta( const void *image_base, size_t image_size )
+{
+    const IMAGE_DOS_HEADER *dos = image_base;
+    const IMAGE_NT_HEADERS *nt;
+    const IMAGE_SECTION_HEADER *sec;
+    unsigned int first_w = 0;
+    unsigned i;
+
+    if (!image_base || image_size < 0x1000) return 0;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    nt = (const IMAGE_NT_HEADERS *)((const char *)image_base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    sec = IMAGE_FIRST_SECTION( nt );
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
+        if ((sec[i].Characteristics & IMAGE_SCN_MEM_WRITE) && sec[i].Misc.VirtualSize &&
+            (!first_w || sec[i].VirtualAddress < first_w))
+            first_w = sec[i].VirtualAddress;
+    if (!first_w) return 0;
+    return (0x4000 - (first_w & 0x3fff)) & 0x3fff;
 }
 
 static void ios_va_gap_probe( const char *why )
@@ -2178,7 +2420,7 @@ static void *user_space_limit    = (void *)0x7fffffff0000;  /* top of the user a
  * gives this 31GB window more headroom than ml123 had), but a third pool needs
  * the ~512MB-per-thread FEXCore LookupCache reservation to shrink first; VA
  * freed elsewhere just gets absorbed by furniture growth. */
-static const ULONG_PTR ios_furniture_ceiling = 0x77ffff0000;
+static const ULONG_PTR ios_furniture_ceiling = 0x73ffff0000;   /* ml132: 3-pool geometry, now with ios_spill_cap bounding the downside */
 
 /* ml116 ROOT CAUSE of the ceiling regressions (disassembly + code-path proof,
  * no device run needed):
@@ -2203,6 +2445,26 @@ static const ULONG_PTR ios_furniture_ceiling = 0x77ffff0000;
  * is pure waste; clamping both ends keeps the search inside the one real
  * window and restores O(1) placement. */
 static const ULONG_PTR ios_usable_va_floor = 0x7038000000;
+
+/* ml132 SPILL CAP — makes the 3-pool experiment SAFE to run.
+ *
+ * Measured: real Wine furniture is only 2130 MB; the other 11604 MB of the
+ * window is steam.exe reserving 23 x 512MB and committing 8% of it
+ * ([bigres-use] reserved=11776 committed=965). Total 13.4GB, which does fit the
+ * 15.1GB below 0x7400000000 — but with ~1.7GB of margin, and every further
+ * guest thread costs another 1GB. ml125 ran exactly this geometry and failed
+ * hard: the advisory relax valve spilled past the ceiling into slot#0 AND
+ * slot#1, poisoning the two pools that already worked, and the pressure then
+ * revived the #34 exec fault into a 7.26M-fault storm.
+ *
+ * The valve must stay (it is what stops an allocation failure from killing the
+ * process), but it does not need to be allowed to eat the PROVEN slots. Cap the
+ * spill at the top of slot#0: overflow may consume [0x7400000000,0x7800000000)
+ * — the third-pool slot, which is what we are speculating with — and never
+ * touches 0x7800000000 or 0x7c00000000. Worst case we fall back to the known-good
+ * two pools instead of losing all three. Bounded downside, so the experiment is
+ * worth running. 0 disables. */
+static const ULONG_PTR ios_spill_cap = 0x7800000000;
 
 /* [va-scan] probe: failing mmap-tryfixed attempts inside the current
  * map_free_area call. virtual_mutex is held throughout, so a plain global is
@@ -2371,11 +2633,65 @@ void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
 }
 
 /* allocate anonymous mmap() memory at any address */
+/* ml134: does [addr,addr+size) touch either JIT pool alias? */
+static int ios_jit_pool_intersects( const void *addr, size_t size )
+{
+    uint64_t a = (uint64_t)(uintptr_t)addr, e = a + size;
+    uint64_t rx = (uint64_t)(uintptr_t)ios_jit_rx_base_global;
+    uint64_t rw = (uint64_t)(uintptr_t)ios_jit_rw_base_global;
+    uint64_t sz = ios_jit_pool_size_global;
+
+    if (!sz) return 0;
+    if (rx && a < rx + sz && e > rx) return 1;
+    if (rw && a < rw + sz && e > rw) return 1;
+    return 0;
+}
+
 void *anon_mmap_alloc( size_t size, int prot )
 {
+    /* ml134 THE #34 CLOBBER, CAUGHT AT LAST.
+     *
+     * The faulting pool page reported prot=0x3 max_prot=0x3 — max_protection
+     * can only DROP via a fresh mapping, never via mprotect, so the blessed RX
+     * page (max_prot=0x7) had been REPLACED by a plain RW anon mapping. Not iOS
+     * reclaiming a page: something mapped over our executable alias. That is
+     * why mprotect(RX) and the read-touch both failed — there was nothing left
+     * to restore.
+     *
+     * ios_jit_range_tripwire instruments every FIXED map and unmap and fired
+     * ZERO times, which leaves exactly the case its own comment predicted: "a
+     * munmap whose hole a later kernel-pick refilled". This function is that
+     * kernel pick, and it was the one path never checked.
+     *
+     * Detect and REJECT: hold the offending mapping so the kernel cannot return
+     * it again, retry, then release the held ones. Clobbering the pool is fatal
+     * and unrecoverable, so paying a few extra mmaps to avoid it is always
+     * right. Bounded at 8 tries, then accept-and-scream rather than fail the
+     * allocation. */
+    void *held[8];
+    int nheld = 0, i;
+    void *ret;
+
     assert( !(size & host_page_mask) );
 
-    return mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON, -1, 0 );
+    for (;;)
+    {
+        ret = mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON, -1, 0 );
+        if (ret == MAP_FAILED || !ios_jit_pool_intersects( ret, size )) break;
+        dprintf( 2, "[jit-clobber] kernel-pick %p+0x%lx prot=%x landed INSIDE the JIT pool"
+                    " (rx=%p rw=%p size=0x%lx) — rejecting, try %d\n",
+                 ret, (unsigned long)size, prot, ios_jit_rx_base_global,
+                 ios_jit_rw_base_global, (unsigned long)ios_jit_pool_size_global, nheld + 1 );
+        if (nheld == 8)
+        {
+            dprintf( 2, "[jit-clobber] EXHAUSTED 8 retries — ACCEPTING a pool-overlapping"
+                        " mapping at %p; expect an exec fault in this range\n", ret );
+            break;
+        }
+        held[nheld++] = ret;
+    }
+    for (i = 0; i < nheld; i++) munmap( held[i], size );
+    return ret;
 }
 
 /* task #34 [jit-tripwire]: ml74's fatal page (0x125114000, inside the JIT
@@ -5093,8 +5409,15 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
             size_t page_size = 0x4000;
             size_t image_alloc = (image_size + page_size - 1) & ~(page_size - 1);
             size_t tramp_prealloc = ios_x18_tramp_prealloc_scan(image_base, image_size);
-            size_t alloc_size = image_alloc + tramp_prealloc;
+            size_t data_delta = ios_jit_data_align_delta(image_base, image_size);
+            size_t alloc_size = image_alloc + tramp_prealloc + (data_delta ? page_size : 0);
             size_t offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
+            if (offset != (size_t)-1 && data_delta)
+            {
+                offset += data_delta;
+                dprintf(2, "[data-align] %s shifted +0x%lx so .data lands on a 16KB page\n",
+                        ios_pe_module_name( image_base, image_size ), (unsigned long)data_delta);
+            }
 
             if (offset == (size_t)-1)
             {
@@ -5134,6 +5457,9 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     ios_pe_module_name( image_base, image_size ), (char *)jit_rx_base + offset,
                     (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size,
                     (unsigned long)tramp_prealloc);
+
+            ios_jit_verify_text_exec( ios_pe_module_name( image_base, image_size ),
+                                      (char *)jit_rx_base + offset, image_size );
 
             /* task #34 [share-probe]: DEFAULT-OFF (set MYTHIC_SHARE_PROBE=1).
              * ml79: running it inline here (pre-detach, on explorer's boot
@@ -5331,9 +5657,63 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                      * Read-only sections (.rdata, .pdata, etc.) are fine as-is. */
                     if (sec_chars & 0x80000000)  /* IMAGE_SCN_MEM_WRITE */
                     {
-                        size_t sec_page_offset = sec_rva & ~(page_size - 1);
-                        size_t sec_page_size = ((sec_rva + sec_vsize + page_size - 1) & ~(page_size - 1)) - sec_page_offset;
-                        void *target = (char *)jit_rx_base + offset + sec_page_offset;
+                        /* ml140 TASK #34 ROOT CAUSE — THE ONE-PAGE .text KILLER.
+                         *
+                         * This rounded the writable section's start DOWN to a
+                         * page boundary, so when a .data section begins partway
+                         * into a page that also holds the TAIL OF .text, the
+                         * mprotect below stripped EXECUTE from a page of live
+                         * code. [copy-verify] caught it at birth in 7 modules at
+                         * once — always exactly one page (two for chromehtml,
+                         * where the 64KB round-down spans several 16KB pages),
+                         * always at a 64KB-aligned offset, which is precisely
+                         * what (sec_rva & ~(page_size-1)) produces.
+                         *
+                         * That is the whole of #34: the page is not reclaimed
+                         * and not overwritten, it is mprotect'ed non-executable
+                         * by US at copy time, and it only kills the process when
+                         * execution finally reaches that part of .text — which
+                         * is why CEF dies at libarm64ecfex+0xd06d0 while Thumper,
+                         * which never calls those emitters, runs clean. It also
+                         * explains max_prot=0x3: mprotect drops EXECUTE from
+                         * max_protection on blessed memory permanently, so no
+                         * later mprotect/read-touch could ever restore it.
+                         *
+                         * Round the writable range UP instead: never touch the
+                         * page shared with preceding code. Writes landing in
+                         * that shared page fall to the SIGBUS emulation path the
+                         * failure branch below already relies on. */
+                        /* ml141 REVERTED to the round-DOWN. Skipping the shared
+                         * page (round-UP) removed every BORN NON-EXEC page, but
+                         * traded an exec fault for an immediate STORE fault:
+                         * steam.exe died after 61 unix calls with
+                         *   BUS: unhandled store insn=0x880a7d09 (STXR)
+                         * A .data write landing in the .text-shared page now hits
+                         * a read-only page, and the SIGBUS store emulator does
+                         * NOT cover store-exclusive — see
+                         * reference_str_emulator_state.md. Losing the write is
+                         * far worse than losing the exec: writes there are common
+                         * and immediate, executing that .text tail is rare.
+                         *
+                         * The correct fix is to remove the SHARING, not to pick a
+                         * loser: PE sections are 4KB-aligned while iOS pages are
+                         * 16KB, so a .data section can always land mid-page on
+                         * .text. Choose each image's pool offset so its first
+                         * writable section starts on a 16KB boundary — everything
+                         * before it is RX, so misaligning .text costs nothing. */
+                        /* ml142: round the ABSOLUTE address, not the RVA. The
+                         * ml141 data-align shift makes `offset` non-page-aligned
+                         * (steamexe +0x2000, libarm64ecfex +0x3000), so
+                         * base+offset+(rva & ~mask) is no longer page-aligned and
+                         * mprotect rejects it — .data stayed read-only and the
+                         * first STXR killed the process at 68 unix calls. With
+                         * the shift in place .data IS absolutely page-aligned, so
+                         * rounding the absolute address is exact: target lands on
+                         * .data's first byte and no .text page is ever included. */
+                        uintptr_t sec_abs = (uintptr_t)((char *)jit_rx_base + offset + sec_rva);
+                        uintptr_t sec_abs_end = (sec_abs + sec_vsize + page_size - 1) & ~(page_size - 1);
+                        void *target = (void *)(sec_abs & ~(uintptr_t)(page_size - 1));
+                        size_t sec_page_size = sec_abs_end - (uintptr_t)target;
 
                         /* Try mprotect to make data section writable (drops execute) */
                         if (mprotect(target, sec_page_size, PROT_READ | PROT_WRITE) == 0)
@@ -5695,7 +6075,12 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
             : 0;
     }
     alloc_size += child_tramp_prealloc;
-    offset = ios_pool_alloc_range(alloc_size, ios_jit_pool_size_global - ios_jit_tail_reserved);
+    {
+        size_t data_delta = ios_jit_data_align_delta(m->pe_base, m->size);
+        if (data_delta) alloc_size += pg;
+        offset = ios_pool_alloc_range(alloc_size, ios_jit_pool_size_global - ios_jit_tail_reserved);
+        if (offset != (size_t)-1 && data_delta) offset += data_delta;
+    }
     if (offset == (size_t)-1)
     {
         dprintf(2, "[child-ntdll] JIT pool exhausted (need 0x%lx, bump=0x%lx of 0x%lx, tail_resv=0x%lx, freelist=%d)\n",
@@ -5826,6 +6211,8 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
 
     __asm__ __volatile__("dsb sy" ::: "memory");
     sys_icache_invalidate(rx_dest, m->size);
+
+    ios_jit_verify_text_exec( ios_pe_module_name( m->pe_base, m->size ), rx_dest, m->size );
 
     /* Register: APPEND an owned entry — the parent's entry stays intact.
      * Task #25: reuse a tombstoned slot when one exists; pe_base written
@@ -6237,6 +6624,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         }
         size_t host_size = ROUND_SIZE( 0, size, host_page_mask );
         size_t unmap_size, view_size = host_size + align_mask + 1;
+        int spill_tries = 0;
 
         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
@@ -6332,6 +6720,15 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                 return status;
             }
             TRACE( "got mem with anon mmap %p-%p\n", ptr, (char *)ptr + size );
+            /* ml132: keep spill out of the proven pool slots — see ios_spill_cap.
+             * Bounded retries, then accept: never fail an allocation for this. */
+            if (ios_spill_cap && spill_tries < 8 &&
+                is_beyond_limit( ptr, view_size, (void *)ios_spill_cap ))
+            {
+                spill_tries++;
+                munmap( ptr, view_size );
+                continue;
+            }
             /* if we got something beyond the user limit, unmap it and retry */
             if (!is_beyond_limit( ptr, view_size, user_space_limit )) break;
             unmap_size = unmap_area_above_user_limit( ptr, view_size );
@@ -6959,8 +7356,10 @@ static void alloc_arm64ec_map(void)
         exit(1);
     }
     peb->EcCodeBitMap = arm64ec_view->base;
-    ERR("alloc_arm64ec_map: peb->EcCodeBitMap=%p size=0x%lx\n",
-        peb->EcCodeBitMap, (unsigned long)size);
+    /* ml127: dprintf, not ERR — the `virtual` channel's ERR is suppressed in
+     * this build, which is why this line has never once appeared in a log. */
+    dprintf(2, "[ec-map] peb->EcCodeBitMap=%p size=0x%lx (%lu MB)\n",
+            peb->EcCodeBitMap, (unsigned long)size, (unsigned long)(size >> 20));
 }
 
 
@@ -9616,15 +10015,70 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
          * proven and the page-pointer array is the thing to shrink; if they are
          * a mix of sizes it is something else entirely and the FEX redesign
          * would have been wasted work. */
+        if ((type & MEM_COMMIT) && ios_bigres_cnt && *ret)
+            ios_bigres_commit( *ret, *size_ptr );
         if (jumbo_size >= 0x10000000 && jumbo_size < 0x40000000 && (type & MEM_RESERVE))
         {
             static unsigned bigres_n;
             static unsigned long long bigres_tot;
             bigres_n++;
             bigres_tot += jumbo_size;
-            dprintf(2, "[bigres] #%u size=0x%lx (%lu MB) hint=%p total=%llu MB\n",
-                    bigres_n, (unsigned long)jumbo_size,
-                    (unsigned long)(jumbo_size >> 20), jumbo_hint, bigres_tot >> 20);
+            /* ml126: ATTRIBUTE BY PROCESS, not by size. All 23 were exactly
+             * 512MB, which rules out FEXCore's LookupCache (a computed sum) and
+             * the CallRetStack (16MB), and no FEX VirtualAlloc site asks for
+             * 512MB either -- so this may well be the GUEST (V8's x64
+             * kMaximalCodeRangeSize is 512MB, which would fit CEF). ERR gives
+             * the wine tid prefix for free, and the PEB identifies WHICH
+             * pseudo-process: correlate against the [init-peb]/NtCreateUserProcess
+             * map. If these are steamwebhelper's PEB it is CEF/V8 and the fix is
+             * a command-line flag, not an FEX redesign -- a completely different
+             * and far cheaper answer than the one I was about to build. */
+            /* ml127: use dprintf, NOT ERR. The `virtual` debug channel's ERR is
+             * suppressed in this build (err:virtual: appears 0 times in a log
+             * with 526 err:seh: lines), so routing this through ERR to get the
+             * tid prefix silenced the probe completely — 23 lines in ml126, 0 in
+             * ml127. Same reason alloc_arm64ec_map's ERR has never appeared in
+             * any log. Read the tid out of the TEB instead. */
+            /* ml129: FEX's own hook ENCODES which structure this is, and I was
+             * simply not printing it. AllocatorHooks.h does
+             *   VirtualAlloc(Base, Size, Commit ? MEM_RESERVE|MEM_COMMIT : MEM_RESERVE,
+             *                Execute ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE)
+             * so protect==0x40 (PAGE_EXECUTE_READWRITE) means an Execute
+             * allocation -- a JIT code buffer (CPUBackend) or the dispatcher --
+             * while 0x04 (PAGE_READWRITE) means data, and the MEM_COMMIT bit
+             * separates the commit-upfront LookupCache path from pure reserves.
+             * That splits the remaining candidates without an FEX build, and
+             * without wiring a unixlib that iOS deliberately no-ops. */
+            dprintf( 2, "[bigres] tid=%04x #%u size=0x%lx (%lu MB) type=0x%x prot=0x%x hint=%p peb=%p total=%llu MB\n",
+                     NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0,
+                     bigres_n, (unsigned long)jumbo_size,
+                     (unsigned long)(jumbo_size >> 20), (unsigned)type, (unsigned)protect,
+                     jumbo_hint, NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL, bigres_tot >> 20 );
+            /* ml128: NAME THE CALLER. Elimination has run out — it is exactly
+             * 2 x 512MB per guest thread of steam.exe (peb=0x11da68000, 12 tids),
+             * and it is NOT the LookupCache (VirtualMemSize = 1ULL<<33 makes
+             * TotalCacheSize ~96MB, below this probe's 256MB floor), NOT the
+             * CallRetStack (16MB), NOT the emulator stack (256KB), and no FEX
+             * VirtualAlloc site asks for 512MB. So stop reasoning about sizes and
+             * read the return addresses off the stack, the same way [exit-stk]
+             * does. Module base + offset is enough — names come from the
+             * [jit-pool] image lines in the same log. */
+            if (bigres_n <= 4)
+            {
+                uint64_t *sp = (uint64_t *)__builtin_frame_address(0);
+                int w, hits = 0;
+                for (w = 0; w < 256 && hits < 6; w++)
+                {
+                    uint64_t mod = 0, va = ios_jit_reverse_translate( sp[w], &mod );
+                    if (va && mod && va != sp[w])
+                    {
+                        dprintf( 2, "[bigres]   caller sp+0x%x: 0x%llx = mod 0x%llx +0x%llx\n",
+                                 w * 8, (unsigned long long)sp[w],
+                                 (unsigned long long)mod, (unsigned long long)(va - mod) );
+                        hits++;
+                    }
+                }
+            }
         }
         /* task#29 CEF: PartitionAlloc (chrome_elf DllMain) reserves multi-GB
          * pools. iOS caps user VA at 0x8000000000 (39-bit; extended-VA is not
@@ -9658,6 +10112,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                     ios_window_inventory( "jumbo reserve failed",
                                           ios_usable_va_floor, ios_furniture_ceiling );
                     ios_slot_probe( "jumbo reserve failed" );
+                    ios_bigres_report( "jumbo reserve failed" );
                 }
             }
         }
@@ -9748,6 +10203,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                         ios_window_inventory( "hinted jumbo retry exhausted",
                                               ios_usable_va_floor, ios_furniture_ceiling );
                         ios_slot_probe( "hinted jumbo retry exhausted" );
+                        ios_bigres_report( "hinted jumbo retry exhausted" );
                     }
                 }
                 if (!st2)
@@ -9760,6 +10216,8 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
         }
 
         if (is_jumbo) ios_jumbo_census( jumbo_hint, jumbo_size, st ? NULL : *ret, (unsigned)st );
+        if (!st && *size_ptr >= 0x10000000 && *size_ptr < 0x40000000 && (type & MEM_RESERVE))
+            ios_bigres_note( *ret, *size_ptr );
         return st;
     }
 #else
@@ -10016,21 +10474,78 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
          * proven and the page-pointer array is the thing to shrink; if they are
          * a mix of sizes it is something else entirely and the FEX redesign
          * would have been wasted work. */
+        if ((type & MEM_COMMIT) && ios_bigres_cnt && *ret)
+            ios_bigres_commit( *ret, *size_ptr );
         if (jumbo_size >= 0x10000000 && jumbo_size < 0x40000000 && (type & MEM_RESERVE))
         {
             static unsigned bigres_n;
             static unsigned long long bigres_tot;
             bigres_n++;
             bigres_tot += jumbo_size;
-            dprintf(2, "[bigres] #%u size=0x%lx (%lu MB) hint=%p total=%llu MB\n",
-                    bigres_n, (unsigned long)jumbo_size,
-                    (unsigned long)(jumbo_size >> 20), jumbo_hint, bigres_tot >> 20);
+            /* ml126: ATTRIBUTE BY PROCESS, not by size. All 23 were exactly
+             * 512MB, which rules out FEXCore's LookupCache (a computed sum) and
+             * the CallRetStack (16MB), and no FEX VirtualAlloc site asks for
+             * 512MB either -- so this may well be the GUEST (V8's x64
+             * kMaximalCodeRangeSize is 512MB, which would fit CEF). ERR gives
+             * the wine tid prefix for free, and the PEB identifies WHICH
+             * pseudo-process: correlate against the [init-peb]/NtCreateUserProcess
+             * map. If these are steamwebhelper's PEB it is CEF/V8 and the fix is
+             * a command-line flag, not an FEX redesign -- a completely different
+             * and far cheaper answer than the one I was about to build. */
+            /* ml127: use dprintf, NOT ERR. The `virtual` debug channel's ERR is
+             * suppressed in this build (err:virtual: appears 0 times in a log
+             * with 526 err:seh: lines), so routing this through ERR to get the
+             * tid prefix silenced the probe completely — 23 lines in ml126, 0 in
+             * ml127. Same reason alloc_arm64ec_map's ERR has never appeared in
+             * any log. Read the tid out of the TEB instead. */
+            /* ml129: FEX's own hook ENCODES which structure this is, and I was
+             * simply not printing it. AllocatorHooks.h does
+             *   VirtualAlloc(Base, Size, Commit ? MEM_RESERVE|MEM_COMMIT : MEM_RESERVE,
+             *                Execute ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE)
+             * so protect==0x40 (PAGE_EXECUTE_READWRITE) means an Execute
+             * allocation -- a JIT code buffer (CPUBackend) or the dispatcher --
+             * while 0x04 (PAGE_READWRITE) means data, and the MEM_COMMIT bit
+             * separates the commit-upfront LookupCache path from pure reserves.
+             * That splits the remaining candidates without an FEX build, and
+             * without wiring a unixlib that iOS deliberately no-ops. */
+            dprintf( 2, "[bigres] tid=%04x #%u size=0x%lx (%lu MB) type=0x%x prot=0x%x hint=%p peb=%p total=%llu MB\n",
+                     NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0,
+                     bigres_n, (unsigned long)jumbo_size,
+                     (unsigned long)(jumbo_size >> 20), (unsigned)type, (unsigned)protect,
+                     jumbo_hint, NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL, bigres_tot >> 20 );
+            /* ml128: NAME THE CALLER. Elimination has run out — it is exactly
+             * 2 x 512MB per guest thread of steam.exe (peb=0x11da68000, 12 tids),
+             * and it is NOT the LookupCache (VirtualMemSize = 1ULL<<33 makes
+             * TotalCacheSize ~96MB, below this probe's 256MB floor), NOT the
+             * CallRetStack (16MB), NOT the emulator stack (256KB), and no FEX
+             * VirtualAlloc site asks for 512MB. So stop reasoning about sizes and
+             * read the return addresses off the stack, the same way [exit-stk]
+             * does. Module base + offset is enough — names come from the
+             * [jit-pool] image lines in the same log. */
+            if (bigres_n <= 4)
+            {
+                uint64_t *sp = (uint64_t *)__builtin_frame_address(0);
+                int w, hits = 0;
+                for (w = 0; w < 256 && hits < 6; w++)
+                {
+                    uint64_t mod = 0, va = ios_jit_reverse_translate( sp[w], &mod );
+                    if (va && mod && va != sp[w])
+                    {
+                        dprintf( 2, "[bigres]   caller sp+0x%x: 0x%llx = mod 0x%llx +0x%llx\n",
+                                 w * 8, (unsigned long long)sp[w],
+                                 (unsigned long long)mod, (unsigned long long)(va - mod) );
+                        hits++;
+                    }
+                }
+            }
         }
 
         st = allocate_virtual_memory( ret, size_ptr, type, protect,
                                       limit_low, limit_high, align, attributes );
 
         if (is_jumbo) ios_jumbo_census( jumbo_hint, jumbo_size, st ? NULL : *ret, (unsigned)st );
+        if (!st && *size_ptr >= 0x10000000 && *size_ptr < 0x40000000 && (type & MEM_RESERVE))
+            ios_bigres_note( *ret, *size_ptr );
         return st;
     }
 #else

@@ -1432,6 +1432,43 @@ static void *ios_mach_exception_thread( void *arg )
                                     (unsigned long long)pg, (unsigned long long)fa, mpr, errno_save,
                                     reuse, xr_n[s], in_pool_rx ? "pool-rx" : "band");
                             if (mpr == 0) handled = 1;
+                            /* ml133: mprotect(RX) on debugger-blessed pool memory
+                             * returns EACCES *unconditionally* — it is a platform
+                             * rule (only StikDebug's original blessed mapping may
+                             * be executable), NOT evidence that the mapping was
+                             * replaced, and the comment below has been reading it
+                             * that way for months. So recovery has never actually
+                             * been attempted here.
+                             *
+                             * What we DO know (ml104 byte-compare): the faulting
+                             * page is READABLE and its content is byte-identical
+                             * to the on-disk DLL. So the mapping is intact and the
+                             * page merely needs faulting back in. Force that from
+                             * the kernel side with mach_vm_read_overwrite — a
+                             * syscall, so it cannot itself fault this handler
+                             * thread the way a user-space load could — then retry
+                             * the instruction. If exec really is gone the retry
+                             * re-faults and the giveup counter above (8 tries per
+                             * page slot) surfaces it instead of spinning. */
+                            else if (in_pool_rx)
+                            {
+                                uint64_t probe[2] = { 0, 0 };
+                                mach_vm_size_t got = 0;
+                                kern_return_t kr = mach_vm_read_overwrite(
+                                        mach_task_self(), (mach_vm_address_t)pg, sizeof(probe),
+                                        (mach_vm_address_t)&probe, &got );
+                                if (kr == KERN_SUCCESS && got == sizeof(probe))
+                                {
+                                    sys_icache_invalidate( (void *)(uintptr_t)pg, XR_PAGE );
+                                    handled = 1;
+                                }
+                                if (xrcn < 40 || (xrcn % 50) == 0)
+                                    dprintf(STDERR_FILENO,
+                                        "[exec-recover] pg=0x%llx read-touch kr=%d got=%llu word0=0x%llx -> %s\n",
+                                        (unsigned long long)pg, (int)kr,
+                                        (unsigned long long)got, (unsigned long long)probe[0],
+                                        handled ? "RETRY" : "surface");
+                            }
                             /* else: mprotect RX failed => max_prot lost EXECUTE =>
                              * the code page was REPLACED by a plain RW mapping
                              * ([jit-tripwire] names the culprit). Nothing here can

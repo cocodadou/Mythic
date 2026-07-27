@@ -37,6 +37,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <limits.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #ifdef WINE_IOS
 /* Minimal Mach API decls to avoid <mach/mach.h>'s host_page_size symbol
@@ -204,6 +206,35 @@ static int ios_pool_free_count;
 
 void *ios_jit_current_peb(void);
 extern void *ios_jit_rw_base_global;  /* defined below */
+extern void *ios_jit_rx_base_global;  /* defined below */
+
+/* ml89: report the RX alias's protections for a pool range, WITHOUT touching
+ * them. The first version of this guard probed with mprotect(RX) and dropped
+ * any range that returned EACCES — but 62 of 62 candidates failed and not one
+ * succeeded, which is the signature of a probe that can never pass rather than
+ * of 62 genuinely dead ranges. mprotect on debugger-blessed pool memory is
+ * refused outright (same family as the share-probe's kr=2 on OVERWRITE), so it
+ * says nothing about executability. mach_vm_region reads max_protection
+ * directly and mutates nothing. Returns 1 if the range still permits exec. */
+static int ios_pool_range_execable(size_t off, unsigned int *cur_out, unsigned int *max_out)
+{
+    mach_vm_address_t a;
+    mach_vm_size_t sz = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+
+    if (!ios_jit_rx_base_global) return 1;
+    a = (mach_vm_address_t)(uintptr_t)((char *)ios_jit_rx_base_global + off);
+    if (mach_vm_region( mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64,
+                        (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS)
+        return 1;   /* can't tell — don't drop the range on a failed query */
+    if (a > (mach_vm_address_t)(uintptr_t)((char *)ios_jit_rx_base_global + off))
+        return 1;   /* region starts past us: address is in a gap, not our entry */
+    if (cur_out) *cur_out = (unsigned int)info.protection;
+    if (max_out) *max_out = (unsigned int)info.max_protection;
+    return (info.max_protection & VM_PROT_EXECUTE) != 0;
+}
 
 /* iOS-Mythic: secondary user_VA → JIT pool aliases mapping for anonymous
  * RWX regions (e.g. FEX CodeBuffer). When user_VA is vm_remap'd from JIT pool
@@ -284,9 +315,28 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
                 continue;
             }
         }
-        if (ios_jit_rw_base_global)
-            madvise( (char *)ios_jit_rw_base_global + ios_pool_freelist[i].off,
-                     ios_pool_freelist[i].size, MADV_FREE );
+        /* ml87 (2026-07-27): DO NOT volatilize pool ranges. Ever.
+         *
+         * History: this was MADV_FREE, then MADV_FREE_REUSABLE on the theory
+         * that the handout path's MADV_FREE_REUSE cancel was mispaired. ml87
+         * disproved that — all 101 cancels returned 0 and libarm64ecfex STILL
+         * died on a reused range (off=0x6844000, mprotect_rx=EACCES), exactly
+         * as in ml76 (off=0x6c34000).
+         *
+         * The flavor was never the issue: BOTH marks let the kernel reclaim
+         * the physical pages. The pool's RX alias is debugger-blessed
+         * (jit26_prepare_region), and a reclaimed page re-faults as a FRESH,
+         * UNBLESSED page — the mapping comes back max_prot=RW and mprotect(RX)
+         * is refused forever. MADV_FREE_REUSE only helps if the kernel hasn't
+         * taken the page yet; under CEF pressure (653MB pool + 212MB libcef)
+         * it already has.
+         *
+         * Cost of not sweeping: dead copies stay resident, so pool RSS sits at
+         * its high-water instead of shrinking. Range REUSE is untouched — the
+         * freelist below still recycles pool VA — so this costs no address
+         * space, only RAM. Note the sweep was originally added to relieve the
+         * RAM pressure blamed for StikDebug dying (the freeze/detach); that
+         * symptom may have been this corruption all along. */
         ios_pool_freelist[i].advised = 1;
     }
 
@@ -295,6 +345,24 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
         if (ios_pool_freelist[i].size < alloc_size) continue;
         if (now - ios_pool_freelist[i].freed_at < IOS_POOL_REUSE_GRACE_SEC) continue;
         if (!IOS_POOL_IN_REACH(ios_pool_freelist[i].off)) continue;
+        /* ml87/ml88 belt: never hand out a range that has genuinely lost its
+         * exec blessing (in ml88 all 8 [exec-recover] deaths were on freelist
+         * ranges, none on virgin bump pages). Now a read-only max_prot query —
+         * see ios_pool_range_execable() for why the mprotect version was a
+         * false positive that dropped all 62 candidates and disabled reuse
+         * entirely (pool then bumped to 762MB of 896MB). */
+        {
+            unsigned int cur = 0, mx = 0;
+            if (!ios_pool_range_execable( ios_pool_freelist[i].off, &cur, &mx ))
+            {
+                dprintf(2, "[jit-pool] POISONED range off=0x%lx size=0x%lx cur=0x%x max=0x%x — dropped, NOT handed out\n",
+                        (unsigned long)ios_pool_freelist[i].off,
+                        (unsigned long)ios_pool_freelist[i].size, cur, mx);
+                ios_pool_freelist[i] = ios_pool_freelist[--ios_pool_free_count];
+                i--;
+                continue;
+            }
+        }
         off = ios_pool_freelist[i].off;
         if (ios_pool_freelist[i].size > alloc_size)
         {
@@ -332,6 +400,22 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
         {
             off = jit_pool_offset;
             jit_pool_offset += alloc_size;
+            /* ml89 CONTROL for the POISONED check above: report the same
+             * max_prot for a range that has NEVER been freed. If virgin ranges
+             * read max=0x7 while freed ranges read max=0x3, reuse really does
+             * strip exec and the guard is sound. If both read the same, the
+             * guard is measuring nothing and the exec faults have another
+             * cause. Logged once every 16 bump allocations to stay quiet. */
+            {
+                static int bump_probe_n;
+                if ((bump_probe_n++ & 15) == 0)
+                {
+                    unsigned int cur = 0, mx = 0;
+                    int ok = ios_pool_range_execable( off, &cur, &mx );
+                    dprintf(2, "[jit-pool] bump-probe off=0x%lx size=0x%lx cur=0x%x max=0x%x execable=%d (VIRGIN control)\n",
+                            (unsigned long)off, (unsigned long)alloc_size, cur, mx, ok);
+                }
+            }
             /* Same volatility belt as the freelist path — virgin pages
              * shouldn't be MADV_FREE-marked, but under Steam-boot pressure
              * we've seen freshly written pool content read back zero. */
@@ -3681,6 +3765,69 @@ static size_t ios_x18_tramp_prealloc_scan( const char *image, size_t image_size 
 }
 
 
+/* [share-probe] logging: the LogStore periodically REWRITES mythic-log.txt
+ * from its own buffer, destroying interleaved raw-stderr lines (ml85: the
+ * probe's whole verdict vanished between pulls). Tee every probe line into
+ * Documents/share-probe.txt (O_APPEND, own fd) so no rewrite can eat it. */
+static void ios_probe_filelog(int fd_unused, const char *fmt, ...)
+{
+    va_list ap;
+    char buf[512];
+    int n;
+    va_start(ap, fmt);
+    n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+    write(2, buf, n);
+    {
+        static int pf = -2;
+        if (pf == -2)
+        {
+            const char *wp = getenv("WINEPREFIX");
+            pf = -1;
+            if (wp && strlen(wp) < 440)
+            {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/../share-probe.txt", wp);
+                pf = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            }
+        }
+        if (pf >= 0) write(pf, buf, n);
+    }
+}
+#define dprintf ios_probe_filelog
+
+/* Watchdog exec: run the 2-insn probe function on a disposable thread with a
+ * timeout, so an instruction-fetch wedge (ml79/ml85 signature) becomes a
+ * logged verdict instead of a lost thread holding the whole probe hostage.
+ * Returns the function's result, or INT_MIN on timeout. */
+static volatile int ios_probe_exec_done;
+static volatile int ios_probe_exec_ret;
+static void *ios_probe_exec_helper(void *p)
+{
+    typedef int (*probe_fn)(void);
+    int v = ((probe_fn)p)();
+    ios_probe_exec_ret = v;
+    __sync_synchronize();
+    ios_probe_exec_done = 1;
+    return NULL;
+}
+static int ios_probe_exec_timed(void *fn, int deciseconds)
+{
+    pthread_t t;
+    int i;
+    ios_probe_exec_done = 0;
+    if (pthread_create(&t, NULL, ios_probe_exec_helper, fn)) return INT_MIN;
+    pthread_detach(t);
+    for (i = 0; i < deciseconds; i++)
+    {
+        if (ios_probe_exec_done) return ios_probe_exec_ret;
+        usleep(100000);
+    }
+    return INT_MIN;
+}
+
 /* task #34 [share-probe] — one-shot go/no-go for one-RX-copy-per-DLL page
  * sharing: does the StikDebug execute blessing survive vm_remap(copy=FALSE)
  * of a blessed pool RX page to a SECOND in-pool VA, and does the dual-map
@@ -3734,93 +3881,149 @@ static void ios_share_probe(void)
     r = ((probe_fn)rx1)();
     dprintf(2, "[share-probe] exec at master %p -> %d (expect 42)\n", rx1, r);
 
-    /* ml77: OVERWRITE-remap into the pool RX region fails kr=2 — the
-     * jit26_prepare_region entry refuses replacement. Two viable mechanisms:
-     * A) punch a hole (deallocate the target slot) then remap FIXED without
-     *    OVERWRITE — keeps all existing rw-alias offset math if it works;
-     * B) remap ANYWHERE outside the pool (the anon-RWX path FEX CodeBuffers
-     *    use daily) — fallback design, mapping entries then carry their own
-     *    rw base. Probe BOTH for full data. */
+    /* [purge-probe] THE ml76-wall suspect: is the debugger-allocated pool
+     * PURGEABLE memory? (Allocator comment: virgin pool pages read back zero
+     * under pressure — anon memory doesn't do that unless volatile/purgeable.)
+     * GET_STATE per view; if any view reports purgeable+volatile, SET
+     * NONVOLATILE and re-query — that one call would be the whole reclaim fix
+     * (no vm_wire, no jetsam cost). KERN_INVALID_ARGUMENT = not purgeable. */
     {
-        vm_address_t target = (vm_address_t)rx2;
-        kr = mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)rx2, pg);
-        dprintf(2, "[share-probe] A: deallocate pool hole %p kr=%d\n", rx2, kr);
-        if (kr == KERN_SUCCESS)
+        struct { const char *name; vm_address_t a; } views[3];
+        int v;
+        views[0].name = "pool-rx-base"; views[0].a = (vm_address_t)ios_jit_rx_base_global;
+        views[1].name = "pool-rw-base"; views[1].a = (vm_address_t)ios_jit_rw_base_global;
+        views[2].name = "master-slot ";  views[2].a = (vm_address_t)rx1;
+        for (v = 0; v < 3; v++)
         {
-            kr = vm_remap(mach_task_self(), &target, pg, 0, VM_FLAGS_FIXED,
-                          mach_task_self(), (vm_address_t)rx1, FALSE,
-                          &cur, &max, VM_INHERIT_DEFAULT);
-            dprintf(2, "[share-probe] A: vm_remap RX %p -> %p (into hole) kr=%d cur=0x%x max=0x%x\n",
-                    rx1, rx2, kr, cur, max);
-        }
-        if (kr != KERN_SUCCESS)
-        {
-            /* If A's deallocate succeeded but the remap didn't, rx2 is now an
-             * unmapped hole in the pool — harmless only because both probe
-             * slots are ledgered under the early-boot NULL peb, which no
-             * process-exit reclaim ever matches, so the allocator never hands
-             * this offset out again. */
-            /* Variant B: kernel-picked VA outside the pool. */
-            vm_address_t anyv = 0;
-            kern_return_t kb = vm_remap(mach_task_self(), &anyv, pg, 0,
-                                        VM_FLAGS_ANYWHERE, mach_task_self(),
-                                        (vm_address_t)rx1, FALSE, &cur, &max,
-                                        VM_INHERIT_DEFAULT);
-            dprintf(2, "[share-probe] B: vm_remap RX %p -> ANYWHERE %p kr=%d cur=0x%x max=0x%x\n",
-                    rx1, (void *)anyv, kb, cur, max);
-            if (kb != KERN_SUCCESS)
+            int state = -1;
+            kern_return_t pk = vm_purgable_control(mach_task_self(), views[v].a,
+                                                   VM_PURGABLE_GET_STATE, &state);
+            dprintf(2, "[purge-probe] %s %p GET_STATE kr=%d state=%d%s\n",
+                    views[v].name, (void *)views[v].a, pk, state,
+                    pk == KERN_SUCCESS
+                        ? (state == VM_PURGABLE_VOLATILE ? " (PURGEABLE+VOLATILE — the wall!)" :
+                           state == VM_PURGABLE_NONVOLATILE ? " (purgeable, nonvolatile)" :
+                           state == VM_PURGABLE_EMPTY ? " (purgeable, EMPTY)" : "")
+                        : " (not purgeable)");
+            if (pk == KERN_SUCCESS && state != VM_PURGABLE_NONVOLATILE)
             {
-                dprintf(2, "[share-probe] VERDICT: NO-GO (both A and B remaps failed)\n");
-                return;
+                int ns = VM_PURGABLE_NONVOLATILE;
+                kern_return_t sk = vm_purgable_control(mach_task_self(), views[v].a,
+                                                       VM_PURGABLE_SET_STATE, &ns);
+                dprintf(2, "[purge-probe] %s SET NONVOLATILE kr=%d (old=%d)\n",
+                        views[v].name, sk, ns);
             }
-            rx2 = (char *)anyv;  /* continue the exec + dual-map test at the B alias */
         }
     }
-    kr = vm_protect(mach_task_self(), (vm_address_t)rx2, pg, FALSE,
-                    VM_PROT_READ | VM_PROT_EXECUTE);
-    dprintf(2, "[share-probe] vm_protect(alias, RX) kr=%d\n", kr);
+
+    /* CONTROL (ml85 confound): variant E execs on a fresh watchdog pthread.
+     * If a bare pthread can't run blessed pool code AT ALL (no FEX/TEB/signal
+     * setup), E's wedge is a thread artifact, not a remap verdict. Run the
+     * MASTER page through the same watchdog path first. master-via-watchdog
+     * == 42 → thread is fine, any E wedge is the remap. WEDGE here → the
+     * whole E result is invalid (thread, not remap). */
     {
-        mach_vm_address_t qa = (mach_vm_address_t)(uintptr_t)rx2;
-        mach_vm_size_t qs = 0;
-        vm_region_basic_info_data_64_t qi = {0};
-        mach_msg_type_number_t qc = VM_REGION_BASIC_INFO_COUNT_64;
-        mach_port_t qo = MACH_PORT_NULL;
-        if (mach_vm_region(mach_task_self(), &qa, &qs, VM_REGION_BASIC_INFO_64,
-                           (vm_region_info_t)&qi, &qc, &qo) != KERN_SUCCESS ||
-            (char *)(uintptr_t)qa > rx2 || !(qi.protection & VM_PROT_EXECUTE))
+        int rc = ios_probe_exec_timed(rx1, 50);
+        dprintf(2, "[share-probe] CONTROL master-via-watchdog -> %s\n",
+                rc == INT_MIN ? "WEDGED (bare pthread can't exec pool code — E verdict would be INVALID)"
+                              : (rc == 42 ? "42 OK (watchdog thread is fine — E wedge = the remap)"
+                                          : "WRONG"));
+    }
+
+    /* Verdicts so far (ml77/79/85): OVERWRITE into pool RX kr=2; hole
+     * dealloc kr=0 but refill remap kr=3; remap ANYWHERE gets kernel R+X but
+     * EXEC WEDGES the thread — attached AND detached. Lore (stikdebug-jit):
+     * self-created exec mappings don't work; only the debugger-allocated
+     * range executes. Yet the PRODUCTION anon-RWX path executes pool pages
+     * remapped OVERWRITE onto wine's pre-existing anon mmap regions daily.
+     * Variant E = exact replica of that shape: mmap anon RW, OVERWRITE-remap
+     * master page onto it, vm_protect RX, exec — on a WATCHDOG thread so a
+     * wedge is a logged verdict, not a lost one. */
+    {
+        void *tgt = mmap(NULL, pg, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANON, -1, 0);
+        vm_address_t target;
+        if (tgt == MAP_FAILED)
         {
-            dprintf(2, "[share-probe] VERDICT: NO-GO (alias lacks EXEC: prot=0x%x max=0x%x)\n",
-                    qi.protection, qi.max_protection);
+            dprintf(2, "[share-probe] E: mmap anon target failed errno=%d\n", errno);
             return;
         }
-        dprintf(2, "[share-probe] alias region prot=0x%x max_prot=0x%x — executing\n",
-                qi.protection, qi.max_protection);
-    }
-    sys_icache_invalidate(rx2, pg);
-    r = ((probe_fn)rx2)();
-    dprintf(2, "[share-probe] exec at ALIAS %p -> %d (expect 42)%s\n",
-            rx2, r, r == 42 ? " OK" : " WRONG");
-    if (r != 42) { dprintf(2, "[share-probe] VERDICT: NO-GO (alias executed wrong bytes)\n"); return; }
-
-    /* Dual-map through the share: remap the RW alias too, rewrite via the
-     * MASTER's RW view, and re-execute at the alias — proves one physical
-     * page serves master-RW writes and alias-RX fetches (the invariant the
-     * sharing design keeps). */
-    {
-        vm_address_t target = (vm_address_t)rw2;
+        dprintf(2, "[share-probe] E: anon RW target %p — OVERWRITE-remap from master %p\n", tgt, rx1);
+        target = (vm_address_t)tgt;
         kr = vm_remap(mach_task_self(), &target, pg, 0,
                       VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
-                      (vm_address_t)rw1, FALSE, &cur, &max, VM_INHERIT_DEFAULT);
-        dprintf(2, "[share-probe] vm_remap RW %p -> %p kr=%d\n", rw1, rw2, kr);
+                      (vm_address_t)rx1, FALSE, &cur, &max, VM_INHERIT_DEFAULT);
+        dprintf(2, "[share-probe] E: vm_remap kr=%d cur=0x%x max=0x%x\n", kr, cur, max);
+        if (kr != KERN_SUCCESS) { dprintf(2, "[share-probe] VERDICT: NO-GO (E remap failed)\n"); return; }
+        kr = vm_protect(mach_task_self(), target, pg, FALSE,
+                        VM_PROT_READ | VM_PROT_EXECUTE);
+        dprintf(2, "[share-probe] E: vm_protect(R+X) kr=%d\n", kr);
+        {
+            mach_vm_address_t qa = (mach_vm_address_t)target;
+            mach_vm_size_t qs = 0;
+            vm_region_basic_info_data_64_t qi = {0};
+            mach_msg_type_number_t qc = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t qo = MACH_PORT_NULL;
+            if (mach_vm_region(mach_task_self(), &qa, &qs, VM_REGION_BASIC_INFO_64,
+                               (vm_region_info_t)&qi, &qc, &qo) == KERN_SUCCESS)
+                dprintf(2, "[share-probe] E: region prot=0x%x max_prot=0x%x\n",
+                        qi.protection, qi.max_protection);
+        }
+        sys_icache_invalidate(tgt, pg);
+        if (*(volatile uint32_t *)tgt != *(volatile uint32_t *)rx1)
+        {
+            dprintf(2, "[share-probe] E: read mismatch tgt=0x%08x master=0x%08x\n",
+                    *(volatile uint32_t *)tgt, *(volatile uint32_t *)rx1);
+        }
+        dprintf(2, "[share-probe] E: executing at %p (watchdog 5s)\n", tgt);
+        r = ios_probe_exec_timed(tgt, 50);
+        if (r == INT_MIN)
+        {
+            dprintf(2, "[share-probe] E: WEDGED (no return in 5s) — VERDICT: NO-GO (anon-replica exec dead too)\n");
+            return;
+        }
+        dprintf(2, "[share-probe] E: exec -> %d (expect 42)%s\n", r, r == 42 ? " OK" : " WRONG");
+        if (r != 42) { dprintf(2, "[share-probe] VERDICT: NO-GO (E wrong bytes)\n"); return; }
+
+        /* Dual-map through the share: rewrite via the MASTER's RW view and
+         * re-execute at the E alias — one physical page must serve master-RW
+         * writes and alias-RX fetches. */
+        ((uint32_t *)rw1)[0] = 0x52800560;  /* mov w0, #43 */
+        __asm__ __volatile__("dsb sy" ::: "memory");
+        sys_icache_invalidate(tgt, pg);
+        r = ios_probe_exec_timed(tgt, 50);
+        dprintf(2, "[share-probe] E: rewrite-via-master exec -> %d (expect 43) — VERDICT: %s\n",
+                r, r == 43 ? "GO (anon-replica sharing works)" : "NO-GO (dual-map incoherent)");
     }
-    ((uint32_t *)rw1)[0] = 0x52800560;  /* mov w0, #43 */
-    __asm__ __volatile__("dsb sy" ::: "memory");
-    sys_icache_invalidate(rx2, pg);
-    r = ((probe_fn)rx2)();
-    dprintf(2, "[share-probe] rewrite-via-master, exec at alias -> %d (expect 43) — VERDICT: %s\n",
-            r, r == 43 ? "GO" : "NO-GO (dual-map incoherent through share)");
+    (void)rx2; (void)rw2;
 }
 
+
+/* task #34 [share-probe] post-detach runner: the ml79 wedge happened with
+ * StikDebug still ATTACHED (exec faults route to the debugger and hang), so
+ * the exec-at-alias verdict was inconclusive. Wait for the app's REAL
+ * jit26_detach on a scratch thread — worst case is a stuck background
+ * thread, never a wedged boot. (ml81 lesson: CS_DEBUGGED is STICKY after
+ * detach — that's why blessed JIT keeps working — so csops can't signal
+ * detach; StikJITHelper.detachDebugger sets MYTHIC_DETACHED instead.
+ * Desktop sessions detach on session exit or the 20-min maxWait cap.) */
+static void *ios_share_probe_thread(void *arg)
+{
+    int i;
+    for (i = 0; i < 900; i++)  /* ≤30min at 2s — covers the 20-min cap */
+    {
+        if (getenv("MYTHIC_DETACHED"))
+        {
+            dprintf(2, "[share-probe] debugger DETACHED (poll %d) — running post-detach probe\n", i);
+            ios_share_probe();
+            return NULL;
+        }
+        usleep(2000000);
+    }
+    dprintf(2, "[share-probe] no detach within 30min — probe skipped\n");
+    return NULL;
+}
+#undef dprintf
 
 /***********************************************************************
  *           mprotect_exec
@@ -4187,16 +4390,19 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     (unsigned long)tramp_prealloc);
 
             /* task #34 [share-probe]: DEFAULT-OFF (set MYTHIC_SHARE_PROBE=1).
-             * ml79 VERDICT recorded — executing at a vm_remap'd alias of a
-             * blessed pool page WEDGES the calling thread (StikDebug exec
-             * blessing does not transfer to a remapped VA), which black-
-             * screens the desktop when it runs on explorer's boot thread.
-             * Kept gated for future mechanism experiments, never on the
-             * boot path by default. */
+             * ml79: running it inline here (pre-detach, on explorer's boot
+             * thread) wedged the session — exec-at-alias hangs while the
+             * debugger is attached. Gated + deferred to a scratch thread
+             * that waits for CS_DEBUGGED to clear before probing. */
             {
                 static int ios_share_probed;
                 if (!ios_share_probed && getenv("MYTHIC_SHARE_PROBE"))
-                { ios_share_probed = 1; ios_share_probe(); }
+                {
+                    pthread_t pt;
+                    ios_share_probed = 1;
+                    if (!pthread_create(&pt, NULL, ios_share_probe_thread, NULL))
+                        pthread_detach(pt);
+                }
             }
 
             /* Mark the JIT-pool range as ARM64EC code in the EcCodeBitMap —

@@ -211,6 +211,9 @@ enum StikJITHelper {
     static func detachDebugger() {
         LogStore.shared.log("Detaching debugger...")
         jit26_detach()
+        // task #34: signal in-process waiters (share-probe poller). CS_DEBUGGED
+        // is sticky post-detach, so an env flag is the reliable signal.
+        setenv("MYTHIC_DETACHED", "1", 1)
         LogStore.shared.log("Debugger detached.", level: .success)
     }
 }

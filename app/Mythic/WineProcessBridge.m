@@ -149,6 +149,11 @@ static void *wine_process_thread(void *arg) {
          * for diagnostic/profiling sessions. */
         setenv("MYTHIC_QUIET", "1", 1);
 
+        /* task #34 share/purge-probe experiments CONCLUDED 2026-07-14
+         * (remap-sharing dead; pool not purgeable; ml76 wall = mismatched
+         * MADV_FREE/MADV_FREE_REUSE pair). Probe machinery stays in
+         * ntdll-unix, gated on MYTHIC_SHARE_PROBE — set it here to re-run. */
+
         /* 2026-07-05 audio: activate the AVAudioSession before Wine boots
          * so the RemoteIO unit in the mmdevapi driver can start. Playback
          * category = ignores silent switch (it's a game). */

@@ -941,6 +941,68 @@ static void ios_bigres_report( const char *why )
  * which I could not distinguish from "clean" until the faulting copy turned out
  * to come from the LOADER path (libarm64ecfex pool 0x11f638000). Always print a
  * verdict so silence can never again be mistaken for a pass. */
+
+/* ml153 WINE DEBUG CHANNELS ARE NEVER RESOLVED IN POOL COPIES.
+ *
+ * struct __wine_debug_channel { unsigned char flags; char name[15]; } ships with
+ * flags = 0xff, the "lazy init" sentinel (__WINE_DBCL_INIT = bit 7). The
+ * compiled fast path is a bare bit test —
+ *     ldrb w8,[x8,#0x40] ; tbz w8,#3,skip     (rpcrt4 NDRCContextUnmarshall)
+ * — so an UNRESOLVED channel reads as TRACE-ENABLED, the TRACE block is entered,
+ * and all of its arguments are evaluated before anything discovers the channel is
+ * actually off. In rpcrt4 that means TRACE("*%p=(%p)...", CContext, *CContext)
+ * dereferences the context handle: with a bad handle that is an instant fault,
+ * which is exactly the 28x RtlLeaveCriticalSection / NDRCContextUnmarshall
+ * cluster that stalls the webhelper's RPC handshake.
+ *
+ * Wine resolves these lazily per channel, so a module copied before a channel was
+ * ever used keeps 0xff forever. Normalise them in the copy: ERR only (0x02),
+ * matching WINEDEBUG=err+all. Costs nothing and removes TRACE argument
+ * evaluation — and its pointer dereferences — from every copied DLL.
+ *
+ * Deliberately conservative: only a byte that is EXACTLY 0xff followed by a
+ * plausible lowercase channel name and NUL padding to 16 bytes is touched. */
+static int ios_jit_init_debug_channels( void *base, size_t image_size,
+                                        size_t data_off, size_t data_size )
+{
+    unsigned char *p = (unsigned char *)base;
+    size_t o;
+    int fixed = 0;
+
+    if (!base || !data_size || data_off + data_size > image_size) return 0;
+    /* ml155: BOUND THE SCAN. The first cut walked every writable section in
+     * full, which not only burned iterations but TOUCHED EVERY .data PAGE of
+     * every one of ~150 module copies — forcing them all resident instead of
+     * faulting lazily. That showed up as a large, user-visible slowdown in
+     * desktop and Steam-updater init.
+     *
+     * Wine builtins keep their __wine_dbch_* table near the start of .data, and
+     * the DLLs with multi-megabyte .data (libcef, steamui, shell32) are not Wine
+     * builtins and have no channels at all. 256KB is 16 pages per section and
+     * caught every channel the unbounded version did (7-44 per module). */
+    if (data_size > 0x40000) data_size = 0x40000;
+    for (o = data_off; o + 16 <= data_off + data_size; o += 8)
+    {
+        unsigned char *c = p + o;
+        int i, namelen = 0;
+
+        if (c[0] != 0xff) continue;
+        for (i = 1; i < 16; i++)
+        {
+            unsigned char ch = c[i];
+            if (ch == 0) break;
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_')) { namelen = -1; break; }
+            namelen++;
+        }
+        if (namelen < 2 || namelen > 14) continue;
+        for (i = 1 + namelen; i < 16; i++) if (c[i]) { namelen = -1; break; }
+        if (namelen < 0) continue;
+        c[0] = 0x02;   /* ERR only — see WINEDEBUG=err+all in WineProcessBridge.m */
+        fixed++;
+    }
+    return fixed;
+}
+
 static void ios_jit_verify_text_exec( const char *who, const void *rx_dest, size_t image_size )
 {
     static unsigned verified;
@@ -967,6 +1029,14 @@ static void ios_jit_verify_text_exec( const char *who, const void *rx_dest, size
                 text_size = sec[i].Misc.VirtualSize;
             }
         if (!text_size || text_offset + text_size > image_size) return;
+
+        /* ml156 REVERTED — see ios_jit_init_debug_channels. The normalisation
+         * itself worked (7-44 channels per module) but the call site was wrong:
+         * it wrote through rx_dest, the EXECUTE alias, instead of the RW alias
+         * the copy path uses for content, and any false-positive match corrupts
+         * real .data. Result: steam.exe died after 137 unix calls with exec
+         * faults back. Re-do it against rw_dest with a stricter pattern before
+         * re-enabling. */
     }
     for (o = 0; o < text_size; o += 0x4000)
     {
@@ -2672,6 +2742,44 @@ static void *user_space_limit    = (void *)0x7fffffff0000;  /* top of the user a
  * freed elsewhere just gets absorbed by furniture growth. */
 static const ULONG_PTR ios_furniture_ceiling = 0x73ffff0000;   /* ml132: 3-pool geometry, now with ios_spill_cap bounding the downside */
 
+/* ml168: running total of 256MB..1GB MEM_RESERVE grants, used ONLY as a pressure
+ * signal for the steering valve in NtAllocateVirtualMemory. Steam/CEF makes 2 x
+ * 512MB reserve-only allocations per guest thread and commits ~1% of them; by
+ * thread 13 that is 13.8GB of the 15.1GB furniture window, maxgap collapses to
+ * 28MB, the next 512MB reserve FAILS and the caller stores through the NULL
+ * (`stp x8,x20,[x0]`, x0=0 -> c0000005, ml166).
+ *
+ * Attribution resisted six approaches (four RIP-based -> all landed inside
+ * VirtualAlloc itself; the guest x64 CONTEXT is all-zero so there is NO guest
+ * context, i.e. the caller is native; and the native stack's frame order is
+ * provably inconsistent — LdrInitializeThunk appeared ABOVE the syscall stub —
+ * so its libarm64ecfex hits mix live and stale frames). The flags also exclude
+ * every FEX site: type=0x2000 lacks MEM_TOP_DOWN which
+ * FEXCore::Allocator::VirtualAlloc unconditionally ORs, CallRetStack is
+ * MEM_TOP_DOWN|PAGE_NOACCESS, and the iOS LookupCache path passes Commit=true.
+ *
+ * So stop trying to name the caller and fix the placement instead. */
+static unsigned long long ios_bigres_reserved_total;
+
+/* ml207: furniture-window PRESSURE LATCH.
+ *
+ * The big-reserve steer valve used to arm only at ios_bigres_reserved_total > 8GB, chosen
+ * so a Thumper run (which never gets near it) keeps byte-identical placement. But the
+ * usable furniture window is only ~16GB, so that gate hands FEX's 512MB per-thread arenas
+ * the first 8GB of it before steering starts. ml207 measured 16 of 25 reserves (8GB)
+ * landing INSIDE the window; ml206 38 of 50 (19GB). What follows is starvation: a 1MB
+ * thread stack cannot be placed, FEX reports "Failed to mprotect last page of code buffer",
+ * the thread dies and steam.exe exits(1) — the shallow runs that have been blocking
+ * verification, at 22k unix calls instead of 46k.
+ *
+ * So arm on the SYMPTOM instead of a guessed constant: the [va-scan] probe already knows
+ * when the window is tight. A healthy scan costs "a handful of tryfixed calls"; ml207
+ * ground 22747 of them. Latching here means a healthy run never arms the valve (Thumper
+ * placement is unchanged, which is the property the 8GB gate existed to protect) while a
+ * starving one steers every subsequent arena out of the window from the moment it is
+ * genuinely tight. */
+static int ios_va_pressure;
+
 /* ml116 ROOT CAUSE of the ceiling regressions (disassembly + code-path proof,
  * no device run needed):
  *
@@ -2715,6 +2823,91 @@ static const ULONG_PTR ios_usable_va_floor = 0x7038000000;
  * two pools instead of losing all three. Bounded downside, so the experiment is
  * worth running. 0 disables. */
 static const ULONG_PTR ios_spill_cap = 0x7800000000;
+
+/* ml170: DEDICATED SLOT FOR STEERED RESERVES.
+ *
+ * The steering valve worked -- 12 x 512MB moved above the ceiling and furniture
+ * occupancy fell 13758MB -> 10160MB, taking the run from 18770 to 37175 unix
+ * calls (deepest yet). But it steered into ios_spill_cap = 0x7800000000, which is
+ * PartitionAlloc's slot 2, so [soft-pool] COLLISION went 12 -> 43 and pools
+ * granted dropped 4 -> 3. Give the steered ranges their OWN slot instead.
+ *
+ * The top slot is the right one to give up: the ml135 census measured real CEF
+ * demand at 3 x 16GB, and slots 0-2 (0x7000000000/0x7400000000/0x7800000000)
+ * cover exactly that, leaving [0x7C00000000, 0x8000000000) = 16GB for steering --
+ * enough for the ~14GB of 512MB reserves this workload makes. */
+static const ULONG_PTR ios_steer_slot = 0x7C00000000;
+
+/* ml173 THREAD-AWARE RECLAMATION of steered reserves (task #35/#36).
+ *
+ * PROVEN LEAK, once the [bigfree] probe was fixed: releases DO happen (32 of them,
+ * all type=0x8000 MEM_RELEASE with size=0 as the Windows contract requires) but every
+ * one is small — 0x1000..0x200000. NOT ONE 512MB range is ever released. So the owner
+ * reserves 2 x 512MB per guest thread at thread start, commits ~1%, and never frees;
+ * the count tracks run length (23 -> 27 -> 55) and no fixed slot size can hold it.
+ *
+ * Reclaiming on THREAD DEATH is the one rule that is airtight: a dead thread can never
+ * commit into its reservation again, so releasing it cannot race a live owner. That is
+ * why this is preferred over recycling any zero-commit range (which can steal a live
+ * thread's untouched reservation) or aliasing (unsound in general).
+ *
+ * ios_thread_died() is called from the pthread_exit path in thread_ios.c. */
+#define IOS_STEER_MAX 256
+static struct { uint64_t base; uint64_t size; unsigned tid; unsigned freed; } ios_steer[IOS_STEER_MAX];
+static unsigned ios_steer_n;
+static unsigned char ios_tid_dead[8192];   /* bitmap, indexed by wine tid */
+
+void ios_thread_died( unsigned tid )
+{
+    if (tid < sizeof(ios_tid_dead) * 8) ios_tid_dead[tid >> 3] |= (1u << (tid & 7));
+}
+
+/* ml181 BUG FIX (mine). Wine thread ids are SMALL AND RECYCLED (0x74, 0x98, 0xbc ...).
+ * ios_tid_dead marked a tid dead permanently, so once a tid was reused by a new thread
+ * the bitmap still read "dead" and the next exhaustion would release that LIVE thread's
+ * 512MB arena. Those arenas hold FEX's CpuStateFrame (it sits at base+0x1140 — ml174/ml181
+ * both show CPUArea+0x30 pointing inside a steered range), so freeing one under a running
+ * thread produces exactly the STATE==0 faults we are chasing. Clear the bit whenever the
+ * tid proves itself alive by making a reservation. */
+static void ios_thread_alive( unsigned tid )
+{
+    if (tid < sizeof(ios_tid_dead) * 8) ios_tid_dead[tid >> 3] &= ~(1u << (tid & 7));
+}
+
+static int ios_tid_is_dead( unsigned tid )
+{
+    if (tid >= sizeof(ios_tid_dead) * 8) return 0;
+    return (ios_tid_dead[tid >> 3] >> (tid & 7)) & 1;
+}
+
+/* Release every steered range whose owning thread has exited. Returns bytes freed.
+ * Called only from the steer path, which does NOT hold the virtual mutex (that is
+ * taken inside allocate_virtual_memory), so re-entering the free path is safe here. */
+static uint64_t ios_steer_reclaim_dead( void )
+{
+    uint64_t freed_total = 0;
+    unsigned i;
+
+    for (i = 0; i < ios_steer_n; i++)
+    {
+        void *addr;
+        SIZE_T sz = 0;
+
+        if (ios_steer[i].freed || !ios_steer[i].base) continue;
+        if (!ios_tid_is_dead( ios_steer[i].tid )) continue;
+
+        addr = (void *)(uintptr_t)ios_steer[i].base;
+        if (!NtFreeVirtualMemory( NtCurrentProcess(), &addr, &sz, MEM_RELEASE ))
+        {
+            ios_steer[i].freed = 1;
+            freed_total += ios_steer[i].size;
+        }
+    }
+    if (freed_total)
+        dprintf(2, "[steer-reclaim] released %lluMB from exited threads\n",
+                (unsigned long long)(freed_total >> 20));
+    return freed_total;
+}
 
 /* [va-scan] probe: failing mmap-tryfixed attempts inside the current
  * map_free_area call. virtual_mutex is held throughout, so a plain global is
@@ -6920,6 +7113,13 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                 static int described;
                 char what[128];
 
+                /* ml207: latch furniture pressure — see ios_va_pressure. Deliberately a
+                 * much stricter test than this probe's own 64-try "SLOW" threshold: an
+                 * outright failure, or grinding on the order of a thousand attempts, is
+                 * unambiguous exhaustion rather than ordinary fragmentation. */
+                if (!ptr || ios_va_scan_tries - tries0 >= 1024)
+                    ios_va_pressure = 1;
+
                 /* ml118 discriminator — see ios_scan_fail_addr. Rate-limited:
                  * the mach query is cheap but not free, and the first handful
                  * of verdicts settle the question. */
@@ -10353,6 +10553,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
             static unsigned long long bigres_tot;
             bigres_n++;
             bigres_tot += jumbo_size;
+            ios_bigres_reserved_total += jumbo_size;
             /* ml126: ATTRIBUTE BY PROCESS, not by size. All 23 were exactly
              * 512MB, which rules out FEXCore's LookupCache (a computed sum) and
              * the CallRetStack (16MB), and no FEX VirtualAlloc site asks for
@@ -10393,19 +10594,91 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
              * read the return addresses off the stack, the same way [exit-stk]
              * does. Module base + offset is enough — names come from the
              * [jit-pool] image lines in the same log. */
-            if (bigres_n <= 4)
+            /* ml166: this scan HAS been running every run and I had simply never read its
+             * output. Symbolising it settles the owner and REFUTES two earlier claims:
+             *   - the 512MB reserves ARE FEX's own: mod 0x73f09d0000 = libarm64ecfex.dll,
+             *     +0x125834/+0x125860 -> VirtualAlloc, +0x1e7e08 -> $iexit_thunk$cdecl$i8$i8.
+             *     So "type=0x2000 proves the caller is NOT FEX" (the AllocatorHooks
+             *     MEM_TOP_DOWN note) does NOT hold here, and the ml128 claim "no FEX
+             *     VirtualAlloc site asks for 512MB" is wrong.
+             *   - but those are FEX's own ALLOCATOR frames, the nearest ones. The subsystem
+             *     that asked is deeper, and the old limits hid it: 6 hits, bigres_n <= 4.
+             *
+             * Scan deeper, report more, and cover the LATE reservations (#18+) which are the
+             * ones that exhaust the window: 27 x 512MB filled 13.8GB of 15.1GB while
+             * committing 1%, maxgap fell to 28MB, a 512MB reserve FAILED, and the NULL
+             * return was stored through (`stp x8,x20,[x0]` with x0=0). Which FEX subsystem
+             * this is decides the fix: smaller per-thread arena vs relocation above the
+             * ceiling vs soft reservation. */
+            if (bigres_n <= 4 || (bigres_n >= 18 && bigres_n <= 30))
             {
                 uint64_t *sp = (uint64_t *)__builtin_frame_address(0);
                 int w, hits = 0;
-                for (w = 0; w < 256 && hits < 6; w++)
+                for (w = 0; w < 1024 && hits < 20; w++)
                 {
                     uint64_t mod = 0, va = ios_jit_reverse_translate( sp[w], &mod );
                     if (va && mod && va != sp[w])
                     {
-                        dprintf( 2, "[bigres]   caller sp+0x%x: 0x%llx = mod 0x%llx +0x%llx\n",
-                                 w * 8, (unsigned long long)sp[w],
+                        dprintf( 2, "[bigres]   caller#%u sp+0x%x: 0x%llx = mod 0x%llx +0x%llx\n",
+                                 bigres_n, w * 8, (unsigned long long)sp[w],
                                  (unsigned long long)mod, (unsigned long long)(va - mod) );
                         hits++;
+                    }
+                }
+
+                /* ml167 GUEST-STACK ATTRIBUTION — the one route not yet tried.
+                 *
+                 * The native scan above is NOT proof of ownership: it surfaces any
+                 * code-like value on the stack, including DEAD frames from earlier FEX
+                 * activity on that thread, and I over-trusted its libarm64ecfex hits last
+                 * round. The flags actually EXCLUDE every FEX site I can enumerate —
+                 * type=0x2000 has no MEM_TOP_DOWN, and FEXCore::Allocator::VirtualAlloc
+                 * unconditionally ORs it (AllocatorHooks.h: Flags = (Commit?MEM_COMMIT:0)
+                 * | MEM_RESERVE | MEM_TOP_DOWN); CallRetStack is MEM_TOP_DOWN+PAGE_NOACCESS;
+                 * the iOS LookupCache path passes Commit=true (FEX_IOS_HOST=1 is global).
+                 *
+                 * All four earlier attribution attempts were RIP-based and returned NATIVE
+                 * addresses inside VirtualAlloc itself. So walk the GUEST stack instead:
+                 * the saved x64 CONTEXT is at CPUArea+0x50, Rsp at +0x98 (Rip at +0xF8, as
+                 * the ios_guest_ctx_rip comment records). x86-64 return addresses there
+                 * point at PE module VAs, which are STABLE all run (unlike pool copies the
+                 * freelist recycles), so they resolve offline against [jit-pool] image.
+                 *
+                 * What this decides: 2 x 512MB per guest thread at 1% commit, with
+                 * [bigres] total only ever GROWING, is either a size knob or a per-thread
+                 * reservation never released on thread exit — both cheap and safe. Only if
+                 * it is neither do we need overcommit/aliasing, which is unsound in general
+                 * (an app is entitled to grow into a range it reserved). */
+                {
+                    TEB *t = NtCurrentTeb();
+                    void *ca = t ? *(void **)((char *)t + 0x1788) : NULL;
+
+                    if ((uintptr_t)ca >= 0x10000)
+                    {
+                        uint64_t grsp = *(uint64_t *)((char *)ca + 0x50 + 0x98);
+                        uint64_t grip = *(uint64_t *)((char *)ca + 0x50 + 0xF8);
+
+                        dprintf( 2, "[bigres]   guest#%u rsp=0x%llx rip=0x%llx\n",
+                                 bigres_n, (unsigned long long)grsp,
+                                 (unsigned long long)grip );
+                        /* Only read the guest stack if Wine owns the range. A raw deref
+                         * here would fault mid-syscall (this is not a signal handler, so
+                         * it would surface as a real AV and cost the run). find_view is
+                         * the header-free check already available in this TU. */
+                        if (grsp >= 0x10000 && !(grsp & 7)
+                            && find_view( (const void *)(uintptr_t)grsp, 0x1000 ))
+                        {
+                            const uint64_t *gs = (const uint64_t *)(uintptr_t)grsp;
+                            int g, gh = 0;
+                            for (g = 0; g < 256 && gh < 12; g++)
+                            {
+                                uint64_t v = gs[g];
+                                if (v < 0x7300000000ULL || v >= 0x7400000000ULL) continue;
+                                dprintf( 2, "[bigres]   guest#%u rsp+0x%x: 0x%llx\n",
+                                         bigres_n, g * 8, (unsigned long long)v );
+                                gh++;
+                            }
+                        }
                     }
                 }
             }
@@ -10449,7 +10722,93 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
         }
         else
         {
-            st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
+            /* ml168 STEERING VALVE (task #35/#36): under furniture pressure, place
+             * large RESERVE-ONLY, unhinted allocations ABOVE the furniture ceiling.
+             *
+             * Deliberately a PRESSURE VALVE, not a behaviour change: it arms only once
+             * >8GB of 256MB..1GB reserves have already been granted, which never happens
+             * in a Thumper run, so existing working cases keep their exact placement.
+             * MEM_COMMIT requests are excluded — those are backed immediately and belong
+             * where the allocator would normally put them; only reserve-only ranges (the
+             * 1%-committed kind measured by [bigres-use]) get moved.
+             *
+             * Above the ceiling the space is the pool slots, which [bigres-use] shows at
+             * 0% committed (POOL 0x7400000000/0x7800000000/0x7c00000000 all 0MB), so the
+             * range is there to use. It is NOT free of risk: PartitionAlloc owns those
+             * slots and could commit into one later, which the [soft-pool] COLLISION
+             * detector would then report. That is why this stays pressure-gated and why
+             * it always FALLS BACK to normal placement on failure — a steer that cannot
+             * be served must never be worse than not steering. */
+            int ios_steered = 0;
+
+            if (!*ret && !limit && (type & MEM_RESERVE) && !(type & MEM_COMMIT)
+                && *size_ptr >= 0x10000000 && *size_ptr < 0x40000000
+                && (ios_bigres_reserved_total > (8ull << 30) || ios_va_pressure))
+            {
+                SIZE_T want = *size_ptr;
+                void *saved = *ret;
+                static unsigned steer_n;
+                /* ml169: `limit` is 0 here ("unconstrained"), so passing it as limit_high
+                 * described the EMPTY range [ios_spill_cap, 0) and every steer failed with
+                 * *ret = 0x0. The upper bound has to be a real address: use the host VA
+                 * ceiling, which is_beyond_limit treats as EXCLUSIVE. */
+                NTSTATUS sst = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                                        ios_steer_slot,
+                                                        (ULONG_PTR)host_addr_space_limit,
+                                                        0, 0 );
+                /* ml171: 16GB is not enough. Surviving longer spawns more threads, so
+                 * the reserve count went 27 -> 55 (28160MB) and BOTH the steer slot and
+                 * furniture reported va-scan FAILED maxgap=0 before the NULL deref.
+                 * Fall back to the 0x7400000000 slot, which this run left UNGRANTED —
+                 * pools landed on 0x7000000000, 0x73ffff0000 and 0x7800000000, matching
+                 * the 3-pool census. That doubles steer capacity to ~32GB. */
+                if (sst)
+                {
+                    *ret = saved; *size_ptr = want;
+                    sst = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                                   0x7400000000ULL, ios_spill_cap, 0, 0 );
+                }
+                /* ml173: both steer slots full -> reclaim ranges owned by threads that
+                 * have since exited, then retry once. This is what makes the steer
+                 * region sustainable: the reserves leak per-thread, so without this any
+                 * fixed capacity is exhausted by a long enough run. */
+                if (sst && ios_steer_reclaim_dead())
+                {
+                    *ret = saved; *size_ptr = want;
+                    sst = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                                   ios_steer_slot,
+                                                   (ULONG_PTR)host_addr_space_limit, 0, 0 );
+                    if (sst)
+                    {
+                        *ret = saved; *size_ptr = want;
+                        sst = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                                       0x7400000000ULL, ios_spill_cap, 0, 0 );
+                    }
+                }
+                if (!sst && ios_steer_n < IOS_STEER_MAX)
+                {
+                    ios_steer[ios_steer_n].base = (uint64_t)(uintptr_t)*ret;
+                    ios_steer[ios_steer_n].size = want;
+                    ios_steer[ios_steer_n].tid  =
+                        NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
+                    ios_thread_alive( ios_steer[ios_steer_n].tid );   /* tid recycling: see above */
+                    ios_steer[ios_steer_n].freed = 0;
+                    ios_steer_n++;
+                }
+                if (steer_n < 12)
+                {
+                    steer_n++;
+                    dprintf(2, "[steer] #%u size=0x%lx reserved_total=%lluMB armed=%s -> %s %p\n",
+                            steer_n, (unsigned long)want,
+                            (unsigned long long)(ios_bigres_reserved_total >> 20),
+                            ios_va_pressure ? "va-pressure" : "8GB-total",
+                            sst ? "FAILED, falling back" : "above ceiling", *ret);
+                }
+                if (!sst) { st = sst; ios_steered = 1; }
+                else { *ret = saved; *size_ptr = want; }   /* fall back to normal */
+            }
+            if (!ios_steered)
+                st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
             /* task#29 CEF plan C: a HINTED jumbo reserve that fails placement
              * is retried as kernel-pick. Windows semantics say fail on
              * conflict, but PartitionAlloc-style callers use the returned
@@ -10558,6 +10917,10 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                         NTSTATUS pst;
 
                         if (ios_soft_slot_taken( slot )) continue;
+                        /* ml170: reserved for steered 512MB reserves (see
+                         * ios_steer_slot) -- granting it as a pool is what caused
+                         * the 43 collisions and cost us the 4th pool. */
+                        if (slot == ios_steer_slot) continue;
                         /* skip a slot that already holds a REAL pool: a 64KB
                          * probe reserve at its base would succeed only if free */
                         probe_addr = NULL; probe_sz = 0;
@@ -10847,6 +11210,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             static unsigned long long bigres_tot;
             bigres_n++;
             bigres_tot += jumbo_size;
+            ios_bigres_reserved_total += jumbo_size;
             /* ml126: ATTRIBUTE BY PROCESS, not by size. All 23 were exactly
              * 512MB, which rules out FEXCore's LookupCache (a computed sum) and
              * the CallRetStack (16MB), and no FEX VirtualAlloc site asks for
@@ -10887,19 +11251,91 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
              * read the return addresses off the stack, the same way [exit-stk]
              * does. Module base + offset is enough — names come from the
              * [jit-pool] image lines in the same log. */
-            if (bigres_n <= 4)
+            /* ml166: this scan HAS been running every run and I had simply never read its
+             * output. Symbolising it settles the owner and REFUTES two earlier claims:
+             *   - the 512MB reserves ARE FEX's own: mod 0x73f09d0000 = libarm64ecfex.dll,
+             *     +0x125834/+0x125860 -> VirtualAlloc, +0x1e7e08 -> $iexit_thunk$cdecl$i8$i8.
+             *     So "type=0x2000 proves the caller is NOT FEX" (the AllocatorHooks
+             *     MEM_TOP_DOWN note) does NOT hold here, and the ml128 claim "no FEX
+             *     VirtualAlloc site asks for 512MB" is wrong.
+             *   - but those are FEX's own ALLOCATOR frames, the nearest ones. The subsystem
+             *     that asked is deeper, and the old limits hid it: 6 hits, bigres_n <= 4.
+             *
+             * Scan deeper, report more, and cover the LATE reservations (#18+) which are the
+             * ones that exhaust the window: 27 x 512MB filled 13.8GB of 15.1GB while
+             * committing 1%, maxgap fell to 28MB, a 512MB reserve FAILED, and the NULL
+             * return was stored through (`stp x8,x20,[x0]` with x0=0). Which FEX subsystem
+             * this is decides the fix: smaller per-thread arena vs relocation above the
+             * ceiling vs soft reservation. */
+            if (bigres_n <= 4 || (bigres_n >= 18 && bigres_n <= 30))
             {
                 uint64_t *sp = (uint64_t *)__builtin_frame_address(0);
                 int w, hits = 0;
-                for (w = 0; w < 256 && hits < 6; w++)
+                for (w = 0; w < 1024 && hits < 20; w++)
                 {
                     uint64_t mod = 0, va = ios_jit_reverse_translate( sp[w], &mod );
                     if (va && mod && va != sp[w])
                     {
-                        dprintf( 2, "[bigres]   caller sp+0x%x: 0x%llx = mod 0x%llx +0x%llx\n",
-                                 w * 8, (unsigned long long)sp[w],
+                        dprintf( 2, "[bigres]   caller#%u sp+0x%x: 0x%llx = mod 0x%llx +0x%llx\n",
+                                 bigres_n, w * 8, (unsigned long long)sp[w],
                                  (unsigned long long)mod, (unsigned long long)(va - mod) );
                         hits++;
+                    }
+                }
+
+                /* ml167 GUEST-STACK ATTRIBUTION — the one route not yet tried.
+                 *
+                 * The native scan above is NOT proof of ownership: it surfaces any
+                 * code-like value on the stack, including DEAD frames from earlier FEX
+                 * activity on that thread, and I over-trusted its libarm64ecfex hits last
+                 * round. The flags actually EXCLUDE every FEX site I can enumerate —
+                 * type=0x2000 has no MEM_TOP_DOWN, and FEXCore::Allocator::VirtualAlloc
+                 * unconditionally ORs it (AllocatorHooks.h: Flags = (Commit?MEM_COMMIT:0)
+                 * | MEM_RESERVE | MEM_TOP_DOWN); CallRetStack is MEM_TOP_DOWN+PAGE_NOACCESS;
+                 * the iOS LookupCache path passes Commit=true (FEX_IOS_HOST=1 is global).
+                 *
+                 * All four earlier attribution attempts were RIP-based and returned NATIVE
+                 * addresses inside VirtualAlloc itself. So walk the GUEST stack instead:
+                 * the saved x64 CONTEXT is at CPUArea+0x50, Rsp at +0x98 (Rip at +0xF8, as
+                 * the ios_guest_ctx_rip comment records). x86-64 return addresses there
+                 * point at PE module VAs, which are STABLE all run (unlike pool copies the
+                 * freelist recycles), so they resolve offline against [jit-pool] image.
+                 *
+                 * What this decides: 2 x 512MB per guest thread at 1% commit, with
+                 * [bigres] total only ever GROWING, is either a size knob or a per-thread
+                 * reservation never released on thread exit — both cheap and safe. Only if
+                 * it is neither do we need overcommit/aliasing, which is unsound in general
+                 * (an app is entitled to grow into a range it reserved). */
+                {
+                    TEB *t = NtCurrentTeb();
+                    void *ca = t ? *(void **)((char *)t + 0x1788) : NULL;
+
+                    if ((uintptr_t)ca >= 0x10000)
+                    {
+                        uint64_t grsp = *(uint64_t *)((char *)ca + 0x50 + 0x98);
+                        uint64_t grip = *(uint64_t *)((char *)ca + 0x50 + 0xF8);
+
+                        dprintf( 2, "[bigres]   guest#%u rsp=0x%llx rip=0x%llx\n",
+                                 bigres_n, (unsigned long long)grsp,
+                                 (unsigned long long)grip );
+                        /* Only read the guest stack if Wine owns the range. A raw deref
+                         * here would fault mid-syscall (this is not a signal handler, so
+                         * it would surface as a real AV and cost the run). find_view is
+                         * the header-free check already available in this TU. */
+                        if (grsp >= 0x10000 && !(grsp & 7)
+                            && find_view( (const void *)(uintptr_t)grsp, 0x1000 ))
+                        {
+                            const uint64_t *gs = (const uint64_t *)(uintptr_t)grsp;
+                            int g, gh = 0;
+                            for (g = 0; g < 256 && gh < 12; g++)
+                            {
+                                uint64_t v = gs[g];
+                                if (v < 0x7300000000ULL || v >= 0x7400000000ULL) continue;
+                                dprintf( 2, "[bigres]   guest#%u rsp+0x%x: 0x%llx\n",
+                                         bigres_n, g * 8, (unsigned long long)v );
+                                gh++;
+                            }
+                        }
                     }
                 }
             }
@@ -10934,6 +11370,30 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     SIZE_T size = *size_ptr;
 
     TRACE("%p %p %08lx %x\n", process, addr, size, type );
+
+    /* ml171 LEAK PROBE: the 512MB reserves grow without bound (27 -> 55 across runs,
+     * 28GB) and only ~1%% is ever committed. If the owner never RELEASES them the fix is
+     * reclamation, not more address space; if it does release and our accounting still
+     * grows, the leak is ours. Log every large free so the next run answers it. */
+    /* ml172 FIX: the first cut gated logging on size >= 256MB, but Windows REQUIRES
+     * size == 0 for MEM_RELEASE (VirtualFree(addr, 0, MEM_RELEASE)) — so the very calls
+     * this probe exists to catch could never be logged, and its "0 frees" result was
+     * meaningless. Log any MEM_RELEASE of an address in the steered/pool band, plus any
+     * large explicit free, and resolve the real extent from the view. */
+    if ((type & MEM_RELEASE) || size >= 0x10000000)
+    {
+        static unsigned freebig_n;
+        uintptr_t fa = (uintptr_t)addr;
+
+        if (freebig_n < 32 && (size >= 0x10000000 || fa >= 0x7000000000ULL))
+        {
+            struct file_view *fv = find_view( addr, 0 );
+            freebig_n++;
+            dprintf(2, "[bigfree] #%u addr=%p size=0x%lx type=0x%x view=%p viewsize=0x%lx\n",
+                    freebig_n, addr, (unsigned long)size, (unsigned)type,
+                    fv ? fv->base : NULL, fv ? (unsigned long)fv->size : 0ul);
+        }
+    }
 
     if (process != NtCurrentProcess())
     {

@@ -1223,18 +1223,48 @@ void main_loop(void)
              * ios_fd_is_inet comment. Dispatch re-checks fd identity —
              * fd_poll_event may remove/reuse later poll users. */
             {
+                /* ml160 (#36): this loop used to stop at the FIRST 64 INET
+                 * fds (`nrp < 64`), silently dropping every one past that on
+                 * every iteration — so those sockets were never polled and
+                 * their asyncs never completed. Steam's symptom matched
+                 * exactly: the EARLY connect (few fds live) completes after
+                 * ~400 polls, while three LATER blocking connects get ZERO
+                 * poll_socket calls and Steam quits after the third.
+                 *
+                 * Now batched: poll ALL INET fds, 64 at a time. The counters
+                 * prove whether the old cap was actually being exceeded —
+                 * if inet_seen never exceeds 64, the cap was NOT the bug and
+                 * this change is merely harmless. */
                 struct pollfd rp[64];
                 int rp_user[64];
                 int nrp = 0, k;
+                int inet_seen = 0;
+                static unsigned ios_inet_cap_reports;
+                static int ios_inet_max_seen;
 
-                for (i = 1; i < nb_users && nrp < 64; i++)
+                for (i = 1; i < nb_users; i++)
                 {
                     if (pollfd[i].fd < 0 || !pollfd[i].events) continue;
                     if (!ios_fd_is_inet( i, pollfd[i].fd )) continue;
+                    inet_seen++;
                     rp[nrp].fd = pollfd[i].fd;
                     rp[nrp].events = pollfd[i].events;
                     rp[nrp].revents = 0;
                     rp_user[nrp++] = i;
+
+                    if (nrp < 64) continue;
+                    if (poll( rp, nrp, 0 ) > 0)
+                    {
+                        for (k = 0; k < nrp; k++)
+                        {
+                            int u = rp_user[k];
+                            if (!rp[k].revents) continue;
+                            if (pollfd[u].fd != rp[k].fd) continue;
+                            ios_events_fired++;
+                            fd_poll_event( poll_users[u], rp[k].revents );
+                        }
+                    }
+                    nrp = 0;
                 }
                 if (nrp && poll( rp, nrp, 0 ) > 0)
                 {
@@ -1245,6 +1275,17 @@ void main_loop(void)
                         if (pollfd[u].fd != rp[k].fd) continue;  /* user removed mid-dispatch */
                         ios_events_fired++;
                         fd_poll_event( poll_users[u], rp[k].revents );
+                    }
+                }
+                if (inet_seen > ios_inet_max_seen)
+                {
+                    ios_inet_max_seen = inet_seen;
+                    if (inet_seen > 48 && ios_inet_cap_reports < 12)
+                    {
+                        ios_inet_cap_reports++;
+                        ws_log("[inet-poll] max INET fds with events = %d (nb_users=%d)%s",
+                               inet_seen, nb_users,
+                               inet_seen > 64 ? "  <-- OLD 64-CAP WOULD HAVE DROPPED SOME" : "");
                     }
                 }
             }

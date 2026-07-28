@@ -1132,6 +1132,14 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
                 (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
                 *(void **)(tsd_base + 275 * 8));
         *(void **)(tsd_base + 275 * 8) = NULL;
+        /* ml173: tell the VA layer this thread is gone so its leaked 512MB steered
+         * reserves can be released (see ios_steer_reclaim_dead in virtual_ios.c).
+         * A dead thread can never commit into them again, which is what makes
+         * reclaiming them safe. */
+        {
+            extern void ios_thread_died( unsigned tid );
+            ios_thread_died( (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread );
+        }
     }
     pthread_exit( UIntToPtr(status) );
 }

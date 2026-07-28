@@ -699,6 +699,54 @@ static void *ios_mach_exception_thread( void *arg )
                     uint32_t insn = *(uint32_t *)(uintptr_t)fault_pc;
                     int rn = (insn >> 5) & 0x1f;
 
+                    /* ml157 PROBE (#36): the webhelper dies here. FEX emitted
+                     * `movz w1,#0; ldr x1,[x1]` — the page-0 address was
+                     * materialised into a SCRATCH register, so rn!=18 and the
+                     * emulator above declines, making the fault fatal (5
+                     * recursive repeats -> thread exit -> steam exit(1)).
+                     *
+                     * The open question is whether address 0 here is a TEB
+                     * offset FEX spilled to a scratch reg, or a genuine guest
+                     * NULL deref. Emulating the wrong one silently corrupts,
+                     * so DO NOT widen the discriminator until this says which.
+                     *
+                     * Discriminators printed:
+                     *  - the 16 insns before pc: an x18 SPILL (`mov xN,x18` /
+                     *    `mrs`+TEB math) means TEB access; a guest-address
+                     *    computation (adds/shifts from FEX guest regs) means a
+                     *    real NULL deref.
+                     *  - base reg VALUE vs fault_addr: equal => the register
+                     *    literally held the small offset.
+                     * Capped at 4 reports so a fault storm can't flood. */
+                    if (rn != 18)
+                    {
+                        static int ios_x18_decline_reports;
+                        if (ios_x18_decline_reports < 4)
+                        {
+                            const uint32_t *w = (const uint32_t *)(uintptr_t)fault_pc;
+                            char buf[512];
+                            int n = 0, k;
+                            /* __x[] is x0..x28 only; fp/lr/sp are separate
+                             * members and rn==31 is xzr/sp. Never index past 28. */
+                            uint64_t rn_val = (rn < 29) ? state.__x[rn] :
+                                              (rn == 29) ? state.__fp :
+                                              (rn == 30) ? state.__lr : state.__sp;
+                            ios_x18_decline_reports++;
+                            for (k = -16; k <= 4 && n < (int)sizeof(buf) - 16; k++)
+                                n += snprintf( buf + n, sizeof(buf) - n, "%s%08x",
+                                               k ? " " : " [", w[k] ) + (k ? 0 : 0);
+                            snprintf( buf + n, sizeof(buf) - n, "]" );
+                            ERR( "[x18-decline] #%d pc=%p fault_addr=0x%lx insn=%08x rn=%d "
+                                 "xRn=0x%llx (rn_val==fault_addr? %d) x18=0 teb=%p\n",
+                                 ios_x18_decline_reports, (void *)(uintptr_t)fault_pc,
+                                 (unsigned long)fault_addr, insn, rn,
+                                 (unsigned long long)rn_val,
+                                 rn_val == fault_addr, (void *)thread_teb );
+                            ERR( "[x18-decline] #%d insns pc-64..pc+16:%s\n",
+                                 ios_x18_decline_reports, buf );
+                        }
+                    }
+
                     if (rn == 18)
                     {
                         uintptr_t ea = thread_teb + fault_addr;
@@ -3676,6 +3724,20 @@ static inline void ios_track_signal( int sig, ucontext_t *context )
  *
  * Handler for SIGSEGV.
  */
+static int dumped_page0;   /* ml180: one wide dump, for the page-0 fault only */
+
+/* ml174: is a candidate FEX CpuStateFrame initialised? See the call site. */
+static int probe_ptr_ok( uint64_t frame )
+{
+    uint64_t v = 0;
+    mach_vm_size_t g = 0;
+
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(frame + 0x40), 8,
+                                (mach_vm_address_t)&v, &g ) != KERN_SUCCESS || g != 8)
+        return 0;
+    return v >= 0x100000000ull && v < 0x8000000000ull;
+}
+
 static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { 0 };
@@ -3785,6 +3847,323 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * violations in an infinite loop (Thumper desktop: `ldrh w7,[x7,...]`
          * on guest pointer 0x3f800018 = float 1.0 bits spun 6.8M times here
          * instead of being delivered to the game as an AV). */
+        /* ml158 PROBE (#36): the webhelper dies on a fault this discriminator
+         * declines. ml157 showed FEX emitted `movz w1,#0; ldr x1,[x1]` — the
+         * page-0 address was materialised into a SCRATCH register, so Rn!=18
+         * and we fall through to a fatal SEGV (5 repeats -> thread exit ->
+         * steam exit(1)).
+         *
+         * ml158 note: the first cut of this probe went into the MACH handler,
+         * but these faults arrive via segv_handler (this function), so it
+         * never fired. Same probe, correct handler.
+         *
+         * Open question this answers: is address 0 here a TEB offset FEX
+         * spilled to a scratch reg, or a genuine guest NULL deref? Emulating
+         * the wrong one silently corrupts, so DO NOT widen the discriminator
+         * until this says which. An x18 spill (`mov xN,x18`) in the preceding
+         * instructions => TEB access; a guest-address computation => real NULL
+         * deref (cf. the Thumper 0x3f800018 case that motivated Rn==18). */
+        /* ml165 (#36): RECOVER A NULL FEX STATE REGISTER (x28).
+         *
+         * Report #1 caught `ldr w2,[x28,#0x5d0]` faulting with x28 == 0, inside a
+         * function whose prologue is `... mov x28, x0` — so FEX was ENTERED with a NULL
+         * CpuStateFrame in arg0 and propagated it into STATE. Surrounding registers place
+         * it mid-PartitionAlloc-reservation (x27 == 0x400010000, exactly our jumbo pool
+         * size; x21/x22 look like PA hints).
+         *
+         * The authoritative frame pointer is available and provably correct: the CPU area
+         * at TEB+0x1788 holds it at +0x30 (FEX sets CPUArea->SuspendDoorbell from the same
+         * frame at Module.cpp:1443), and in the SAME process/TEB of ml165 reports #3/#4
+         * carried x28 == 0x7310001140 == CPUArea+0x30. So restoring x28 from CPUArea+0x30
+         * and retrying restores exactly the value FEX itself would have used.
+         *
+         * This mirrors the accepted x18-restore-from-TSD-275 approach. Gated hard, because
+         * x28 is an ordinary callee-saved register in non-FEX code and ALL our modules run
+         * from the JIT pool:
+         *   - x28 must be EXACTLY 0 (not merely small),
+         *   - the faulting instruction's base register must BE x28,
+         *   - the fault offset must be a plausible CpuStateFrame field (< 64KB),
+         *   - CPUArea+0x30 must read back non-NULL, and the target field must be readable.
+         * Reads go through mach_vm_read_overwrite so a bad CPU area cannot recurse the
+         * handler. pc is NOT advanced: we fix the register and re-execute.
+         *
+         * If this restores the wrong thing we will see it immediately — the fault was
+         * fatal anyway, so recovery is strictly better than dying, and every restore is
+         * logged. */
+        if (REGn_sig(28, context) == 0 && (uintptr_t)pc >= 0x100000000ULL
+            && ios_teb_for_signals != 0)
+        {
+            uintptr_t fa = (uintptr_t)siginfo->si_addr;
+            uint32_t insn = *(uint32_t *)pc;
+
+            if (((insn >> 5) & 31) == 28 && fa < 0x10000)
+            {
+                uint64_t cpu_area = 0, frame = 0, probe = 0;
+                mach_vm_size_t got = 0;
+
+                if (mach_vm_read_overwrite( mach_task_self(),
+                        (mach_vm_address_t)(ios_teb_for_signals + 0x1788), 8,
+                        (mach_vm_address_t)&cpu_area, &got ) == KERN_SUCCESS && got == 8
+                    && cpu_area
+                    && mach_vm_read_overwrite( mach_task_self(),
+                        (mach_vm_address_t)(cpu_area + 0x30), 8,
+                        (mach_vm_address_t)&frame, &got ) == KERN_SUCCESS && got == 8
+                    && frame
+                    && mach_vm_read_overwrite( mach_task_self(),
+                        (mach_vm_address_t)(frame + fa), 8,
+                        (mach_vm_address_t)&probe, &got ) == KERN_SUCCESS && got == 8
+                    /* ml174: the frame must also be INITIALISED, not merely readable.
+                     * Restoring a readable-but-uninitialised frame is worse than not
+                     * restoring at all: in ml174 x28 was set to 0x7c80001140 and the very
+                     * next instruction did `ldr x2,[x28,#0x40]` -> garbage -> `str x0,[x2]`
+                     * faulted at 0x80001131, and the bogus exception frame turned a
+                     * contained thread-kill into "frame not in stack limits" and killed
+                     * the whole process. FEX keeps a pointer at frame+0x40 (the sequence
+                     * ldr/sub #0x10/str/store-through is a stack-style push), so require
+                     * it to look like a real userspace pointer before trusting the frame. */
+                    && probe_ptr_ok( frame ))
+                {
+                    static int ios_state_restores;
+
+                    if (ios_state_restores < 12)
+                    {
+                        ios_state_restores++;
+                        ERR( "[state-restore] #%d pc=%p insn=%08x off=0x%lx x28=0 -> %p "
+                             "(CPUArea=%p) retrying\n", ios_state_restores, pc, insn,
+                             (unsigned long)fa, (void *)(uintptr_t)frame,
+                             (void *)(uintptr_t)cpu_area );
+                    }
+                    REGn_sig(28, context) = frame;
+                    return;
+                }
+            }
+        }
+
+        {
+            uintptr_t f_addr = (uintptr_t)siginfo->si_addr;
+            uint32_t f_insn = ((uintptr_t)pc >= 0x100000000ULL) ? *(uint32_t *)pc : 0;
+            int f_rn = (f_insn >> 5) & 31;
+            static int ios_x18_decline_reports;
+
+            if (REGn_sig(18, context) == 0 && ios_teb_for_signals != 0
+                && (uintptr_t)pc >= 0x100000000ULL && f_addr < 0x10000
+                && f_rn != 18 && ios_x18_decline_reports < 4)
+            {
+                const uint32_t *w = (const uint32_t *)pc;
+                char buf[512];
+                int n = 0, k;
+                ios_x18_decline_reports++;
+                for (k = -16; k <= 4 && n < (int)sizeof(buf) - 16; k++)
+                    n += snprintf( buf + n, sizeof(buf) - n, "%s%08x",
+                                   (k == -16) ? " [" : " ", w[k] );
+                snprintf( buf + n, sizeof(buf) - n, "]" );
+                ERR("[x18-decline] #%d pc=%p fault_addr=0x%lx insn=%08x rn=%d "
+                    "xRn=%p (rn_val==fault_addr? %d) x18=0 teb=%p\n",
+                    ios_x18_decline_reports, pc, (unsigned long)f_addr, f_insn, f_rn,
+                    (void *)REGn_sig(f_rn, context),
+                    (uintptr_t)REGn_sig(f_rn, context) == f_addr,
+                    (void *)ios_teb_for_signals);
+                ERR("[x18-decline] #%d insns pc-64..pc+16:%s\n",
+                    ios_x18_decline_reports, buf);
+
+                /* ml164 follow-up: 21 instruction words were not enough to NAME the
+                 * emitted stub, and source archaeology has not pinned it either. Scan a
+                 * wide window for STRUCTURAL markers whose encodings are unambiguous, so
+                 * the stub identifies itself:
+                 *
+                 *   brk #0xCAFE = 0xd4395fc0  -> Arm64JITCore::EmitSuspendInterruptCheck
+                 *                                (SuspendMagic; ARCHITECTURE_arm64ec only)
+                 *   brk #0x0    = 0xd4200000  -> generic trap
+                 *   mrs xN, TPIDRRO_EL0 (0xd53bd060 mask) -> IOS_LOAD_TEB / x18 patcher
+                 *                                trampoline, i.e. a TEB-load site
+                 *   msr TPIDR_EL0 (0xd51bd040 mask) -> MUST NEVER appear (corrupts Apple
+                 *                                malloc); flag loudly if it does.
+                 *
+                 * Read through mach_vm_read_overwrite, never a raw deref: pc may sit near
+                 * the start of its mapping and a fault inside this handler would recurse. */
+                {
+                    static uint32_t win[320];   /* pc-1024 .. pc+256 */
+                    mach_vm_size_t got = 0;
+                    uintptr_t base = (uintptr_t)pc - 1024;
+
+                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)base,
+                                                sizeof(win), (mach_vm_address_t)win,
+                                                &got ) == KERN_SUCCESS && got >= 4)
+                    {
+                        unsigned words = (unsigned)(got / 4), j;
+                        int cafe = -1, brk0 = -1, tpidrro = -1, tpidrw = -1;
+
+                        for (j = 0; j < words; j++)
+                        {
+                            uint32_t v = win[j];
+                            int off = (int)(j * 4) - 1024;
+                            if (v == 0xd4395fc0 && cafe < 0) cafe = off;
+                            else if (v == 0xd4200000 && brk0 < 0) brk0 = off;
+                            if ((v & 0xffffffe0) == 0xd53bd060 && tpidrro < 0) tpidrro = off;
+                            if ((v & 0xffffffe0) == 0xd51bd040 && tpidrw < 0) tpidrw = off;
+                        }
+                        ERR("[x18-decline] #%d markers(words=%u): brk#CAFE@%d brk#0@%d "
+                            "mrs_TPIDRRO@%d msr_TPIDR_EL0@%d%s\n",
+                            ios_x18_decline_reports, words, cafe, brk0, tpidrro, tpidrw,
+                            tpidrw >= 0 ? "  <-- ILLEGAL TPIDR_EL0 WRITE IN THIS BLOCK" : "");
+
+                        /* ml179: the fault is ALWAYS at offset 0x650 of a 16KB-aligned
+                         * block, and FEX's whole generated dispatcher is exactly
+                         * MAX_DISPATCHER_CODE_SIZE = FEX_PAGE_SIZE*4 = 16KB
+                         * (Dispatcher.cpp:48). So this pc is a FIXED location in the
+                         * dispatcher, and 21 instruction words were never going to name
+                         * it. Dump a wide raw window instead so it can be disassembled
+                         * offline against Dispatcher.cpp's emission order — that is what
+                         * finally identifies the stub, with no FEX rebuild.
+                         * Emitted as 8 lines of 16 words to stay readable. */
+                        /* ml180: gate on the PAGE-0 fault, not on report #1. The
+                         * first qualifying fault in a run is often the NULL-CS one
+                         * (RtlLeaveCriticalSection, addr=0x8), which consumed the single
+                         * dump last run and told us nothing about the FEX site. Also drop
+                         * the "dispatcher is 16KB" wording: 16KB-alignment of the pc is
+                         * arithmetic, not evidence that the block IS FEX's dispatcher. */
+                        /* ml191 CALLRET PROBE. The two guest RIPs that reach this
+                         * trampoline are libcef+0x1900733 and +0x3b508f0. Decoding libcef
+                         * forward from 0x1900733-16 gives a clean x86 stream
+                         * (mov/mov/test/je/mov/call) in which the `call` STARTS ONE BYTE
+                         * BEFORE that RIP — i.e. the guest arrived MID-INSTRUCTION. FEX
+                         * then decodes garbage and raises NoExecOp (PARTIAL_DECODE_INST
+                         * routes to the same handler as NOEXEC_INST), which is why this
+                         * looked like a permissions bug when it is really a bad control
+                         * flow target.
+                         *
+                         * So log where the target came from: FEX's call-return prediction
+                         * stack. The ml174 dump showed the push sequence
+                         *   ldr x2,[x28,#0x40]; sub x2,#0x10; str x2,[x28,#0x40]; str x0,[x2]
+                         * ml193: the first cut guessed frame+0x40/+0x48 from that push and
+                         * was WRONG — the probe self-reported it (in_range=0, and the
+                         * "entries" decoded as ASCII text), which is exactly why it was
+                         * built to validate. Offsets now COMPUTED from CPUState in
+                         * CoreState.h rather than inferred:
+                         *   +0x00 InlineJITBlockHeader, +0x08 DeferredSignalRefCount,
+                         *   +0x10 pf_raw, +0x14 af_raw, +0x18 rip,
+                         *   +0x20 gregs[16] (128B, ..0x9F), +0xA0 L1Pointer, +0xA8 L1Mask,
+                         *   +0xB0 callret_sp, +0xB8 callret_sp_base
+                         * CPUState is the first member of CpuStateFrame, so these are
+                         * frame-relative. (+0x18 rip also matches the known state[0x18]
+                         * native-PC note.) */
+                        if (f_addr == 0 && REGn_sig(28, context) >= 0x100000000ULL)
+                        {
+                            uint64_t frame = REGn_sig(28, context);
+                            uint64_t sp = 0, base = 0, ent[8] = {0};
+                            mach_vm_size_t g = 0;
+                            int ok_sp, ok_base, ok_ent = 0;
+
+                            ok_sp = (mach_vm_read_overwrite( mach_task_self(),
+                                        (mach_vm_address_t)(frame + 0xB0), 8,
+                                        (mach_vm_address_t)&sp, &g ) == KERN_SUCCESS && g == 8);
+                            ok_base = (mach_vm_read_overwrite( mach_task_self(),
+                                        (mach_vm_address_t)(frame + 0xB8), 8,
+                                        (mach_vm_address_t)&base, &g ) == KERN_SUCCESS && g == 8);
+                            if (ok_sp && sp >= 0x10000)
+                                ok_ent = (mach_vm_read_overwrite( mach_task_self(),
+                                            (mach_vm_address_t)sp, sizeof(ent),
+                                            (mach_vm_address_t)ent, &g ) == KERN_SUCCESS);
+                            {
+                                uint64_t grip = 0; mach_vm_size_t g2 = 0;
+                                if (mach_vm_read_overwrite( mach_task_self(),
+                                        (mach_vm_address_t)(frame + 0x18), 8,
+                                        (mach_vm_address_t)&grip, &g2 ) == KERN_SUCCESS)
+                                    ERR("[callret] State.rip=%p\n", (void *)(uintptr_t)grip);
+                            }
+                            ERR("[callret] frame=%p sp=%p(ok=%d) base=%p(ok=%d) in_range=%d\n",
+                                (void *)(uintptr_t)frame, (void *)(uintptr_t)sp, ok_sp,
+                                (void *)(uintptr_t)base, ok_base,
+                                (ok_sp && ok_base && base && sp >= base && sp < base + 0x1000000));
+                            if (ok_ent)
+                                ERR("[callret] top: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                                    (unsigned long long)ent[0], (unsigned long long)ent[1],
+                                    (unsigned long long)ent[2], (unsigned long long)ent[3],
+                                    (unsigned long long)ent[4], (unsigned long long)ent[5],
+                                    (unsigned long long)ent[6], (unsigned long long)ent[7]);
+                        }
+
+                        if (f_addr == 0 && !dumped_page0 && (dumped_page0 = 1))
+                        {
+                            uintptr_t blk = (uintptr_t)pc & ~0x3fffULL;
+                            unsigned row;
+
+                            ERR("[disp-dump] block=%p pc=%p offset=0x%lx (16KB-aligned window)\n",
+                                (void *)blk, pc, (unsigned long)((uintptr_t)pc - blk));
+                            for (row = 0; row < 8; row++)
+                            {
+                                /* window: pc-0x200 .. pc+0x0 , 16 words per row */
+                                const uint32_t *w2 = (const uint32_t *)((uintptr_t)pc - 0x200 + row * 64);
+                                int off = -0x200 + (int)(row * 64);
+                                char lb[256];
+                                int ln = 0, q;
+                                for (q = 0; q < 16 && ln < (int)sizeof(lb) - 12; q++)
+                                    ln += snprintf( lb + ln, sizeof(lb) - ln, "%08x ",
+                                                    win[(0x400 + off + q * 4) / 4] );
+                                (void)w2;
+                                ERR("[disp-dump] +%04x: %s\n",
+                                    (unsigned)((uintptr_t)pc - blk + off), lb);
+                            }
+                        }
+                    }
+                    else
+                        ERR("[x18-decline] #%d marker scan unreadable at %p\n",
+                            ios_x18_decline_reports, (void *)base);
+                }
+
+                /* ml159 follow-up: the fatal webhelper fault is FEX's own
+                 * `movz w1,#0; ldr x1,[x1]` sitting between two
+                 * SpillStaticRegs (verified against Arm64Emitter.cpp: the
+                 * trailing mrs FPCR / bic NEP|AH|FIZ / msr FPCR is literally
+                 * SpillStaticRegs' first emission). Probe #2 showed FEX's
+                 * STATE register x28 == 0 in this process. The segv dump
+                 * prints x0-x3/x8-x10/x16-x20 but NOT x21-x28, so we cannot
+                 * yet tell whether the fatal site ALSO has a null STATE.
+                 *
+                 * FEX spills guest regs to [x28,#N] and FPRs via x10=x28+0x1c0
+                 * — so if x28 is sane here, the null pointer is a separate
+                 * FEX constant; if x28 is 0, the whole FEX instance is
+                 * uninitialised and the fix belongs in FEX per-process init.
+                 * Also walk TEB -> CPUArea (TEB+0x1788) -> +0x30, the chain
+                 * the EC dispatcher uses, since that is what FEX_IOS_HOST
+                 * reads via TPIDRRO_EL0 + TSD slot 275. */
+                ERR("[x18-decline] #%d x21=%p x22=%p x23=%p x24=%p\n",
+                    ios_x18_decline_reports,
+                    (void *)REGn_sig(21, context), (void *)REGn_sig(22, context),
+                    (void *)REGn_sig(23, context), (void *)REGn_sig(24, context));
+                ERR("[x18-decline] #%d x25=%p x26=%p x27=%p x28(STATE)=%p lr=%p sp=%p\n",
+                    ios_x18_decline_reports,
+                    (void *)REGn_sig(25, context), (void *)REGn_sig(26, context),
+                    (void *)REGn_sig(27, context), (void *)REGn_sig(28, context),
+                    (void *)REGn_sig(30, context), (void *)SP_sig(context));
+                {
+                    /* Read via mach_vm_read_overwrite, never a raw deref: a
+                     * fault INSIDE the segv handler would recurse and hang
+                     * the app instead of dying cleanly. */
+                    uintptr_t teb = ios_teb_for_signals;
+                    uint64_t cpu_area = 0, ca30 = 0;
+                    mach_vm_size_t got = 0;
+                    int ok1 = 0, ok2 = 0;
+
+                    if (teb)
+                        ok1 = (mach_vm_read_overwrite( mach_task_self(),
+                                   (mach_vm_address_t)(teb + 0x1788), 8,
+                                   (mach_vm_address_t)&cpu_area, &got ) == KERN_SUCCESS
+                               && got == 8);
+                    if (ok1 && cpu_area)
+                        ok2 = (mach_vm_read_overwrite( mach_task_self(),
+                                   (mach_vm_address_t)(cpu_area + 0x30), 8,
+                                   (mach_vm_address_t)&ca30, &got ) == KERN_SUCCESS
+                               && got == 8);
+                    ERR("[x18-decline] #%d teb=%p CPUArea(teb+0x1788)=%p(ok=%d) "
+                        "CPUArea+0x30=%p(ok=%d)\n",
+                        ios_x18_decline_reports, (void *)teb,
+                        (void *)(uintptr_t)cpu_area, ok1,
+                        (void *)(uintptr_t)ca30, ok2);
+                }
+            }
+        }
+
         if (REGn_sig(18, context) == 0 && ios_teb_for_signals != 0
             && (uintptr_t)pc >= 0x100000000ULL
             && ((*(uint32_t *)pc >> 5) & 31) == 18)

@@ -889,24 +889,41 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
      * error reporter process." → continues), verified run 9. Remove once
      * (a) exception dispatch at guest faults works and (b) the pseudo-proc
      * terminate path no longer kills the session. */
+    /* ml178: gldriverquery64 joins the gate for a DIFFERENT and more permanent
+     * reason. It is Steam's OpenGL driver probe, and this device has no GL driver
+     * at all — we render through DXMT/Metal. With MSVCR120.dll now shipped it
+     * loads and resolves its whole import chain (verified ml178), gets as far as
+     * querying, finds nothing, and dies on a NULL read:
+     *   "Unhandled page fault on read access to 0000000000000000 ... thread 010c"
+     * There is no result it could ever return here, and Steam treats a missing
+     * GL probe as "no GL" and carries on — the same tolerance it shows for a
+     * failed error-reporter spawn. Refusing the spawn is strictly better than
+     * letting it fault. */
     {
-        static const char blocked[] = "steamerrorreporter";
+        static const char * const blocked_names[] = { "steamerrorreporter", "gldriverquery" };
         const WCHAR *ip = params->ImagePathName.Buffer;
         int ip_len = params->ImagePathName.Length / sizeof(WCHAR);
-        int bl = sizeof(blocked) - 1, k, j;
-        for (k = 0; k + bl <= ip_len; k++)
+        unsigned b;
+
+        for (b = 0; b < sizeof(blocked_names)/sizeof(blocked_names[0]); b++)
         {
-            for (j = 0; j < bl; j++)
+            const char *blocked = blocked_names[b];
+            int bl = (int)strlen( blocked ), k, j;
+
+            for (k = 0; k + bl <= ip_len; k++)
             {
-                WCHAR c = ip[k + j];
-                if (c >= 'A' && c <= 'Z') c += 32;
-                if (c != (WCHAR)blocked[j]) break;
-            }
-            if (j == bl)
-            {
-                dprintf(2, "[proc-gate] REFUSING spawn of %s (steamerrorreporter TEMP gate)\n",
-                        debugstr_us( &params->ImagePathName ));
-                return STATUS_ACCESS_DENIED;
+                for (j = 0; j < bl; j++)
+                {
+                    WCHAR c = ip[k + j];
+                    if (c >= 'A' && c <= 'Z') c += 32;
+                    if (c != (WCHAR)blocked[j]) break;
+                }
+                if (j == bl)
+                {
+                    dprintf(2, "[proc-gate] REFUSING spawn of %s (%s gate)\n",
+                            debugstr_us( &params->ImagePathName ), blocked );
+                    return STATUS_ACCESS_DENIED;
+                }
             }
         }
     }

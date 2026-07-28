@@ -4178,9 +4178,13 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             /* Check TPIDR_EL0 — should hold TEB if binary patcher is working */
             uint64_t tpidr_el0;
             __asm__ volatile("mrs %0, TPIDR_EL0" : "=r"(tpidr_el0));
-            ERR("SEGV at pc=%p addr=%p esr=0x%llx TPIDR_EL0=%p (expected %p)\n",
-                pc, siginfo->si_addr, (unsigned long long)esr,
-                (void*)tpidr_el0, (void*)ios_teb_for_signals);
+            /* ml209: TPIDR_EL0 is INFORMATIONAL ONLY. iOS owns and zeroes it, we removed
+             * our `msr TPIDR_EL0, x18` on 2026-07-04, and nothing of ours reads it — TEB
+             * recovery runs off TPIDRRO_EL0 + TSD slot 275, printed below. The old
+             * "(expected ...)" wording cost a debugging detour by making a garbage value
+             * here look like a root cause; it is not one. */
+            ERR("SEGV at pc=%p addr=%p esr=0x%llx TPIDR_EL0=%p (informational only — TEB is tsd275 below)\n",
+                pc, siginfo->si_addr, (unsigned long long)esr, (void*)tpidr_el0);
             ERR("  x0=%p x1=%p x2=%p x3=%p\n",
                 (void*)REGn_sig(0, context), (void*)REGn_sig(1, context),
                 (void*)REGn_sig(2, context), (void*)REGn_sig(3, context));
@@ -4205,6 +4209,99 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 ERR("  [tsd275] base=%p slot275=%p teb_key_val=%p\n",
                     (void*)tsd_base_now, *(void **)(tsd_base_now + 275 * 8),
                     pthread_getspecific(ios_teb_tls_key));
+            }
+            /* ml209: the libcef-init wall. A guest PUSH faulted writing to an address
+             * Wine does not own, because the guest RSP held 0x40001141 while the thread's
+             * real stack was [73d2130000..73d2170000]. The faulting block was
+             *   ldr x2,[x28,#0x40] / sub x2,x2,#0x10 / str x2,[x28,#0x40] / str x0,[x2]
+             * so x28 is FEX's live STATE pointer and +0x40 is gregs[4] = RSP.
+             *
+             * Dump the whole CPUState to split the two candidates, which need opposite
+             * fixes: if only RSP is implausible the guest clobbered its own stack pointer;
+             * if most gregs are garbage we are executing on an uninitialised or wrong
+             * CpuStateFrame. The plausible-pointer count is the discriminator, and it is
+             * printed alongside the raw values so a wrong assumption here is visible
+             * rather than silently believed. */
+            {
+                uint64_t state = REGn_sig(28, context);
+                uint64_t cs[17];              /* +0x18 rip, then gregs[0..15] */
+                mach_vm_size_t got = 0;
+
+                if (state && mach_vm_read_overwrite( mach_task_self(),
+                        (mach_vm_address_t)(state + 0x18), sizeof(cs),
+                        (mach_vm_address_t)cs, &got ) == KERN_SUCCESS && got == sizeof(cs))
+                {
+                    static const char * const gn[16] = {
+                        "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                        "r8 ","r9 ","r10","r11","r12","r13","r14","r15" };
+                    int i, plausible = 0;
+
+                    ERR("  [guest-state] x28=%p rip=%p\n", (void*)state, (void*)cs[0]);
+                    for (i = 0; i < 16; i += 4)
+                        ERR("  [guest-state]   %s=%p %s=%p %s=%p %s=%p\n",
+                            gn[i],   (void*)cs[1+i], gn[i+1], (void*)cs[2+i],
+                            gn[i+2], (void*)cs[3+i], gn[i+3], (void*)cs[4+i]);
+                    for (i = 0; i < 16; i++)
+                        if (cs[1+i] >= 0x100000000ull && cs[1+i] < 0x8000000000ull) plausible++;
+                    ERR("  [guest-state] plausible-ptr gregs=%d/16 (low => uninitialised frame, "
+                        "high => only rsp clobbered)\n", plausible);
+
+                    /* ml212: NAME THE CALLER.
+                     *
+                     * The guest RIP is <arena>+0xe0080 — an address with no code — so FEX
+                     * raised SIGSEGV through its deliberate `mov w1,#0; ldr x1,[x1]`
+                     * trampoline (visible in insn_stream above). Nothing is corrupt: the
+                     * CpuStateFrame is valid and the fault is FEX correctly reporting a
+                     * bogus branch target. The open question is who branched there, and
+                     * that offset has been byte-identical across runs and across three
+                     * different arena bases, so it is computed, not random.
+                     *
+                     * FEX keeps guest return addresses on its callret stack
+                     * (CPUState+0xB0 = sp, +0xB8 = base). Dump the top entries; resolving
+                     * them offline against the [iOS-xins]/[jit-pool] bases names the
+                     * function that jumped. Depth is printed too, so an empty or absurd
+                     * stack is visible rather than silently mistaken for evidence. */
+                    {
+                        uint64_t cr[2] = { 0, 0 };
+                        uint64_t ents[8];
+                        mach_vm_size_t g2 = 0;
+
+                        if (mach_vm_read_overwrite( mach_task_self(),
+                                (mach_vm_address_t)(state + 0xB0), sizeof(cr),
+                                (mach_vm_address_t)cr, &g2 ) == KERN_SUCCESS && g2 == sizeof(cr))
+                        {
+                            unsigned long long depth =
+                                (cr[0] > cr[1]) ? (cr[0] - cr[1]) / 8 : 0;
+
+                            ERR("  [callret] sp=%p base=%p depth=%llu\n",
+                                (void *)cr[0], (void *)cr[1], depth );
+
+                            /* ml213: the cap was 0x100000, but a real run had depth=168218
+                             * (1.28MB of stack) and the dump was skipped for no good
+                             * reason — only the TOP n*8 bytes are ever read, so the total
+                             * size never mattered. Bound it generously, purely as a
+                             * sanity check against a garbage sp/base pair. */
+                            if (depth && cr[0] - cr[1] <= 0x10000000)
+                            {
+                                unsigned n = depth > 8 ? 8 : (unsigned)depth;
+
+                                if (mach_vm_read_overwrite( mach_task_self(),
+                                        (mach_vm_address_t)(cr[0] - (uint64_t)n * 8),
+                                        n * 8, (mach_vm_address_t)ents, &g2 ) == KERN_SUCCESS
+                                    && g2 == n * 8)
+                                {
+                                    unsigned k;
+
+                                    for (k = n; k-- > 0; )
+                                        ERR("  [callret]   [-%u] %p\n", n - k, (void *)ents[k]);
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                    ERR("  [guest-state] x28=%p UNREADABLE got=%llu\n",
+                        (void*)state, (unsigned long long)got);
             }
             {
                 uintptr_t sym_addrs[2] = { (uintptr_t)PC_sig(context), (uintptr_t)REGn_sig(30, context) };

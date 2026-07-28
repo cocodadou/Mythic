@@ -2913,6 +2913,10 @@ static uint64_t ios_steer_reclaim_dead( void )
  * map_free_area call. virtual_mutex is held throughout, so a plain global is
  * safe. Proves or refutes the grind above in one run. */
 static unsigned int ios_va_scan_tries;
+/* ml211: how many times the scan JUMPED over a foreign Mach region instead of
+ * crawling a granule at a time. Reported next to tries= so the two are directly
+ * comparable: before this, placing 1MB cost ~8000 tries and 0 skips. */
+static unsigned int ios_va_scan_skips;
 
 /* ml117: the grind is GONE (Thumper splash back to 2s) but a 512KB-aligned
  * 512MB request still FAILED in the 15.1GB window with tries=0 — i.e.
@@ -2945,6 +2949,76 @@ static int   ios_scan_fail_errno;
 
 /* Describe what the kernel believes is at addr: the enclosing region, or the
  * hole it falls in. Non-destructive (query only). */
+/* ml210: one-shot census of the furniture window.
+ *
+ * Every recent run grinds here — a 1MB request costs ~8000 tryfixed attempts and still
+ * reports errno=12 — and FEX then dereferences a NULL returned by an 8KB
+ * aligned_alloc (libarm64ecfex+0x16298, `stp x8,x20,[x0]` with x0=0, unchecked). That is
+ * very likely why each run dies at a DIFFERENT small-offset null address (0x0, 0x8, 0x28,
+ * 0x68): one exhaustion cause landing on whichever allocation runs first, not a race.
+ *
+ * Before guessing who consumes the window, measure it. Walks the real Mach map rather
+ * than Wine's view bookkeeping, so it reports the truth even for foreign/FEX mappings,
+ * and prints the largest free gap next to the largest regions — if the gap is big the
+ * problem is placement, if it is tiny the window is genuinely full. */
+static void ios_furniture_census( void )
+{
+    const mach_vm_address_t LO = 0x7000000000ULL, HI = 0x73ffff0000ULL;
+    struct { unsigned long long base, size; unsigned prot; } top[16];
+    unsigned ntop = 0, nregions = 0, k;
+    unsigned long long mapped = 0, biggest_gap = 0, gap_at = 0, prev_end = LO;
+    mach_vm_address_t a = LO;
+
+    for (;;)
+    {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        unsigned i, j;
+
+        if (mach_vm_region( mach_task_self(), &a, &size, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS)
+            break;
+        if (a >= HI) break;
+
+        if (a > prev_end && a - prev_end > biggest_gap)
+        {
+            biggest_gap = a - prev_end;
+            gap_at = prev_end;
+        }
+        nregions++;
+        mapped += size;
+
+        for (i = 0; i < ntop && top[i].size >= (unsigned long long)size; i++) {}
+        if (i < 16)
+        {
+            for (j = (ntop < 16 ? ntop : 15); j > i; j--) top[j] = top[j - 1];
+            top[i].base = (unsigned long long)a;
+            top[i].size = (unsigned long long)size;
+            top[i].prot = (unsigned)info.protection;
+            if (ntop < 16) ntop++;
+        }
+        prev_end = (unsigned long long)a + size;
+        a += size;
+    }
+    if (HI > prev_end && HI - prev_end > biggest_gap)
+    {
+        biggest_gap = HI - prev_end;
+        gap_at = prev_end;
+    }
+
+    dprintf( 2, "[furniture] window 0x%llx..0x%llx = %llu MB | regions=%u mapped=%llu MB "
+                "free=%llu MB | biggest free gap=%llu MB at 0x%llx\n",
+             (unsigned long long)LO, (unsigned long long)HI,
+             (unsigned long long)((HI - LO) >> 20), nregions,
+             mapped >> 20, (unsigned long long)(((HI - LO) - mapped) >> 20),
+             biggest_gap >> 20, gap_at );
+    for (k = 0; k < ntop; k++)
+        dprintf( 2, "[furniture]   #%u 0x%llx +0x%llx (%llu MB) prot=%x\n",
+                 k + 1, top[k].base, top[k].size, top[k].size >> 20, top[k].prot );
+}
+
 static void ios_va_describe( void *addr, char *buf, size_t buflen )
 {
     mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)addr;
@@ -4749,6 +4823,49 @@ static struct wine_rb_entry *find_view_inside_range( void **base_ptr, void **end
  * Try mmaping some expected free memory region, eventually stepping and
  * retrying inside it, and return where it actually succeeded, or NULL.
  */
+/* ml211: ask Mach where the mapping occupying `addr` ends, so the scan can jump over it.
+ *
+ * Wine's rb tree only knows Wine's OWN views (53 in a Steam run), but the [furniture]
+ * census found 57347 FOREIGN 16KB Mach regions packed solid from 0x7000000000 to
+ * 0x7038000000. try_map_free_area steps one align granule at a time, so crossing those
+ * costs one failed mmap each -- ~8000 syscalls to place a single 1MB allocation, while the
+ * window still had 15.4GB contiguous free the entire time. The address space was never
+ * exhausted; the scanner was crawling.
+ *
+ * Returns 1 and sets *out only when Mach confirms `addr` is inside a mapped region, so
+ * this can only ever skip provably-occupied space. Anything else returns 0 and the caller
+ * falls back to the plain step, which keeps a wrong answer here free of consequence.
+ * Forward progress is guaranteed in both directions: bottom-up resumes past the region
+ * end (> addr, since the region contains addr), top-down at region base - size (< addr). */
+static int ios_skip_occupied( void *addr, size_t size, size_t align_mask,
+                              int top_down, void **out )
+{
+    mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)addr, rbase = a;
+    mach_vm_size_t rsize = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+
+    if (mach_vm_region( mach_task_self(), &rbase, &rsize, VM_REGION_BASIC_INFO_64,
+                        (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS)
+        return 0;
+    if (rbase > a || !rsize)
+        return 0;         /* addr is in a free hole: mmap failed for some other reason
+                             (iOS refuses certain addresses), so stepping is correct */
+    if (top_down)
+    {
+        if (rbase < (mach_vm_address_t)size) return 0;
+        *out = ROUND_ADDR( (char *)(uintptr_t)rbase - size, align_mask );
+    }
+    else
+    {
+        mach_vm_address_t nxt = rbase + rsize;
+
+        *out = (void *)(uintptr_t)((nxt + align_mask) & ~(mach_vm_address_t)align_mask);
+    }
+    return 1;
+}
+
 static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
                                 void *start, size_t size, int unix_prot )
 {
@@ -4774,7 +4891,23 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
             (step < 0 && (char *)start - (char *)base < -step) ||
             step == 0)
             break;
-        start = (char *)start + step;
+        /* ml211: jump over the whole occupying region instead of crawling one granule
+         * at a time -- see ios_skip_occupied. Bounds are re-checked by the loop
+         * condition, so an over-long jump simply ends the scan rather than escaping
+         * the range. */
+        {
+            void *next = start;
+
+            if (step && ios_skip_occupied( start, size, (size_t)(step < 0 ? -step : step) - 1,
+                                           step < 0, &next )
+                && next != start)
+            {
+                ios_va_scan_skips++;
+                start = next;
+            }
+            else
+                start = (char *)start + step;
+        }
     }
 
     return NULL;
@@ -7100,6 +7233,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         if (start > address_space_start || end < host_addr_space_limit || top_down)
         {
             unsigned int tries0 = ios_va_scan_tries;
+            unsigned int skips0 = ios_va_scan_skips;
 
             ptr = map_free_area( start, end, host_size, top_down, unix_prot, align_mask );
             /* [va-scan] the ml116/ml117 probe: a healthy scan costs a handful of
@@ -7118,7 +7252,12 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                  * outright failure, or grinding on the order of a thousand attempts, is
                  * unambiguous exhaustion rather than ordinary fragmentation. */
                 if (!ptr || ios_va_scan_tries - tries0 >= 1024)
+                {
+                    static int censused;
+
                     ios_va_pressure = 1;
+                    if (!censused) { censused = 1; ios_furniture_census(); }
+                }
 
                 /* ml118 discriminator — see ios_scan_fail_addr. Rate-limited:
                  * the mach query is cheap but not free, and the first handful
@@ -7127,12 +7266,12 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                 if (ios_scan_fail_addr && described++ < 12)
                     ios_va_describe( ios_scan_fail_addr, what, sizeof(what) );
 
-                dprintf( 2, "[va-scan] %s window=%p..%p size=%p align=%p %s tries=%u"
+                dprintf( 2, "[va-scan] %s window=%p..%p size=%p align=%p %s tries=%u skips=%u"
                             " | seen=%p..%p views=%u maxgap=%p stop=%s"
                             " | firstfail=%p errno=%d(%s) %s%s\n",
                          ptr ? "SLOW" : "FAILED", start, end, (void *)size,
                          (void *)(align_mask + 1), top_down ? "top-down" : "bottom-up",
-                         ios_va_scan_tries - tries0,
+                         ios_va_scan_tries - tries0, ios_va_scan_skips - skips0,
                          ios_scan_base, ios_scan_end, ios_scan_views,
                          (void *)ios_scan_maxgap, ios_scan_stop_name( ios_scan_stop ),
                          ios_scan_fail_addr, ios_scan_fail_errno,
@@ -10795,7 +10934,10 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                     ios_steer[ios_steer_n].freed = 0;
                     ios_steer_n++;
                 }
-                if (steer_n < 12)
+                /* ml210: was 12, which was BELOW the ~25-50 reserves a Steam run makes, so
+                 * the log count saturated and could not measure how many arenas actually
+                 * got steered. */
+                if (steer_n < 64)
                 {
                     steer_n++;
                     dprintf(2, "[steer] #%u size=0x%lx reserved_total=%lluMB armed=%s -> %s %p\n",
@@ -10921,6 +11063,24 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                          * ios_steer_slot) -- granting it as a pool is what caused
                          * the 43 collisions and cost us the 4th pool. */
                         if (slot == ios_steer_slot) continue;
+                        /* ml213: never hand PA a slot that OVERLAPS THE FURNITURE WINDOW.
+                         *
+                         * The window starts at 0x7038000000, which is INSIDE
+                         * [0x7000000000,0x7400000000), so every Wine/FEX allocation --
+                         * including FEX's kernel-picked RWX JIT buffers -- packs the bottom
+                         * of that slot. The [furniture] census measured 57347 foreign 16KB
+                         * regions sitting there, and PA duly died on
+                         *   [soft-pool] COLLISION: commit 0x7000200000+0x4000 inside soft
+                         *   0x7000000000 -- VA mapped but NOT a wine view (prot=3/7)
+                         * followed by a Chromium int3 (0x80000003) that aborted libcef
+                         * init. A soft pool is only sound where nothing else allocates, and
+                         * this is precisely where everything else allocates.
+                         *
+                         * Expressed as an overlap test rather than a hardcoded address so
+                         * it stays correct if the window or the slot stride moves. */
+                        if (slot < ios_furniture_ceiling
+                            && slot + (uint64_t)*size_ptr > 0x7038000000ULL)
+                            continue;
                         /* skip a slot that already holds a REAL pool: a 64KB
                          * probe reserve at its base would succeed only if free */
                         probe_addr = NULL; probe_sz = 0;

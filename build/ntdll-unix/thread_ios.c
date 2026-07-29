@@ -1748,6 +1748,32 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL 
 
     if (first_chance) return call_user_exception_dispatcher( rec, context );
 
+    /* ml257: A DEBUG PRINT MUST NEVER KILL THE PROCESS.
+     *
+     * Steam called OutputDebugString; that raises DBG_PRINTEXCEPTION_C, which is
+     * meant to be swallowed -- see rtl.c, where RtlRaiseException's own filter
+     * returns EXCEPTION_EXECUTE_HANDLER for exactly this code. Here the dispatcher
+     * could not reach that filter ("unwind stuck: steps=2 -- abandoning walk"), so
+     * the raise fell through to second chance and we terminated the process with
+     * exit_code=0x40010006 at unix_calls=13251 -- killing a Steam that was otherwise
+     * healthy, over a printf. On Windows with no debugger attached this is a no-op.
+     *
+     * So swallow it and continue, exactly as the DBG_CONTINUE path above does. This
+     * does not paper over the stuck unwind (task #38) -- it stops a benign event from
+     * being fatal while that is fixed. Real faults still terminate. */
+    if (rec->ExceptionCode == DBG_PRINTEXCEPTION_C ||
+        rec->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C)
+    {
+        static int swallowed;
+        if (swallowed++ < 8)
+            ERR_(seh)("[dbgprint] swallowing %s that reached second chance "
+                      "(flags=%x addr=%p) -- continuing instead of dying\n",
+                      rec->ExceptionCode == DBG_PRINTEXCEPTION_C ? "DBG_PRINTEXCEPTION_C"
+                                                                : "DBG_PRINTEXCEPTION_WIDE_C",
+                      rec->ExceptionFlags, rec->ExceptionAddress );
+        return NtContinue( context, FALSE );
+    }
+
     if (rec->ExceptionFlags & EXCEPTION_STACK_INVALID)
         ERR_(seh)("Exception frame is not in stack limits => unable to dispatch exception.\n");
     else if (rec->ExceptionCode == STATUS_NONCONTINUABLE_EXCEPTION)

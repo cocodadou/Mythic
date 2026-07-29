@@ -1647,10 +1647,31 @@ static void ios_pool_check_range_exec( size_t off, size_t size, int reused )
         if (!(inf.max_protection & VM_PROT_EXECUTE))
         {
             if (bad++ == 0 && checked++ < 30)
+            {
+                /* ml248: name the OWNER. mprotect_exec never touches pool VA (0 calls, 20
+                 * poisoned ranges), so nothing is narrowing maxprot in place -- the pages
+                 * are being REPLACED by a different mapping. Guest PE images live in the
+                 * same 0x1xxxxxxxx band as the pool, so the suspect is Wine's own allocator
+                 * handing out VA that overlaps the pool and later unmapping/remapping it.
+                 * The Mach user_tag identifies the allocator, and share_mode distinguishes
+                 * our dual-mapped alias from an ordinary private mapping. */
+                vm_region_extended_info_data_t ext;
+                mach_msg_type_number_t ecnt = VM_REGION_EXTENDED_INFO_COUNT;
+                mach_vm_address_t ea = want;
+                mach_vm_size_t esz = 0;
+                mach_port_t eobj = MACH_PORT_NULL;
+                unsigned tag = 0, share = 0;
+
+                if (mach_vm_region( mach_task_self(), &ea, &esz, VM_REGION_EXTENDED_INFO,
+                                    (vm_region_info_t)&ext, &ecnt, &eobj ) == KERN_SUCCESS)
+                { tag = ext.user_tag; share = ext.share_mode; }
+
                 dprintf( 2, "[pool-poison] HANDED OUT NON-EXEC off=0x%lx +0x%lx va=%p prot=%x "
-                            "max=%x reused=%d  <== range arrives already poisoned\n",
+                            "max=%x reused=%d user_tag=%u share_mode=%u regionsz=0x%llx\n",
                          (unsigned long)off, (unsigned long)o, (void *)(uintptr_t)want,
-                         inf.protection, inf.max_protection, reused );
+                         inf.protection, inf.max_protection, reused, tag, share,
+                         (unsigned long long)esz );
+            }
         }
     }
     if (bad && checked < 30)
@@ -1680,6 +1701,40 @@ static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
 static volatile size_t ios_jit_tail_reserved = 0;
 
 /* Exported JIT pool addresses for use by SIGBUS handler in signal_arm64_ios.c */
+/* ml251: does anything MUNMAP/MMAP inside the JIT pool's VA?
+ *
+ * Two pool symptoms share one explanation and neither goes through mprotect_exec (which
+ * logged ZERO pool calls): isolated single-page RW regions (poison, max=3 forever) and
+ * MEM_FREE holes inside the pool span -- the latter is what the fatal CASPAL targets
+ * (0x1541af700, state=MEM_FREE), i.e. a use-after-free of pool memory that ends runs.
+ * Both are what you get if Wine's allocator believes pool VA is free and maps/unmaps
+ * there. Guest PE images already share the 0x1xxxxxxxx band with the pool, so this is
+ * plausible rather than speculative. Report any such call, with its caller tag. */
+void ios_pool_va_warn( const char *who, const void *addr, size_t size )
+{
+    extern void *ios_jit_rx_base_global;
+    extern void *ios_jit_rw_base_global;
+    extern size_t ios_jit_pool_size_global;
+    uintptr_t a = (uintptr_t)addr, rx = (uintptr_t)ios_jit_rx_base_global;
+    uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
+    size_t ps = ios_jit_pool_size_global;
+    static int warned;
+
+    if (!ps || warned >= 40) return;
+    if (rx && a < rx + ps && a + size > rx)
+    {
+        warned++;
+        dprintf( 2, "[pool-va] %s addr=%p size=0x%lx INSIDE RX pool off=0x%lx  <== foreign map/unmap\n",
+                 who, addr, (unsigned long)size, (unsigned long)(a - rx) );
+    }
+    else if (rw && a < rw + ps && a + size > rw)
+    {
+        warned++;
+        dprintf( 2, "[pool-va] %s addr=%p size=0x%lx INSIDE RW pool off=0x%lx  <== foreign map/unmap\n",
+                 who, addr, (unsigned long)size, (unsigned long)(a - rw) );
+    }
+}
+
 void *ios_jit_rx_base_global = NULL;
 void *ios_jit_rw_base_global = NULL;
 size_t ios_jit_pool_size_global = 0;
@@ -3123,6 +3178,26 @@ static uint64_t ios_steer_reclaim_dead( void )
     return freed_total;
 }
 
+/* ml255: STORM GATE.
+ *
+ * ml255 wrote a 510 MB / 4.47-MILLION-line log because a NULL-deref loop ran
+ * 524,186 times and three diagnostics fired on EVERY iteration: [va-scan] FAILED
+ * (524k), [fault-rgn] (524k + 393k) and the setup_exception/TEB dumps (393k).
+ * Device I/O that heavy is destructive on its own and it buried the one line that
+ * mattered. These probes are all still worth having -- the FIRST few of each
+ * settle the question -- so gate them instead of deleting them.
+ *
+ * Escalating schedule: every one of the first 20, then 1-in-1000, then
+ * 1-in-100000 past 100k. A storm still proves it is a storm and still shows where
+ * it ends, at ~1/1000th the bytes. */
+static int ios_storm_gate( unsigned long *n )
+{
+    unsigned long c = ++(*n);
+    if (c <= 20) return 1;
+    if (c <= 100000) return (c % 1000) == 0;
+    return (c % 100000) == 0;
+}
+
 /* [va-scan] probe: failing mmap-tryfixed attempts inside the current
  * map_free_area call. virtual_mutex is held throughout, so a plain global is
  * safe. Proves or refutes the grind above in one run. */
@@ -3356,6 +3431,7 @@ static void ios_jit_range_tripwire( const char *tag, const void *addr, size_t si
 /* mmap() anonymous memory at a fixed address */
 void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
 {
+    ios_pool_va_warn( "anon_mmap_fixed", start, size );
     assert( !((UINT_PTR)start & host_page_mask) );
     assert( !(size & host_page_mask) );
 
@@ -3763,6 +3839,7 @@ static size_t unmap_area_above_user_limit( void *addr, size_t size )
 
 static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags )
 {
+    ios_pool_va_warn( "anon_mmap_tryfixed", start, size );
     void *ptr;
 
     /* no [jit-tripwire] here: tryfixed is no-clobber by definition (fails on
@@ -4734,9 +4811,46 @@ void ios_jit_reclaim_process( void *peb )
             static int prechk;
 
             if (!ios_pool_range_execable( off, size, &bcur, &bmax ) && prechk++ < 20)
+            {
+                /* ml249: name the OWNER of the poisoned page here, not at hand-out -- the
+                 * guard now rejects poisoned ranges before hand-out, so the probe there can
+                 * never fire (0 hits vs 20 here). mprotect_exec is called ZERO times on pool
+                 * VA, so nothing narrows maxprot in place; the pages must be REPLACED by a
+                 * different mapping. Mach's user_tag identifies the allocator and share_mode
+                 * distinguishes our dual-mapped alias from an ordinary private mapping, which
+                 * is what tells us whether Wine handed out VA overlapping the pool. */
+                extern void *ios_jit_rx_base_global;
+                mach_vm_address_t ea = (mach_vm_address_t)(uintptr_t)((char *)ios_jit_rx_base_global + off);
+                mach_vm_size_t esz = 0;
+                vm_region_extended_info_data_t ext;
+                mach_msg_type_number_t ecnt = VM_REGION_EXTENDED_INFO_COUNT;
+                mach_port_t eobj = MACH_PORT_NULL;
+                unsigned tag = 0, share = 0;
+                size_t scan;
+
+                /* walk to the first genuinely poisoned page inside the range */
+                for (scan = 0; scan < size; scan += 0x4000)
+                {
+                    mach_vm_address_t a2 = (mach_vm_address_t)(uintptr_t)((char *)ios_jit_rx_base_global + off + scan), q = a2;
+                    mach_vm_size_t s2 = 0;
+                    vm_region_basic_info_data_64_t b2;
+                    mach_msg_type_number_t c2 = VM_REGION_BASIC_INFO_COUNT_64;
+                    mach_port_t o2 = MACH_PORT_NULL;
+
+                    if (mach_vm_region( mach_task_self(), &q, &s2, VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&b2, &c2, &o2 ) != KERN_SUCCESS) break;
+                    if (q > a2) continue;
+                    if (!(b2.max_protection & VM_PROT_EXECUTE)) { ea = a2; break; }
+                }
+                if (mach_vm_region( mach_task_self(), &ea, &esz, VM_REGION_EXTENDED_INFO,
+                                    (vm_region_info_t)&ext, &ecnt, &eobj ) == KERN_SUCCESS)
+                { tag = ext.user_tag; share = ext.share_mode; }
+
                 dprintf( 2, "[pool-freechk] PRE-CLEAR poisoned off=0x%lx size=0x%lx cur=0x%x max=0x%x"
-                            "  <== poison predates clear_arm64ec_range\n",
-                         (unsigned long)off, (unsigned long)size, bcur, bmax );
+                            " | page=%p user_tag=%u share_mode=%u regionsz=0x%llx\n",
+                         (unsigned long)off, (unsigned long)size, bcur, bmax,
+                         (void *)(uintptr_t)ea, tag, share, (unsigned long long)esz );
+            }
         }
         if (arm64ec_view) clear_arm64ec_range( rx_base + off, size );
 
@@ -5117,6 +5231,49 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
 {
     while (start && base <= start && (char*)start + size <= (char*)end)
     {
+        /* ml253 ROOT-CAUSE FIX: never allocate inside the JIT pool.
+         *
+         * Wine's scanner walks straight through the pool -- measured, marching upward in
+         * 0x10000 steps calling anon_mmap_tryfixed at every address:
+         *   [pool-va] anon_mmap_tryfixed addr=0x11e800000 size=0x100000 INSIDE RX pool off=0x0
+         *   [pool-va] anon_mmap_tryfixed addr=0x11e810000 ... off=0x10000   (etc)
+         * Where the pool is mapped these fail (that is the scan grinding). Wherever the pool
+         * has a HOLE they SUCCEED, installing a foreign one-page RW mapping -- exactly the
+         * poison fingerprint (regionsz=0x4000, user_tag=0, max=RW, unraisable), which then
+         * lands in a module's .text as a permanently non-executable page. When Wine later
+         * releases such an allocation the hole becomes MEM_FREE inside the pool span, which
+         * is what the fatal CASPAL dereferences (0x1541af700, state=MEM_FREE).
+         *
+         * One cause, three symptoms. The pool is ours; Wine must never hand out its VA.
+         * Skipping the whole pool in one jump is also strictly faster than stepping it. */
+        {
+            extern void *ios_jit_rx_base_global;
+            extern void *ios_jit_rw_base_global;
+            extern size_t ios_jit_pool_size_global;
+            uintptr_t a = (uintptr_t)start;
+            uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+            uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
+            size_t ps = ios_jit_pool_size_global;
+            uintptr_t pool_end = 0;
+
+            if (ps && rx && a + size > rx && a < rx + ps) pool_end = rx + ps;
+            else if (ps && rw && a + size > rw && a < rw + ps) pool_end = rw + ps;
+            if (pool_end)
+            {
+                static int skipped;
+                if (skipped++ < 8)
+                    dprintf( 2, "[pool-va] SKIP scan over JIT pool at %p -> %p\n",
+                             start, (void *)pool_end );
+                if (step < 0)
+                {
+                    uintptr_t pool_base = (pool_end == rx + ps) ? rx : rw;
+                    if (pool_base < size) break;
+                    start = ROUND_ADDR( (char *)(pool_base - size), (size_t)(-step) - 1 );
+                }
+                else start = (void *)((pool_end + (size_t)step - 1) & ~((uintptr_t)step - 1));
+                continue;
+            }
+        }
         if (anon_mmap_tryfixed( start, size, unix_prot, 0 ) != MAP_FAILED) return start;
         TRACE( "Found free area is already mapped, start %p.\n", start );
         ios_va_scan_tries++;
@@ -5308,6 +5465,7 @@ static void remove_reserved_area( void *addr, size_t size )
             ios_jit_range_tripwire( "remove_reserved_area", addr,
                                     (char *)view->base - (char *)addr, -1,
                                     __builtin_return_address(0) );
+            ios_pool_va_warn( "munmap", addr, (char *)view->base - (char *)addr );
             munmap( addr, (char *)view->base - (char *)addr );
         }
         if ((char *)view->base + view->size > (char *)addr + size) return;
@@ -5316,6 +5474,7 @@ static void remove_reserved_area( void *addr, size_t size )
         addr = (char *)view->base + view_size;
     }
     ios_jit_range_tripwire( "remove_reserved_area", addr, size, -1, __builtin_return_address(0) );
+    ios_pool_va_warn( "munmap", addr, size );
     munmap( addr, size );
 }
 
@@ -5349,6 +5508,7 @@ static void unmap_area( void *start, size_t size )
         if (area_end <= start) continue;
         if (area_start > start)
         {
+            ios_pool_va_warn( "munmap", start, (char *)area_start - (char *)start );
             munmap( start, (char *)area_start - (char *)start );
             start = area_start;
         }
@@ -5360,6 +5520,7 @@ static void unmap_area( void *start, size_t size )
         anon_mmap_fixed( start, (char *)area_end - (char *)start, PROT_NONE, MAP_NORESERVE );
         start = area_end;
     }
+    ios_pool_va_warn( "munmap", start, (char *)end - (char *)start );
     munmap( start, (char *)end - (char *)start );
 }
 
@@ -5895,6 +6056,40 @@ static void *ios_share_probe_thread(void *arg)
  */
 static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 {
+    /* ml247: catch WHO narrows maxprot on pool pages.
+     *
+     * Poison is created during a module's life (POISONED AT FREE, and predating
+     * clear_arm64ec_range). The freelist guard now refuses poisoned ranges, but that
+     * ORPHANS them -- 62 drops = 164MB from an 896MB pool now at 92% used, and FEX has
+     * started failing allocations (NULL IREmitter -> str xzr,[x0,#0x378] with x0=0;
+     * reclaim-recover ENOMEM). Recovering that VA means stopping the poison at source.
+     *
+     * mprotect_exec is the one hook every protection change funnels through. Its existing
+     * ERR() output is swallowed by MYTHIC_QUIET, so log via dprintf, and only for pool
+     * addresses so this cannot flood. */
+    {
+        extern void *ios_jit_rx_base_global;
+        extern void *ios_jit_rw_base_global;
+        extern size_t ios_jit_pool_size_global;
+        uintptr_t b = (uintptr_t)base;
+        uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+        uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
+        size_t ps = ios_jit_pool_size_global;
+        static int prot_n;
+
+        if (ps && prot_n < 40 &&
+            ((rx && b >= rx && b < rx + ps) || (rw && b >= rw && b < rw + ps)))
+        {
+            prot_n++;
+            dprintf( 2, "[pool-prot] mprotect_exec base=%p size=0x%lx prot=%c%c%c alias=%s off=0x%lx\n",
+                     base, (unsigned long)size,
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-',
+                     (unix_prot & PROT_EXEC)  ? 'x' : '-',
+                     (rx && b >= rx && b < rx + ps) ? "RX" : "RW",
+                     (unsigned long)((rx && b >= rx && b < rx + ps) ? b - rx : b - rw) );
+        }
+    }
     if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
     {
         TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );
@@ -7217,11 +7412,13 @@ static inline void *unmap_extra_space( void *ptr, size_t total_size, size_t want
     if ((ULONG_PTR)ptr & align_mask)
     {
         size_t extra = align_mask + 1 - ((ULONG_PTR)ptr & align_mask);
+        ios_pool_va_warn( "munmap", ptr, extra );
         munmap( ptr, extra );
         ptr = (char *)ptr + extra;
         total_size -= extra;
     }
     if (total_size > wanted_size)
+        ios_pool_va_warn( "munmap", (char *)ptr + wanted_size, total_size - wanted_size );
         munmap( (char *)ptr + wanted_size, total_size - wanted_size );
     return ptr;
 }
@@ -7518,6 +7715,9 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                 if (ios_scan_fail_addr && described++ < 12)
                     ios_va_describe( ios_scan_fail_addr, what, sizeof(what) );
 
+                {
+                static unsigned long vs_storm;
+                if (ios_storm_gate( &vs_storm ))
                 dprintf( 2, "[va-scan] %s window=%p..%p size=%p align=%p %s tries=%u skips=%u"
                             " | seen=%p..%p views=%u maxgap=%p stop=%s"
                             " | firstfail=%p errno=%d(%s) %s%s\n",
@@ -7530,6 +7730,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                          ios_scan_fail_errno ? strerror( ios_scan_fail_errno ) : "-", what,
                          ptr ? "" : (ceiling_relaxable ? "  --> relaxing ceiling, retrying unclamped"
                                                        : "  <-- STATUS_NO_MEMORY (callers see a NULL alloc)") );
+                }
             }
             if (ptr)
             {
@@ -7567,6 +7768,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                 is_beyond_limit( ptr, view_size, (void *)ios_spill_cap ))
             {
                 spill_tries++;
+                ios_pool_va_warn( "munmap", ptr, view_size );
                 munmap( ptr, view_size );
                 continue;
             }
@@ -8137,6 +8339,7 @@ static void *get_host_addr_space_limit(void)
         void *ret = mmap( (void *)addr, host_page_size, PROT_NONE, flags, -1, 0 );
         if (ret != MAP_FAILED)
         {
+            ios_pool_va_warn( "munmap", ret, host_page_size );
             munmap( ret, host_page_size );
             if (ret >= (void *)addr) break;
         }
@@ -10026,6 +10229,7 @@ void virtual_init_user_shared_data(void)
     }
 
     init_shared_data_cpuinfo( data );
+    ios_pool_va_warn( "munmap", data, sizeof(*data) );
     munmap( data, sizeof(*data) );
 }
 
@@ -10176,6 +10380,10 @@ void ios_dump_fault_region( void *addr )
               rw = (uintptr_t)ios_jit_rw_base_global, sz = ios_jit_pool_size_global;
     const char *region = "unknown/foreign";
 
+    {
+        static unsigned long fr_storm;
+        if (!ios_storm_gate( &fr_storm )) return;
+    }
     mutex_lock( &virtual_mutex );
     vp_prev = get_host_page_vprot( page - host_page_size );
     vp      = get_host_page_vprot( page );
@@ -10199,6 +10407,37 @@ void ios_dump_fault_region( void *addr )
 /***********************************************************************
  *           virtual_setup_exception
  */
+
+/* ml262: is every page of [addr, addr+size) mapped AND writable?
+ *
+ * Needed because virtual_setup_exception's "outside thread stack" branch is routine
+ * in this port -- FEX guest stacks are not Wine views -- and it must not hand back
+ * memory the caller cannot write. Walks region-by-region so a HOLE (mach_vm_region
+ * returning a region that starts above the query address) is detected rather than
+ * mistaken for the containing region. */
+static int ios_range_writable( const void *addr, size_t size )
+{
+    mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)addr;
+    mach_vm_address_t end = a + (size ? size : 1);
+
+    while (a < end)
+    {
+        mach_vm_address_t q = a;
+        mach_vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        if (mach_vm_region( mach_task_self(), &q, &sz, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS)
+            return 0;
+        if (q > a) return 0;                             /* hole */
+        if (!(info.protection & VM_PROT_WRITE)) return 0;
+        a = q + sz;
+    }
+    return 1;
+}
+
 void *virtual_setup_exception( void *stack_ptr, size_t size, EXCEPTION_RECORD *rec )
 {
     char *stack = stack_ptr;
@@ -10214,6 +10453,29 @@ void *virtual_setup_exception( void *stack_ptr, size_t size, EXCEPTION_RECORD *r
         WARN( "exception outside of stack limits addr %p stack %p (%p-%p-%p)\n",
               rec->ExceptionAddress, stack, NtCurrentTeb()->DeallocationStack,
               NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase );
+        /* ml262 LIVELOCK FIX: this branch used to return an UNVALIDATED pointer.
+         *
+         * "Outside a Wine thread stack" is routine in this port -- FEX guest stacks
+         * are not Wine views -- so this is a hot path, and the caller immediately
+         * copies EXCEPTION_RECORD + CONTEXT to whatever we return. When that landed
+         * in an unmapped hole the copy faulted, which raised another exception down
+         * this same path, which faulted again: an unbreakable loop. Measured twice --
+         * 49,500 faults in ml261 and 53,000 in ml262, each consuming the entire run:
+         *   [fault-stuck] page 0x73d16ac000 faulted 2048 times with NO progress
+         *   [fault-stuck]   region 0x73d16b0000 +0x40000 prot=3/7   <- first region ABOVE
+         *   sym pc=Mythic.debug.dylib`setup_raise_exception+0x104 (stp q1,q0,[x0,#0x1d0])
+         * The write target sat 0x170 bytes BELOW the base of the guest stack region,
+         * i.e. the guest stack was exhausted and the frame did not fit.
+         *
+         * An exception that cannot be delivered is unrecoverable, exactly like the two
+         * cases above, so abort the thread instead of spinning forever. */
+        if (!ios_range_writable( stack - size, size ))
+        {
+            ERR( "[exc-stack] cannot deliver exception: %p..%p not writable "
+                 "(addr %p) -- aborting thread instead of faulting forever\n",
+                 stack - size, stack, rec->ExceptionAddress );
+            abort_thread(1);
+        }
         return stack - size;
     }
 

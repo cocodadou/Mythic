@@ -86,6 +86,16 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
 #define NTDLL_DWARF_H_NO_UNWINDER
 #include "dwarf.h"
 
+/* ml255: storm gate -- see ios_storm_gate in virtual_ios.c for the rationale
+ * (510 MB log from a 524k-iteration NULL-deref loop). */
+static int ios_sig_storm_gate( unsigned long *n )
+{
+    unsigned long c = ++(*n);
+    if (c <= 20) return 1;
+    if (c <= 100000) return (c % 1000) == 0;
+    return (c % 100000) == 0;
+}
+
 /***********************************************************************
  * signal context platform-specific definitions
  */
@@ -1679,6 +1689,76 @@ skip_reclaim_band: ;
                         }
                     }
                     __sync_add_and_fetch(&seen_count[slot], 1);
+
+                    /* ml261 LIVELOCK BREAKER, keyed on the faulting PAGE.
+                     *
+                     * ml261 burned its whole run on 49,500+ faults at ONE address --
+                     * previous runs peaked near 4,000. Signature:
+                     *   insn f81f0ff3 = str x19,[sp,#-16]!   (a prologue push)
+                     *   sp=0x73d16aff40, fault addr=0x73d16aff30  (16 bytes below sp)
+                     *   [fault-rgn] page=0x73d16ac000 vprot prev/this/next=00/00/23
+                     *   [fault-rgn] NO wine view -- Wine doesn't own this addr
+                     * i.e. a stack growing into an UNCOMMITTED page (the page above IS
+                     * committed) on a stack Wine does not own, so virtual_handle_fault
+                     * declines, nothing commits it, and the access retries forever.
+                     *
+                     * The existing SEGV LOOP FATAL guard cannot catch this: it keys on
+                     * the PC, and here two PCs alternate (0x13b5f2004 prologue and
+                     * 0x1026b3188 memcpy) over the SAME page. Key on the page instead.
+                     *
+                     * This does NOT fix the missing commit -- it stops one page from
+                     * eating an entire run, and dumps the region layout around it so the
+                     * owner can be identified and the real fix aimed correctly. */
+                    {
+                        static volatile uint64_t stuck_page;
+                        static volatile uint32_t stuck_n;
+                        uint64_t fpage = (uint64_t)fault_addr & ~0x3fffull;
+
+                        if (fpage && fpage == stuck_page)
+                        {
+                            uint32_t n = __sync_add_and_fetch(&stuck_n, 1);
+                            if (n == 2048)
+                            {
+                                mach_vm_address_t ra = (mach_vm_address_t)(fpage - 0x8000);
+                                int i;
+                                dprintf(STDERR_FILENO,
+                                    "[fault-stuck] page 0x%llx faulted %u times with NO progress "
+                                    "(pc=0x%llx sp=0x%llx) -- region map around it:\n",
+                                    (unsigned long long)fpage, n,
+                                    (unsigned long long)fault_pc_check,
+                                    (unsigned long long)__darwin_arm_thread_state64_get_sp(state));
+                                for (i = 0; i < 6; i++)
+                                {
+                                    mach_vm_size_t rs = 0;
+                                    vm_region_basic_info_data_64_t rbi;
+                                    mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+                                    mach_port_t ro = MACH_PORT_NULL;
+                                    mach_vm_address_t q = ra;
+                                    if (mach_vm_region( mach_task_self(), &q, &rs,
+                                                        VM_REGION_BASIC_INFO_64,
+                                                        (vm_region_info_t)&rbi, &rc, &ro ) != KERN_SUCCESS)
+                                    {
+                                        dprintf(STDERR_FILENO,
+                                            "[fault-stuck]   probe 0x%llx -> no region above\n",
+                                            (unsigned long long)ra);
+                                        break;
+                                    }
+                                    dprintf(STDERR_FILENO,
+                                        "[fault-stuck]   region 0x%llx +0x%llx prot=%d/%d %s\n",
+                                        (unsigned long long)q, (unsigned long long)rs,
+                                        rbi.protection, rbi.max_protection,
+                                        (q <= fpage && fpage < q + rs) ? "  <== FAULTING PAGE" : "");
+                                    ra = q + rs;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            stuck_page = fpage;
+                            stuck_n = 0;
+                        }
+                    }
+
                     if (cnt <= 50 || first_seen || (cnt % 500) == 0)
                     {
                         dprintf(STDERR_FILENO,
@@ -1762,6 +1842,89 @@ skip_reclaim_band: ;
                         (void*)(uintptr_t)__darwin_arm_thread_state64_get_sp(state),
                         (void*)(uintptr_t)state.__x[16],
                         (void*)(uintptr_t)state.__x[17]);
+                    /* ml254: 4797 of 4832 faults share ONE call site
+                     * (libarm64ecfex+0x1e8060: adrp/ldr x8,[x8,#0x38]/ldr x16,[x8]/blr x16
+                     * -- an indirect call through a pointer-to-pointer, i.e. an import
+                     * slot) and ONE target, x16=0x155ffc138: pool offset 0x37ffc138, the
+                     * LAST page of the pool, in the trampoline region above the `used`
+                     * cursor. Control reaches tiny, ODD-aligned PCs (0x22d1, 0x22d5) --
+                     * odd is why bus_handler reports exec=1 -- so the tramp RAN and then
+                     * branched to garbage. The same high band held the earlier CASPAL
+                     * use-after-free (0x1541af700, MEM_FREE).
+                     *
+                     * Three candidate causes need different fixes: (a) tramp bytes are
+                     * zero/garbage -- it was never written or was overwritten; (b) tramp
+                     * is intact but its embedded target is stale -- a lifetime bug;
+                     * (c) the page is gone (MEM_FREE / reclaimed / non-exec) -- a mapping
+                     * bug. Only the bytes plus the region info discriminate, so dump both.
+                     * Self-targeting (tiny pc + x16 in pool) so a storm cannot flood it. */
+                    {
+                        extern void *ios_jit_rx_base_global;
+                        extern size_t ios_jit_pool_size_global;
+                        uint64_t x16v = (uint64_t)state.__x[16];
+                        uint64_t rxb  = (uint64_t)(uintptr_t)ios_jit_rx_base_global;
+                        static int tramp_dumps;
+                        /* ml255/ml256: the ORIGINAL condition also required x16 to be a
+                         * pool address, which was fitted to ml254's signature
+                         * (x16=0x155ffc138) rather than to the invariant. Two runs later
+                         * x16 was 0x0 / 0x4000 / 0x1fffffff and the probe correctly but
+                         * uselessly declined. The invariant is the tiny bogus pc; x16 is
+                         * the thing we are trying to LEARN about, so it must not gate. */
+                        if (fault_pc < 0x10000 && tramp_dumps < 6)
+                        {
+                            mach_vm_address_t qa = (mach_vm_address_t)(x16v & ~0x3fffull);
+                            mach_vm_size_t qs = 0;
+                            vm_region_extended_info_data_t qi;
+                            mach_msg_type_number_t qc = VM_REGION_EXTENDED_INFO_COUNT;
+                            mach_port_t qo = MACH_PORT_NULL;
+                            kern_return_t qkr;
+                            /* extended info carries share_mode/user_tag but NOT
+                             * max_protection; basic_64 carries max. Need both, and
+                             * max is the one that says "can never be exec again". */
+                            mach_vm_address_t ba = qa;
+                            mach_vm_size_t bs = 0;
+                            vm_region_basic_info_data_64_t bi;
+                            mach_msg_type_number_t bc = VM_REGION_BASIC_INFO_COUNT_64;
+                            mach_port_t bo = MACH_PORT_NULL;
+                            int bmax = -1;
+
+                            tramp_dumps++;
+                            if (mach_vm_region( mach_task_self(), &ba, &bs,
+                                                VM_REGION_BASIC_INFO_64,
+                                                (vm_region_info_t)&bi, &bc, &bo ) == KERN_SUCCESS
+                                && ba <= (x16v & ~0x3fffull))
+                                bmax = bi.max_protection;
+                            qkr = mach_vm_region( mach_task_self(), &qa, &qs,
+                                                  VM_REGION_EXTENDED_INFO,
+                                                  (vm_region_info_t)&qi, &qc, &qo );
+                            if (qkr == KERN_SUCCESS && qa <= (x16v & ~0x3fffull))
+                                dprintf(STDERR_FILENO,
+                                    "[tramp-dump] x16=0x%llx pooloff=0x%llx REGION base=0x%llx size=0x%llx "
+                                    "prot=0x%x max=0x%x share=%d tag=%d\n",
+                                    (unsigned long long)x16v,
+                                    (unsigned long long)(rxb ? x16v - rxb : 0),
+                                    (unsigned long long)qa, (unsigned long long)qs,
+                                    qi.protection, bmax,
+                                    qi.share_mode, qi.user_tag);
+                            else
+                                dprintf(STDERR_FILENO,
+                                    "[tramp-dump] x16=0x%llx pooloff=0x%llx REGION **NONE** (kr=%d, first region above = 0x%llx) "
+                                    "-- page is NOT MAPPED\n",
+                                    (unsigned long long)x16v,
+                                    (unsigned long long)(rxb ? x16v - rxb : 0),
+                                    qkr, (unsigned long long)qa);
+
+                            /* the tramp's own words -- only if the page is readable */
+                            if (qkr == KERN_SUCCESS && qa <= (x16v & ~0x3fffull) &&
+                                (qi.protection & VM_PROT_READ))
+                            {
+                                const uint32_t *w = (const uint32_t *)(uintptr_t)x16v;
+                                dprintf(STDERR_FILENO,
+                                    "[tramp-dump]   words: %08x %08x %08x %08x %08x %08x\n",
+                                    w[0], w[1], w[2], w[3], w[4], w[5]);
+                            }
+                        }
+                    }
                     /* ml224: name the faulting address against the JIT-pool ledger.
                      *
                      * Steam/CEF dies on a 128-bit atomic whose target VirtualQuery
@@ -3404,8 +3567,9 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
         if (pe)
         {
             rec->ExceptionAddress = (void *)(uintptr_t)pe;
+            { static unsigned long pe_storm; if (ios_sig_storm_gate( &pe_storm ))
             ERR( "setup_exception: pool pc %p -> PE ExceptionAddress %p\n",
-                 (void *)PC_sig(sigcontext), rec->ExceptionAddress );
+                 (void *)PC_sig(sigcontext), rec->ExceptionAddress ); }
         }
     }
 #endif
@@ -4403,6 +4567,44 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             if ((uintptr_t)PC_sig(context) >= 0x100000000ULL)
             {
                 uint32_t *p = (uint32_t*)(uintptr_t)PC_sig(context);
+                /* ml265 (#46): WIDE window when the fault PC is FEX-emitted code.
+                 *
+                 * The ml265 fatal is a DELIBERATE null deref in the dispatcher:
+                 *   52800001  movz w1, #0        <- x1 set to 0 literally
+                 *   f9400021  ldr  x1, [x1]      <- FAULTS
+                 *   d53b440a  mrs  x10, fpcr     (FP-control setup)
+                 * preceded by two `st1` SIMD stores -- the dispatcher's FP-save
+                 * sequence. pc sits at pool offset 0x36ff8650, the tail EC_CODE area,
+                 * i.e. code FEX EMITTED, not translated guest code.
+                 *
+                 * That matters because this port already patches "FEX's emitter on iOS
+                 * produces garbage words in the dispatcher" (Module.cpp SpillStaticRegs
+                 * scanner), whose own comment notes mis-patching "causes st1 faults
+                 * later". 7 words is too narrow to tell a genuine emit from a corrupted
+                 * one, and the offset relative to the dispatcher decides which documented
+                 * site (+0x160 / +0x184 / +0x264) this is. Dump 24 words with the pool
+                 * offset so the emitted sequence can be read offline against the
+                 * expected layout. Capped; only for pool PCs. */
+                {
+                    extern void *ios_jit_rx_base_global;
+                    extern size_t ios_jit_pool_size_global;
+                    uintptr_t rxb = (uintptr_t)ios_jit_rx_base_global;
+                    uintptr_t fpc = (uintptr_t)PC_sig(context);
+                    static int wide_dumps;
+
+                    if (rxb && fpc >= rxb && fpc < rxb + ios_jit_pool_size_global &&
+                        wide_dumps < 4)
+                    {
+                        const uint32_t *w = (const uint32_t *)(fpc - 48);
+                        int i;
+                        wide_dumps++;
+                        ERR("  [emit-dump] pc=0x%llx pooloff=0x%llx  PC-48..PC+44:\n",
+                            (unsigned long long)fpc, (unsigned long long)(fpc - rxb));
+                        for (i = 0; i < 24; i += 6)
+                            ERR("  [emit-dump]   +%-4d %08x %08x %08x %08x %08x %08x\n",
+                                (i - 12) * 4, w[i], w[i+1], w[i+2], w[i+3], w[i+4], w[i+5]);
+                    }
+                }
                 ERR("  insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",
                     p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3]);
             }
@@ -4639,7 +4841,8 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         if (this_pc == last_fault_pc)
         {
             fault_repeat_count++;
-            if (fault_repeat_count == 3)
+            static unsigned long loop_storm;
+            if (fault_repeat_count == 3 && ios_sig_storm_gate( &loop_storm ))
             {
                 ERR("SEGV LOOP DETECTED: pc=%p addr=%p repeated %d times, dumping TEB+PEB\n",
                     (void*)this_pc, siginfo->si_addr, fault_repeat_count);
@@ -5187,6 +5390,67 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 PC_sig(bus_ctx) += 4;
                 ios_fixup_x18_for_return( bus_ctx );
                 return;  /* Resume after the emulated store */
+            }
+            /* ml264 (#45): NAME THE MEMORY, not the instruction.
+             *
+             * All four failing instructions in ml264 target the SAME address
+             * 0x156a097b0 (pool offset 0x361b57b0, tail/JIT-code area) and all four
+             * are ATOMICS of different widths:
+             *   0x88eafe89  CAS   32-bit   x1
+             *   0xc8f1fd60  CAS   64-bit   x1
+             *   0x4866fd64  CASPAL 128-bit x1
+             *   0x4866fe6a  CASPAL 128-bit x59
+             * A location that rejects atomics at EVERY width is not an instruction
+             * problem -- the Size==1 CASPAL implementation is in and working, and
+             * [caspal128] is silent. On Apple silicon LSE atomics require normal
+             * cacheable memory, and this pool is mach_vm_remap dual-mapped (RW alias
+             * + RX alias), which is exactly the kind of mapping where they fault.
+             *
+             * Two readings need opposite fixes: (a) the whole dual-mapped pool
+             * rejects atomics -- then FEX's own atomics on pool-resident structures
+             * can never work there and the data must move; (b) only THIS page is bad
+             * (reclaimed, or the single-page RW poison of task #41) -- a page-level
+             * problem with a page-level fix. protection/max_protection/share_mode/
+             * user_tag distinguish them. Capped; fires only on an already-fatal path. */
+            {
+                static int busrgn;
+                if (busrgn++ < 10)
+                {
+                    mach_vm_address_t ba = (mach_vm_address_t)(uintptr_t)siginfo->si_addr;
+                    mach_vm_size_t bs = 0;
+                    vm_region_basic_info_data_64_t bbi;
+                    mach_msg_type_number_t bbc = VM_REGION_BASIC_INFO_COUNT_64;
+                    mach_port_t bbo = MACH_PORT_NULL;
+                    mach_vm_address_t xa = (mach_vm_address_t)(uintptr_t)siginfo->si_addr;
+                    mach_vm_size_t xs = 0;
+                    vm_region_extended_info_data_t xi;
+                    mach_msg_type_number_t xc = VM_REGION_EXTENDED_INFO_COUNT;
+                    mach_port_t xo = MACH_PORT_NULL;
+                    extern void *ios_jit_rx_base_global, *ios_jit_rw_base_global;
+                    extern size_t ios_jit_pool_size_global;
+                    uintptr_t rxb = (uintptr_t)ios_jit_rx_base_global;
+                    uintptr_t rwb = (uintptr_t)ios_jit_rw_base_global;
+                    size_t psz = ios_jit_pool_size_global;
+                    uintptr_t fa = (uintptr_t)siginfo->si_addr;
+                    const char *where = "outside pool";
+
+                    if (rxb && fa >= rxb && fa < rxb + psz) where = "JIT-POOL-RX (dual-mapped)";
+                    else if (rwb && fa >= rwb && fa < rwb + psz) where = "JIT-POOL-RW (alias)";
+
+                    if (mach_vm_region( mach_task_self(), &ba, &bs, VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&bbi, &bbc, &bbo ) == KERN_SUCCESS &&
+                        mach_vm_region( mach_task_self(), &xa, &xs, VM_REGION_EXTENDED_INFO,
+                                        (vm_region_info_t)&xi, &xc, &xo ) == KERN_SUCCESS)
+                        ERR("[atomic-mem] addr=%p %s pooloff=0x%llx | region=0x%llx+0x%llx "
+                            "prot=%d max=%d share_mode=%d user_tag=%d\n",
+                            siginfo->si_addr, where,
+                            (unsigned long long)(rxb && fa >= rxb ? fa - rxb : 0),
+                            (unsigned long long)ba, (unsigned long long)bs,
+                            bbi.protection, bbi.max_protection, xi.share_mode, xi.user_tag);
+                    else
+                        ERR("[atomic-mem] addr=%p %s -- mach_vm_region FAILED (unmapped?)\n",
+                            siginfo->si_addr, where);
+                }
             }
             ERR("BUS: unhandled store insn=0x%08x at pc=%p addr=%p\n",
                 insn, pc, siginfo->si_addr);

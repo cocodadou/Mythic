@@ -2253,7 +2253,22 @@ static int ios_load_child_ec_ntdll( PEB *child_peb )
             void **p_xlate_rev = (void **)find_named_export( module, exports, "p_ios_jit_reverse_translate_addr" );
             if (p_xlate)     { *p_xlate = (void *)ios_jit_translate_addr;              ios_jit_sync_write( p_xlate, sizeof(void*) ); }
             else dprintf(2, "[ec-child-ntdll] p_ios_jit_translate_addr NOT FOUND\n");
-            if (p_xlate_rev) { *p_xlate_rev = (void *)ios_jit_reverse_translate_addr;  ios_jit_sync_write( p_xlate_rev, sizeof(void*) ); }
+            /* ml221: this used to install the reverse hook with NO log on either
+             * outcome, so whether a CHILD ntdll copy got it was invisible. That matters:
+             * each pseudo-process has its own cloned .data, hence its own
+             * p_ios_jit_reverse_translate_addr, and if it stays NULL then
+             * xlate_ios_jit_rev degrades to identity, virtual_unwind walks in JIT-pool
+             * space where no function tables are registered, and the resulting garbage
+             * frame trips "Exception frame is not in stack limits" -> process death. */
+            if (p_xlate_rev)
+            {
+                *p_xlate_rev = (void *)ios_jit_reverse_translate_addr;
+                ios_jit_sync_write( p_xlate_rev, sizeof(void*) );
+                dprintf( 2, "[ec-child-ntdll] XLATE-REV installed at %p = %p\n",
+                         p_xlate_rev, (void *)ios_jit_reverse_translate_addr );
+            }
+            else dprintf( 2, "[ec-child-ntdll] p_ios_jit_reverse_translate_addr NOT FOUND"
+                             " -- unwind will run in pool space\n" );
         }
 
         /* Sync all written slots into the pool copy (PE code reads there). */

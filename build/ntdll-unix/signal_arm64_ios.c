@@ -1762,6 +1762,85 @@ skip_reclaim_band: ;
                         (void*)(uintptr_t)__darwin_arm_thread_state64_get_sp(state),
                         (void*)(uintptr_t)state.__x[16],
                         (void*)(uintptr_t)state.__x[17]);
+                    /* ml224: name the faulting address against the JIT-pool ledger.
+                     *
+                     * Steam/CEF dies on a 128-bit atomic whose target VirtualQuery
+                     * reports MEM_FREE while sitting INSIDE the pool's span -- so the
+                     * pointer is dangling, not misaligned, and pool lifetime is the
+                     * suspect. Whether the range is on the reclaim freelist, still a live
+                     * mapping, or neither picks between three different fixes, and this
+                     * is the only place that can tell. Rate-limited with the dump it
+                     * rides on, so a fault storm cannot flood the log. */
+                    {
+                        extern void ios_jit_describe_pool_addr( const void *addr, char *buf,
+                                                                size_t buflen );
+                        static int ledger_n;
+                        char pooldesc[192];
+
+                        /* ml225: riding the mach_exc limiter alone still produced 3790
+                         * lines in one run, because a null-deref storm (addr=0x10/0xc/0x2)
+                         * asks the ledger a question it can only answer "OUTSIDE pool".
+                         * Only sub-pool-band addresses are interesting here, and cap the
+                         * rest, so the interesting verdict cannot be buried. */
+                        if (ledger_n < 40 && fault_addr >= 0x10000)
+                        {
+                            ledger_n++;
+                            ios_jit_describe_pool_addr( (const void *)fault_addr, pooldesc,
+                                                        sizeof(pooldesc) );
+                            dprintf( STDERR_FILENO, "[mach_exc]   [pool-ledger] addr=%p : %s\n",
+                                     (void *)fault_addr, pooldesc );
+                        }
+                    }
+                    /* ml226: is the guest RSP TRUNCATED TO 32 BITS, or already garbage?
+                     *
+                     * The recurring fatal address family is 0x40001141 / 0x80001141 /
+                     * 0xe0001141 -- all 32-bit values with identical low halves, reached
+                     * through a guest PUSH (ldr x2,[x28,#0x40]; sub x2,x2,#0x10; str x0,[x2]).
+                     * A 64-bit RSP does not look like that. One reading is an instruction
+                     * writing RSP with 32-bit operand size (mov esp,eax semantics), which
+                     * would be a FEX decode bug; the other is that RSP arrived corrupt from
+                     * somewhere upstream, which is a different bug entirely.
+                     *
+                     * Decide it by dumping the guest state and the x86 bytes AT the guest
+                     * RIP. If those bytes decode to a 32-bit write to RSP the first reading
+                     * is confirmed; if they are an ordinary push/call then RSP was already
+                     * wrong on entry and the truncation idea is dead. Prints the raw bytes
+                     * rather than a verdict so it can say "neither". */
+                    {
+                        static int rsp_n;
+                        uint64_t st28 = state.__x[28];
+                        uint64_t cs[5];            /* +0x18 rip .. +0x38 */
+                        uint64_t rsp = 0;
+                        unsigned char code[16];
+                        mach_vm_size_t g = 0;
+
+                        if (rsp_n < 12 && st28 > 0x100000 &&
+                            mach_vm_read_overwrite( mach_task_self(),
+                                (mach_vm_address_t)(st28 + 0x18), sizeof(cs),
+                                (mach_vm_address_t)cs, &g ) == KERN_SUCCESS && g == sizeof(cs) &&
+                            mach_vm_read_overwrite( mach_task_self(),
+                                (mach_vm_address_t)(st28 + 0x40), 8,
+                                (mach_vm_address_t)&rsp, &g ) == KERN_SUCCESS)
+                        {
+                            rsp_n++;
+                            dprintf( STDERR_FILENO,
+                                     "[rsp-trunc] x28=%p guest_rip=%p rsp=%p rsp_hi32=%s\n",
+                                     (void *)st28, (void *)cs[0], (void *)rsp,
+                                     (rsp >> 32) ? "set (64-bit)" : "ZERO (looks truncated)" );
+                            g = 0;
+                            if (cs[0] && mach_vm_read_overwrite( mach_task_self(),
+                                    (mach_vm_address_t)cs[0], sizeof(code),
+                                    (mach_vm_address_t)code, &g ) == KERN_SUCCESS &&
+                                g == sizeof(code))
+                                dprintf( STDERR_FILENO,
+                                         "[rsp-trunc]   x86 @rip: %02x %02x %02x %02x %02x %02x %02x %02x"
+                                         " %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                         code[0],code[1],code[2],code[3],code[4],code[5],code[6],code[7],
+                                         code[8],code[9],code[10],code[11],code[12],code[13],code[14],code[15] );
+                            else
+                                dprintf( STDERR_FILENO, "[rsp-trunc]   x86 @rip UNREADABLE\n" );
+                        }
+                    }
                     /* [ec-fault-regs] the faulting insn f8686928 = ldr x8,[x9,x8]:
                      * addr = x9(base) + x8(index). Dump x8..x11 so we can name the
                      * table (EC bitmap? syscall-frame? LookupCache?) and why it's bad. */

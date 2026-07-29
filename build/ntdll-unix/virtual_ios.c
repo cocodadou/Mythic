@@ -203,6 +203,87 @@ struct ios_pool_free
 };
 static struct ios_pool_free ios_pool_freelist[IOS_POOL_FREE_MAX];
 static int ios_pool_free_count;
+
+/* ml224: describe a faulting address against the JIT-pool ledger.
+ *
+ * Steam/CEF dies on a 128-bit atomic whose target VirtualQuery reports as MEM_FREE:
+ *   [caspal128] addr=0x1526120e0 misalign=0 region base=0x152612000 size=0x2fee000
+ *               prot=0x1 type=MEM_PRIVATE state=0x10000   (0x10000 = MEM_FREE)
+ * so the instruction and its alignment were never the problem -- the POINTER is dangling.
+ * The address sits inside the pool's span yet is unmapped, which points at pool lifetime
+ * rather than guest logic. Three candidates need different fixes, and only the ledger can
+ * tell them apart:
+ *   - it lands in a freelist entry  => reclamation released memory still referenced
+ *   - it lands in a live mapping    => the mapping exists; the fault is something else
+ *   - it lands in neither           => a hole; the guest pointer is simply stale/garbage
+ * Reports all three plus the pool geometry, so "none of the above" is a real answer.
+ * Caller supplies the buffer; no allocation, safe from a fault handler. */
+void ios_jit_describe_pool_addr( const void *addr, char *buf, size_t buflen )
+{
+    /* these are defined further down this file; declare locally so the describer can sit
+     * next to the freelist it reports on rather than being pushed below its data */
+    extern void *ios_jit_rw_base_global;
+    extern void *ios_jit_rx_base_global;
+    extern size_t ios_jit_pool_size_global;
+    extern const char *ios_pe_module_name( const void *image_base, size_t image_size );
+
+    uintptr_t a = (uintptr_t)addr;
+    uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+    size_t ps = ios_jit_pool_size_global;
+    uintptr_t base = 0;
+    const char *which = NULL;
+    size_t off;
+    int i;
+
+    if (!buf || !buflen) return;
+    buf[0] = 0;
+    if (!ps) { snprintf( buf, buflen, "pool not initialised" ); return; }
+
+    if (rw && a >= rw && a < rw + ps)      { base = rw; which = "RW"; }
+    else if (rx && a >= rx && a < rx + ps) { base = rx; which = "RX"; }
+    else { snprintf( buf, buflen, "OUTSIDE pool (rw=%p rx=%p size=0x%lx)",
+                     (void *)rw, (void *)rx, (unsigned long)ps ); return; }
+
+    off = a - base;
+
+    for (i = 0; i < ios_pool_free_count; i++)
+    {
+        if (off >= ios_pool_freelist[i].off &&
+            off < ios_pool_freelist[i].off + ios_pool_freelist[i].size)
+        {
+            snprintf( buf, buflen,
+                      "%s pool off=0x%lx -> FREELIST[%d] off=0x%lx size=0x%lx advised=%d"
+                      "  <== RECLAIMED MEMORY STILL REFERENCED",
+                      which, (unsigned long)off, i,
+                      (unsigned long)ios_pool_freelist[i].off,
+                      (unsigned long)ios_pool_freelist[i].size,
+                      ios_pool_freelist[i].advised );
+            return;
+        }
+    }
+
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t jb = (uintptr_t)ios_jit_mappings[i].jit_base;
+        size_t sz = ios_jit_mappings[i].size;
+
+        if (jb && sz && a >= jb && a < jb + sz)
+        {
+            snprintf( buf, buflen,
+                      "%s pool off=0x%lx -> LIVE mapping[%d] %s pe=%p jit=%p+0x%lx owner=%p",
+                      which, (unsigned long)off, i,
+                      ios_pe_module_name( ios_jit_mappings[i].pe_base, sz ),
+                      ios_jit_mappings[i].pe_base, (void *)jb, (unsigned long)sz,
+                      ios_jit_mappings[i].owner_peb );
+            return;
+        }
+    }
+
+    snprintf( buf, buflen, "%s pool off=0x%lx -> HOLE (no freelist entry, no live mapping;"
+                           " %d mappings, %d freelist)", which, (unsigned long)off,
+              ios_jit_mapping_count, ios_pool_free_count );
+}
 /* task #34: 1 if the most recent ios_pool_alloc_range served from the freelist,
  * 0 if it came off the virgin bump. Read immediately after the call by the
  * copy-verify probe so a failed copy can be attributed to reuse or not. */
@@ -1003,6 +1084,45 @@ static int ios_jit_init_debug_channels( void *base, size_t image_size,
     return fixed;
 }
 
+/* ml240: WHICH copy step poisons maxprot?
+ *
+ * The pool range is CLEAN at hand-out (24/24, all reused=0) yet isolated .text pages come
+ * out with max=3 -- EXEC gone from maxprot, unraisable, so mprotect(RX) fails forever and
+ * execution there faults NOEXEC. Between hand-out and verification the only memory
+ * operations are the memcpy through the RW alias and sys_icache_invalidate on the RX
+ * alias, so scanning after each pinpoints the culprit instead of guessing. */
+static unsigned ios_jit_scan_nonexec( const char *label, const char *who,
+                                      const void *rx_dest, size_t size )
+{
+    static int scans;
+    unsigned bad = 0;
+    size_t o;
+
+    for (o = 0; o < size; o += 0x4000)
+    {
+        mach_vm_address_t want = (mach_vm_address_t)(uintptr_t)((const char *)rx_dest + o), a = want;
+        mach_vm_size_t rsz = 0;
+        vm_region_basic_info_data_64_t inf;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        if (mach_vm_region( mach_task_self(), &a, &rsz, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&inf, &cnt, &obj ) != KERN_SUCCESS) break;
+        if (a > want) continue;
+        if (!(inf.max_protection & VM_PROT_EXECUTE))
+        {
+            if (bad == 0 && scans < 30)
+                dprintf( 2, "[poison-step] %s: FIRST non-exec at +0x%lx va=%p prot=%x max=%x (%s)\n",
+                         label, (unsigned long)o, (void *)(uintptr_t)want,
+                         inf.protection, inf.max_protection, who ? who : "?" );
+            bad++;
+        }
+    }
+    if (bad && scans < 30) { scans++;
+        dprintf( 2, "[poison-step] %s: %u non-exec pages (%s)\n", label, bad, who ? who : "?" ); }
+    return bad;
+}
+
 static void ios_jit_verify_text_exec( const char *who, const void *rx_dest, size_t image_size )
 {
     static unsigned verified;
@@ -1162,24 +1282,59 @@ static void ios_va_gap_probe( const char *why )
  * refused outright (same family as the share-probe's kr=2 on OVERWRITE), so it
  * says nothing about executability. mach_vm_region reads max_protection
  * directly and mutates nothing. Returns 1 if the range still permits exec. */
-static int ios_pool_range_execable(size_t off, unsigned int *cur_out, unsigned int *max_out)
+static int ios_pool_range_execable(size_t off, size_t range_size,
+                                   unsigned int *cur_out, unsigned int *max_out)
 {
-    mach_vm_address_t a;
-    mach_vm_size_t sz = 0;
-    vm_region_basic_info_data_64_t info;
-    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t obj = MACH_PORT_NULL;
+    /* ml242 FIX: scan the WHOLE range, not just its first page.
+     *
+     * This guard existed and its intent was right, but it queried exactly one address --
+     * rx_base + off -- so it only ever saw the START page. Every poisoned page measured
+     * sits deeper in (+0x30000, +0x60000, +0x90000, +0xb0000, +0xd0000, +0xe0000), so the
+     * start looked clean, the guard passed, and the range was recycled with a permanently
+     * non-executable page inside it. That page later lands in a module's .text, mprotect(RX)
+     * can never restore EXEC (maxprot only ever lowers), and execution there faults NOEXEC
+     * -- killing the process (this run: dbghelp.dll+0x6da14).
+     *
+     * Measured discriminator: 29 of 29 poisoned ranges had reused=1; virgin bump memory was
+     * never poisoned. So recycled VA carrying narrowed maxprot is the whole mechanism.
+     *
+     * Walks region-by-region (mach_vm_region returns each region's size) rather than page
+     * by page, so this is O(regions) and cheap even for multi-MB ranges. */
+    mach_vm_address_t base, a, end;
 
     if (!ios_jit_rx_base_global) return 1;
-    a = (mach_vm_address_t)(uintptr_t)((char *)ios_jit_rx_base_global + off);
-    if (mach_vm_region( mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64,
-                        (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS)
-        return 1;   /* can't tell — don't drop the range on a failed query */
-    if (a > (mach_vm_address_t)(uintptr_t)((char *)ios_jit_rx_base_global + off))
-        return 1;   /* region starts past us: address is in a gap, not our entry */
-    if (cur_out) *cur_out = (unsigned int)info.protection;
-    if (max_out) *max_out = (unsigned int)info.max_protection;
-    return (info.max_protection & VM_PROT_EXECUTE) != 0;
+    base = (mach_vm_address_t)(uintptr_t)((char *)ios_jit_rx_base_global + off);
+    end  = base + (range_size ? range_size : 1);
+
+    for (a = base; a < end; )
+    {
+        mach_vm_address_t q = a;
+        mach_vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        if (mach_vm_region( mach_task_self(), &q, &sz, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS)
+            return 1;      /* can't tell — don't drop the range on a failed query */
+        if (q >= end) break;
+        if (q > a) { a = q; continue; }   /* gap: skip to the next real region */
+        if (!sz) break;
+
+        if (!(info.max_protection & VM_PROT_EXECUTE))
+        {
+            if (cur_out) *cur_out = (unsigned int)info.protection;
+            if (max_out) *max_out = (unsigned int)info.max_protection;
+            return 0;      /* poisoned somewhere in the range — refuse it */
+        }
+        if (a == base)
+        {
+            if (cur_out) *cur_out = (unsigned int)info.protection;
+            if (max_out) *max_out = (unsigned int)info.max_protection;
+        }
+        a = q + sz;
+    }
+    return 1;
 }
 
 /* iOS-Mythic: secondary user_VA → JIT pool aliases mapping for anonymous
@@ -1299,7 +1454,8 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
          * entirely (pool then bumped to 762MB of 896MB). */
         {
             unsigned int cur = 0, mx = 0;
-            if (!ios_pool_range_execable( ios_pool_freelist[i].off, &cur, &mx ))
+            if (!ios_pool_range_execable( ios_pool_freelist[i].off,
+                                          ios_pool_freelist[i].size, &cur, &mx ))
             {
                 dprintf(2, "[jit-pool] POISONED range off=0x%lx size=0x%lx cur=0x%x max=0x%x — dropped, NOT handed out\n",
                         (unsigned long)ios_pool_freelist[i].off,
@@ -1391,7 +1547,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
                 if ((bump_probe_n++ & 15) == 0)
                 {
                     unsigned int cur = 0, mx = 0;
-                    int ok = ios_pool_range_execable( off, &cur, &mx );
+                    int ok = ios_pool_range_execable( off, alloc_size, &cur, &mx );
                     dprintf(2, "[jit-pool] bump-probe off=0x%lx size=0x%lx cur=0x%x max=0x%x execable=%d (VIRGIN control)\n",
                             (unsigned long)off, (unsigned long)alloc_size, cur, mx, ok);
                 }
@@ -1450,9 +1606,67 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
     return off;
 }
 
+/* ml239: is a pool range ALREADY non-executable when handed out?
+ *
+ * copy-verify reports isolated .text pages BORN NON-EXEC with max=3 -- maxprot lacking
+ * EXEC, which can never be raised again, so mprotect(RX) fails forever and execution there
+ * faults NOEXEC (this run: dbghelp.dll+0x6da14, unhandled -> process death). Seen across
+ * several modules: 1/295 in steamwebhelper, 2/72 in chromehtml, 1/40 in libswresample.
+ *
+ * Two candidates needing different fixes: the copy path poisons the page, or the pool
+ * RECYCLES already-poisoned VA (68 freelist/reclaim events this run) so it arrives poisoned.
+ * Checking maxprot at hand-out time -- BEFORE anything is written -- separates them.
+ * VM_PROT_COPY was already ruled out (zero RW+COPY events in the failing run). */
+static void ios_pool_check_range_exec( size_t off, size_t size, int reused )
+{
+    extern void *ios_jit_rx_base_global;
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+    static int checked;
+    size_t o;
+    unsigned bad = 0;
+
+    /* ml241: do NOT cap the CHECK -- only the printing. The first version incremented a
+     * shared counter on clean ranges too, so it sampled the first 24 allocations (all
+     * clean) and never looked at the ones that were actually poisoned (winmm, setupapi,
+     * ...). It reported "CLEAN at hand-out 24/24" and I wrongly concluded the copy path was
+     * to blame; [poison-step] pre-memcpy then showed the pages already non-exec BEFORE the
+     * copy. Check everything, print only what is interesting. */
+    if (!rx) return;
+
+    for (o = 0; o < size; o += 0x4000)
+    {
+        mach_vm_address_t want = (mach_vm_address_t)(rx + off + o), a = want;
+        mach_vm_size_t rsz = 0;
+        vm_region_basic_info_data_64_t inf;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        if (mach_vm_region( mach_task_self(), &a, &rsz, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&inf, &cnt, &obj ) != KERN_SUCCESS) break;
+        if (a > want) continue;
+        if (!(inf.max_protection & VM_PROT_EXECUTE))
+        {
+            if (bad++ == 0 && checked++ < 30)
+                dprintf( 2, "[pool-poison] HANDED OUT NON-EXEC off=0x%lx +0x%lx va=%p prot=%x "
+                            "max=%x reused=%d  <== range arrives already poisoned\n",
+                         (unsigned long)off, (unsigned long)o, (void *)(uintptr_t)want,
+                         inf.protection, inf.max_protection, reused );
+        }
+    }
+    if (bad && checked < 30)
+        dprintf( 2, "[pool-poison] off=0x%lx +0x%lx : %u poisoned pages, reused=%d\n",
+                 (unsigned long)off, (unsigned long)size, bad, reused );
+}
+
 static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
 {
-    return ios_pool_alloc_range_ex( alloc_size, pool_limit, (size_t)-1, 0 );
+    size_t off = ios_pool_alloc_range_ex( alloc_size, pool_limit, (size_t)-1, 0 );
+
+    /* ml239: see ios_pool_check_range_exec. ios_pool_last_alloc_reused tells us whether
+     * this came off the freelist or the virgin bump, which is exactly the discriminator. */
+    if (off != (size_t)-1)
+        ios_pool_check_range_exec( off, alloc_size, ios_pool_last_alloc_reused );
+    return off;
 }
 
 /* Total bytes reserved from the pool TAIL by NtAllocateVirtualMemoryEx for
@@ -4510,7 +4724,39 @@ void ios_jit_reclaim_process( void *peb )
             }
         }
 
+        /* ml244: bracket clear_arm64ec_range. The free-time check below fires on 20 ranges
+         * ("narrowed during the module's life"), but it sits AFTER this call -- which
+         * operates on the same pool range -- so it could be observing poison this very call
+         * creates. Check immediately before to separate "already poisoned when we got here"
+         * from "clear_arm64ec_range narrows it". */
+        {
+            unsigned int bcur = 0, bmax = 0;
+            static int prechk;
+
+            if (!ios_pool_range_execable( off, size, &bcur, &bmax ) && prechk++ < 20)
+                dprintf( 2, "[pool-freechk] PRE-CLEAR poisoned off=0x%lx size=0x%lx cur=0x%x max=0x%x"
+                            "  <== poison predates clear_arm64ec_range\n",
+                         (unsigned long)off, (unsigned long)size, bcur, bmax );
+        }
         if (arm64ec_view) clear_arm64ec_range( rx_base + off, size );
+
+        /* ml243: is the range ALREADY poisoned when it is freed?
+         *
+         * The guard now refuses poisoned ranges (correct) but never recovers them -- 62
+         * drops = 164MB orphaned from an 896MB pool, which already sits at 86% used. The
+         * durable fix is to stop the poison being CREATED, so pin down when maxprot is
+         * narrowed: during the module's life (poisoned here at free time) or later while
+         * the range sits on the freelist (clean here, poisoned at reuse). Those need
+         * completely different fixes. Self-targeting: prints only when poisoned. */
+        {
+            unsigned int fcur = 0, fmax = 0;
+            static int freechk;
+
+            if (!ios_pool_range_execable( off, size, &fcur, &fmax ) && freechk++ < 20)
+                dprintf( 2, "[pool-freechk] POISONED AT FREE off=0x%lx size=0x%lx cur=0x%x max=0x%x"
+                            "  <== narrowed during the module's life\n",
+                         (unsigned long)off, (unsigned long)size, fcur, fmax );
+        }
 
         if (ios_pool_free_count < IOS_POOL_FREE_MAX)
         {
@@ -6014,8 +6260,14 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
             /* Copy ENTIRE PE image to JIT pool (code + data + headers).
              * This preserves ADRP-based PC-relative references between sections. */
+            ios_jit_scan_nonexec( "pre-memcpy", ios_pe_module_name( image_base, image_size ),
+                                  (char *)jit_rx_base + offset, image_size );
             memcpy((char *)jit_rw_base + offset, image_base, image_size);
+            ios_jit_scan_nonexec( "post-memcpy", ios_pe_module_name( image_base, image_size ),
+                                  (char *)jit_rx_base + offset, image_size );
             sys_icache_invalidate((char *)jit_rx_base + offset, image_size);
+            ios_jit_scan_nonexec( "post-icache", ios_pe_module_name( image_base, image_size ),
+                                  (char *)jit_rx_base + offset, image_size );
             ios_jit_verify_copy( (const char *)image_base,
                                  (const char *)jit_rx_base + offset,
                                  image_size, ios_pe_module_name( image_base, image_size ),

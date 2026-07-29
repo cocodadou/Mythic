@@ -699,6 +699,64 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)
 
+                Button("🎮 Run Steam (S3 smoke test)") {
+                    // Steam S3 first boot: virtual desktop (Steam needs a
+                    // window manager) + services.exe (SCM → rpcss for Steam's
+                    // COM, the chain proven in the rpcss milestone) + steam.exe
+                    // itself, all launched by C:\steam-launch.bat (pushed to
+                    // the prefix). Batch avoids quote-escaping hell; combase's
+                    // 5s OpenSCManager retry covers the services-vs-steam race.
+                    // Steam install = CrossOver copy at C:\Program Files (x86)\
+                    // Steam (all boot binaries verified x86-64; steamwebhelper
+                    // /libcef = 209MB → watch pool: first webhelper may fit,
+                    // multiples need .text sharing). Flags: -no-cef-sandbox
+                    // (sandbox can't work in Wine), -cef-disable-gpu (software
+                    // render), -console (Steam's own log → our stderr). Steam
+                    // WILL try to self-update through our GnuTLS stack — that
+                    // attempt is itself an informative S0 re-test.
+                    let deskW = 1024, deskH = 768
+                    setenv("MYTHIC_EXE", "explorer.exe", 1)
+                    setenv("MYTHIC_ARGS",
+                           "/desktop=shell,\(deskW)x\(deskH) cmd /c C:\\steam-launch.bat", 1)
+                    setenv("MYTHIC_DESKTOP", "1", 1)
+                    setenv("MYTHIC_SCREEN_W", String(deskW), 1)
+                    setenv("MYTHIC_SCREEN_H", String(deskH), 1)
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+
+                Button("Run Desktop + services (R2v2)") {
+                    // S3-pre R2v2: raw rpcss.exe CANNOT run standalone —
+                    // its wmain unconditionally StartServiceCtrlDispatcherW's
+                    // (rpcss_main.c:282), which RPCs back to the SCM; without
+                    // services.exe it raised + wedged in
+                    // service_run_main_thread, and explorer's
+                    // CoRegisterClassObject wedged behind it (seq-3680 run).
+                    // Proper bootstrap: explorer's cmdline child = services.exe
+                    // (SCM host, windows-subsystem = no console). It creates
+                    // \pipe\svcctl early, runs auto-start services (MountMgr/
+                    // Eventlog/NDIS/nsiproxy/PlugPlay — winedevice/plugplay
+                    // are bundled; failures tolerated), and combase's
+                    // start_rpcss then demand-starts RpcSs through the SCM
+                    // with a 30s start-pending wait → rpcss runs as services'
+                    // child (3-deep tree, proven depth) with a proper
+                    // dispatcher connection → epmapper up → real COM.
+                    // Known risk: if shellwindows_init beats services.exe's
+                    // RPC_Init, OpenSCManager fails → watch whether that
+                    // fails fast or hits the RaiseException→CS wedge again.
+                    let deskW = 960, deskH = 540
+                    setenv("MYTHIC_EXE", "explorer.exe", 1)
+                    setenv("MYTHIC_ARGS",
+                           "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\services.exe", 1)
+                    setenv("MYTHIC_DESKTOP", "1", 1)
+                    setenv("MYTHIC_SCREEN_W", String(deskW), 1)
+                    setenv("MYTHIC_SCREEN_H", String(deskH), 1)
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.mint)
+
                 Button("Run Thumper (D3D11 / win10)") {
                     // Game lives at Documents/wine/drive_c/Program Files/Thumper/
                     // (push via scripts/deploy-thumper.sh during development;
@@ -783,64 +841,6 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.teal)
-
-                Button("Run Desktop + services (R2v2)") {
-                    // S3-pre R2v2: raw rpcss.exe CANNOT run standalone —
-                    // its wmain unconditionally StartServiceCtrlDispatcherW's
-                    // (rpcss_main.c:282), which RPCs back to the SCM; without
-                    // services.exe it raised + wedged in
-                    // service_run_main_thread, and explorer's
-                    // CoRegisterClassObject wedged behind it (seq-3680 run).
-                    // Proper bootstrap: explorer's cmdline child = services.exe
-                    // (SCM host, windows-subsystem = no console). It creates
-                    // \pipe\svcctl early, runs auto-start services (MountMgr/
-                    // Eventlog/NDIS/nsiproxy/PlugPlay — winedevice/plugplay
-                    // are bundled; failures tolerated), and combase's
-                    // start_rpcss then demand-starts RpcSs through the SCM
-                    // with a 30s start-pending wait → rpcss runs as services'
-                    // child (3-deep tree, proven depth) with a proper
-                    // dispatcher connection → epmapper up → real COM.
-                    // Known risk: if shellwindows_init beats services.exe's
-                    // RPC_Init, OpenSCManager fails → watch whether that
-                    // fails fast or hits the RaiseException→CS wedge again.
-                    let deskW = 960, deskH = 540
-                    setenv("MYTHIC_EXE", "explorer.exe", 1)
-                    setenv("MYTHIC_ARGS",
-                           "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\services.exe", 1)
-                    setenv("MYTHIC_DESKTOP", "1", 1)
-                    setenv("MYTHIC_SCREEN_W", String(deskW), 1)
-                    setenv("MYTHIC_SCREEN_H", String(deskH), 1)
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.mint)
-
-                Button("🎮 Run Steam (S3 smoke test)") {
-                    // Steam S3 first boot: virtual desktop (Steam needs a
-                    // window manager) + services.exe (SCM → rpcss for Steam's
-                    // COM, the chain proven in the rpcss milestone) + steam.exe
-                    // itself, all launched by C:\steam-launch.bat (pushed to
-                    // the prefix). Batch avoids quote-escaping hell; combase's
-                    // 5s OpenSCManager retry covers the services-vs-steam race.
-                    // Steam install = CrossOver copy at C:\Program Files (x86)\
-                    // Steam (all boot binaries verified x86-64; steamwebhelper
-                    // /libcef = 209MB → watch pool: first webhelper may fit,
-                    // multiples need .text sharing). Flags: -no-cef-sandbox
-                    // (sandbox can't work in Wine), -cef-disable-gpu (software
-                    // render), -console (Steam's own log → our stderr). Steam
-                    // WILL try to self-update through our GnuTLS stack — that
-                    // attempt is itself an informative S0 re-test.
-                    let deskW = 1024, deskH = 768
-                    setenv("MYTHIC_EXE", "explorer.exe", 1)
-                    setenv("MYTHIC_ARGS",
-                           "/desktop=shell,\(deskW)x\(deskH) cmd /c C:\\steam-launch.bat", 1)
-                    setenv("MYTHIC_DESKTOP", "1", 1)
-                    setenv("MYTHIC_SCREEN_W", String(deskW), 1)
-                    setenv("MYTHIC_SCREEN_H", String(deskH), 1)
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
 
                 Button("Run cmd /c proc tree") {
                     // Steam S1 ladder: wine's cmd runs the full test tree —

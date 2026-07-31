@@ -3122,7 +3122,9 @@ static const ULONG_PTR ios_steer_slot = 0x7C00000000;
  *
  * ios_thread_died() is called from the pthread_exit path in thread_ios.c. */
 #define IOS_STEER_MAX 256
-static struct { uint64_t base; uint64_t size; unsigned tid; unsigned freed; } ios_steer[IOS_STEER_MAX];
+/* iOS-Mythic ml312 (task #54): `inuse` is set the moment ANY allocation lands inside a steered
+ * arena, and blocks reclamation of that arena forever after. See ios_steer_reclaim_dead(). */
+static struct { uint64_t base; uint64_t size; unsigned tid; unsigned freed; unsigned inuse; } ios_steer[IOS_STEER_MAX];
 static unsigned ios_steer_n;
 static unsigned char ios_tid_dead[8192];   /* bitmap, indexed by wine tid */
 
@@ -3164,6 +3166,47 @@ static uint64_t ios_steer_reclaim_dead( void )
 
         if (ios_steer[i].freed || !ios_steer[i].base) continue;
         if (!ios_tid_is_dead( ios_steer[i].tid )) continue;
+        /* iOS-Mythic ml312 (task #54) -- THE FIX FOR THE VA DOUBLE-ALLOCATION.
+         *
+         * These 512MB ranges are FEX's jemalloc HEAP ARENAS, which are process-wide. Tagging one
+         * with the thread that happened to trigger it and releasing it when that thread exits is
+         * wrong: FEX allocates FEXMem_ThreadState / FEXMem_Lookup / FEXMem_CallRetStacks INSIDE
+         * them, and those outlive the triggering thread. ml312 caught the consequence directly --
+         * nine arenas came back from this function with freed=1 and were immediately reissued, and
+         * the reissued VAs are exactly where the duplicate ThreadStates appear:
+         *   0x7d00001000 owned by tids A8, AC and E4   (arena 0x7d00000000, reissued)
+         *   0x7d40001000 owned by tids B0 and F0       (arena 0x7d40000000, reissued)
+         * Two threads sharing a ThreadState share x28, so one thread's State.rip IS the other's;
+         * sharing a CallRetStack means one pops the other's {guest_ret, host_label} pair and
+         * branches into a foreign block. That is the #51/#52 signature and the variance source.
+         *
+         * Refuse to reclaim any arena something has allocated inside. Thread-exit is simply not
+         * evidence that a process-wide arena is dead. Arenas never touched are still reclaimable,
+         * so the pressure-relief this function exists for survives for the case it is valid in. */
+        /* ml313 RETRACTION: the ml312 "KEEPING in-use arenas" guard here was built on a premise
+         * ml313 then refuted. Two [vname] records at one address do NOT prove two live owners --
+         * [vname] logs allocations but not frees, and the liveness test on ml313's two duplicate
+         * ThreadStates showed the first owner went quiet ~20 lines after claiming, long before the
+         * second claim: ordinary allocator reuse after thread exit, not a collision. The
+         * ThreadState allocations also never appear in the [va-exit] syscall census (they are
+         * jemalloc sub-allocations, invisible to VirtualAlloc), and ml313's arenas were each
+         * reserved exactly once with zero reissues -- yet duplicates still appeared. So
+         * reclaim-reissue was not causing them either.
+         *
+         * Blocking reclaim outright would risk VA exhaustion (#43) for no demonstrated benefit.
+         * Keep the inuse flag as a DETECTOR instead: if reclaim ever releases an arena that has
+         * interior allocations, say so loudly, so any later corruption in that range can be tied
+         * to this event with evidence rather than theory. */
+        if (ios_steer[i].inuse)
+        {
+            static int rc_note;
+            if (rc_note++ < 12)
+                dprintf(2, "[steer-reclaim] rev=ml313 RELEASING arena #%u [0x%llx+0x%llx] dead_tid=%04x "
+                        "which HAS interior allocations -- if corruption follows in this range, "
+                        "the ml312 guard was right after all\n",
+                        i, (unsigned long long)ios_steer[i].base,
+                        (unsigned long long)ios_steer[i].size, ios_steer[i].tid);
+        }
 
         addr = (void *)(uintptr_t)ios_steer[i].base;
         if (!NtFreeVirtualMemory( NtCurrentProcess(), &addr, &sz, MEM_RELEASE ))
@@ -4503,6 +4546,25 @@ static BYTE get_page_vprot( const void *addr )
 #else
     return pages_vprot[idx];
 #endif
+}
+
+/* iOS-Mythic ml306 (task #53): lock-free vprot peek for the Mach reclaim handler.
+ *
+ * The [reclaim-recover] path in signal_arm64_ios.c re-mmaps arena-band pages whose host
+ * mapping has vanished (mprotect ENOMEM), on the assumption that fresh zeros are correct.
+ * That assumption was written for LookupCache pages; the band now holds FEX's entire host
+ * heap, and ml305 died on a null+0x90 deref through a pointer that plausibly came from such
+ * a zero-filled page. Whether zero-fill is safe hinges on one bit that only Wine knows:
+ * VPROT_COMMITTED. Committed-then-vanished means data loss or use-after-free (zeros MASK a
+ * real bug); never-committed means lazy-reservation first touch (zeros are the contract).
+ *
+ * Deliberately no locking: this is called from the Mach exception thread while the faulting
+ * thread is suspended possibly holding virtual_mutex, so taking any lock could deadlock.
+ * get_page_vprot is a plain two-level array read and the fault paths already use it this
+ * way; a stale read only mislabels one diagnostic line. */
+unsigned char ios_reclaim_page_vprot( unsigned long long va )
+{
+    return get_page_vprot( (const void *)(uintptr_t)va );
 }
 
 
@@ -7318,6 +7380,28 @@ static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vpr
 }
 
 
+/* iOS-Mythic ml293 (task #52): the PartitionAlloc-arena band. Steered arenas are placed
+ * top-down at/above 0x7c00000000 and no guest PE image is ever mapped >= 0x7400000000
+ * (verified across 13 runs: every [jit-pool] image base is 0x71-0x73), so this test is
+ * unambiguous and needs no bounds table. */
+static inline int ios_is_arena_addr( const void *p )
+{
+    return (uintptr_t)p >= 0x7400000000ULL;
+}
+
+/* Offset of the first non-zero byte in [p, p+n), or -1 if all zero. Exists so the
+ * zero-contract probes VERIFY BY READING MEMORY BACK rather than trusting that a
+ * memset/mmap-over was issued -- on iOS those can silently not do what was asked
+ * (PROT_WRITE downgrade), which is exactly the class of bug being hunted. */
+static long ios_first_nonzero( const void *p, size_t n )
+{
+    const unsigned char *b = (const unsigned char *)p;
+    size_t i;
+    for (i = 0; i < n; i++) if (b[i]) return (long)i;
+    return -1;
+}
+
+
 /***********************************************************************
  *           set_protection
  *
@@ -7345,7 +7429,57 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
                 base, (void *)size, (unsigned)protect);
         return STATUS_ACCESS_DENIED;
     }
+
     return STATUS_SUCCESS;
+}
+
+
+/***********************************************************************
+ *           ios_verify_commit_zero      (iOS-Mythic ml293, task #52)
+ *
+ * The OTHER HALF of the decommit zero contract.
+ *
+ * [decommit-zero] proves the decommit side zeroed. That alone is not sufficient:
+ * PartitionAlloc reads its BackupRefPtr refcount out of freshly RECOMMITTED metadata, so a
+ * commit that hands back stale bytes fails identically even when every decommit was perfect.
+ * Windows guarantees MEM_COMMIT yields zero-filled pages; verify we do too. Together the two
+ * probes localise any break to one side or the other.
+ *
+ * Deliberately NOT placed inside set_protection: that function serves both MEM_COMMIT and
+ * plain NtProtectVirtualMemory, so protect traffic would consume the report cap and starve
+ * the commit signal -- a probe whose cap is spent on the case it is not measuring reports
+ * nothing useful. Called only from the commit branches instead.
+ *
+ * Reads memory back rather than echoing intent, and only when the protection actually permits
+ * reading, so the probe can never itself fault.
+ */
+static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect )
+{
+    static unsigned long rc_n;
+
+    if (!base || !size || !ios_is_arena_addr( base )) return;
+    if (protect & (PAGE_NOACCESS | PAGE_GUARD)) return;
+    if (!(protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                     PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return;
+
+    if (++rc_n > 40) return;
+    {
+        size_t chk = size < 64 ? (size_t)size : 64;
+        long nz = ios_first_nonzero( base, chk );
+        if (nz < 0)
+            dprintf( 2, "[commit-zero] #%lu OK base=%p size=0x%lx protect=0x%x "
+                     "(first 0x%lx bytes verified zero)\n",
+                     rc_n, base, (unsigned long)size, (unsigned)protect, (unsigned long)chk );
+        else
+        {
+            const unsigned char *b = (const unsigned char *)base;
+            dprintf( 2, "[commit-zero] #%lu *** STALE ON COMMIT *** base=%p size=0x%lx "
+                     "protect=0x%x first_nonzero=+0x%lx bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                     rc_n, base, (unsigned long)size, (unsigned)protect, (unsigned long)nz,
+                     b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7] );
+        }
+    }
 }
 
 
@@ -7979,6 +8113,10 @@ static int ios_pool_live_overlap( uintptr_t rw_start, size_t size,
 static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size )
 {
     char *host_end, *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
+    /* ml293 probe state: which branch honoured the zero contract, and where to read back. */
+    const char *dc_branch = "none";
+    const void *dc_verify = NULL;
+    size_t      dc_vsize  = 0;
 
     if (!size)
     {
@@ -8018,15 +8156,30 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
             size_t l_off = 0;
             void  *l_peb = NULL;
             if (ios_pool_live_overlap( rw_alias, size, &l_off, &l_peb ))
+            {
                 dprintf(2, "[alias-tomb] STALE alias decommit REFUSED: user_va=%p size=0x%lx rw_alias=0x%lx -> pool off=0x%lx (LIVE, peb=%p) — would have zeroed a loaded module\n",
                         base, (unsigned long)size, (unsigned long)rw_alias,
                         (unsigned long)l_off, l_peb);
+                /* ml293: this branch DELIBERATELY skips zeroing. That is right for a loaded
+                 * module, but it means the caller's decommit-as-bzero contract is broken for
+                 * this range -- name it so, instead of leaving it indistinguishable from a
+                 * range that was zeroed. */
+                dc_branch = "alias-REFUSED(NOT zeroed)";
+            }
             else
+            {
                 memset( (void *)rw_alias, 0, size );
+                dc_branch = "alias-memset";
+                dc_verify = (const void *)rw_alias;
+                dc_vsize  = size;
+            }
         }
         else if (host_start < host_end)
         {
             anon_mmap_fixed( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0 );
+            dc_branch = "mmap-over";
+            dc_verify = host_start;
+            dc_vsize  = host_end - host_start;
             /* Zero the guest sub-ranges on partial host pages the mmap-over
              * couldn't cover — FEX relies on decommit-as-bzero, and stale
              * LookupCache entries surviving at the edges would run wrong
@@ -8039,6 +8192,54 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
             /* Range lies within a single host page — no full page to remap;
              * zero it in place to honour the decommit-as-bzero contract. */
             memset( base, 0, size );
+            dc_branch = "subpage-memset";
+            dc_verify = base;
+            dc_vsize  = size;
+        }
+
+        /* iOS-Mythic ml293 (task #52): VERIFY THE DECOMMIT ZERO CONTRACT IN THE PA ARENAS.
+         *
+         * Chromium's PartitionAlloc decommits slot spans and requires the pages to read
+         * back as zero on recommit; its BackupRefPtr refcount lives in that metadata. A
+         * stale (non-zero) refcount is exactly the failure chrome_elf reported: a "refcount"
+         * PA_CHECK ending in `ud2` at chrome_elf+0xd7d70, with 0xAA poison and the caller
+         * passing 0xEF (PA's quarantine byte).
+         *
+         * Every branch above believes it zeroed the range, so a report that merely echoed
+         * the branch would prove nothing -- READ THE MEMORY BACK. Both outcomes are
+         * reportable: OK confirms the contract holds and moves the hypothesis elsewhere,
+         * while a non-zero offset plus the stale bytes names the bug outright. The
+         * alias-REFUSED branch is reported without a read-back precisely because it does
+         * not zero.
+         *
+         * Arena-band only, capped, so this cannot storm a log. */
+        if (ios_is_arena_addr( base ))
+        {
+            static unsigned long dc_n;
+            if (++dc_n <= 40)
+            {
+                if (dc_verify && dc_vsize)
+                {
+                    size_t chk = dc_vsize < 64 ? dc_vsize : 64;
+                    long nz = ios_first_nonzero( dc_verify, chk );
+                    if (nz < 0)
+                        dprintf( 2, "[decommit-zero] #%lu OK base=%p size=0x%lx branch=%s "
+                                 "(first 0x%lx bytes verified zero)\n",
+                                 dc_n, base, (unsigned long)size, dc_branch, (unsigned long)chk );
+                    else
+                    {
+                        const unsigned char *b = (const unsigned char *)dc_verify;
+                        dprintf( 2, "[decommit-zero] #%lu *** NOT ZEROED *** base=%p size=0x%lx "
+                                 "branch=%s first_nonzero=+0x%lx bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                 dc_n, base, (unsigned long)size, dc_branch, (unsigned long)nz,
+                                 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7] );
+                    }
+                }
+                else
+                    dprintf( 2, "[decommit-zero] #%lu base=%p size=0x%lx branch=%s "
+                             "(no read-back: this branch does not zero)\n",
+                             dc_n, base, (unsigned long)size, dc_branch );
+            }
         }
     }
     set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
@@ -10985,6 +11186,72 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             {
                 base = view->base;
                 if (vprot & VPROT_EXEC || force_exec_prot) mprotect_range( base, size, 0, 0 );
+
+                /* iOS-Mythic ml308 (task #54): DETECT VA HANDED OUT TWICE.
+                 *
+                 * ml308's [vname] map (which only became readable once ml294 turned the iOS
+                 * VirtualName no-op into a range log) shows 50 OVERLAPPING FEX allocations,
+                 * including EXACT DUPLICATES given to different threads:
+                 *   FEXMem_ThreadState  [0x7d00001000..0x7d00004000]  tid A8 AND tid B0
+                 *   FEXMem_Lookup       [0x73af1a0000..0x73b41a0000]  tid B4 AND tid C4 (80MB)
+                 *   FEXMem_Lookup_L1    [0x73b41a0000..0x73b51a0000]  tid B4 AND tid C4 (16MB)
+                 *   FEXMem_CallRetStacks overlapping by up to 16MB in several pairs
+                 * Two threads sharing a ThreadState means the SAME x28, so one thread's
+                 * State.rip is the other's; sharing a CallRetStack means one thread pops the
+                 * other's {guest_ret, host_label} pair and branches to a foreign block's
+                 * intra-block label. That is exactly the #51/#52 signature (host PC 0x2c-0x12b4
+                 * into "the current" block, present in no guest GPR) and exactly why disabling
+                 * the call-ret predictor helped -- it stopped consuming the foreign host half.
+                 * It also explains the run-to-run variance, since damage depends on whether the
+                 * colliding threads run concurrently.
+                 *
+                 * A8's ThreadState landed at <steered 512MB reservation base>+0x1000, and B0's
+                 * landed on the identical address with no new [bigres] -- so later allocations
+                 * are not excluding already-steered ranges. Report any allocation that lands
+                 * inside a live ios_steer[] entry, naming both owners. Detection only; no
+                 * behaviour change until the log says which path grants the collision. */
+                /* ml309: the ml308 version above could only CONFIRM -- it printed nothing when it
+                 * found no match, so "0 hits" was indistinguishable from "never reached" and from
+                 * "ios_steer[] empty in this process". ml309 hit exactly that: the [vname] map still
+                 * showed 3 exact-duplicate FEXMem_ThreadState ranges (tids A8/C0, B4/C4, D0/DC), the
+                 * colliding bases 0x7d00000000 / 0x7dc0000000 / 0x7ec0000000 ARE all recorded steer
+                 * bases, steer-reclaim never ran, and A8 and C0 are the same process (peb
+                 * 0x115bc8000, per [thr-create] + the [tsd275] tid<->TEB mapping) -- yet zero
+                 * [va-collide] lines. So log EVERY arena-band allocation with the match RESULT, which
+                 * makes the negative readable: "no steer match" with ios_steer_n>0 means the table
+                 * lacks the entry, whereas no lines at all means this code path is not on the path
+                 * FEX's VirtualAlloc2 takes. */
+                if ((uint64_t)(uintptr_t)base >= 0x7C00000000ULL)
+                {
+                    static int ac;
+                    uint64_t nb = (uint64_t)(uintptr_t)base, ne = nb + size;
+                    unsigned i, hit = (unsigned)-1;
+                    for (i = 0; i < ios_steer_n; i++)
+                    {
+                        uint64_t sb, se;
+                        if (!ios_steer[i].base) continue;
+                        sb = ios_steer[i].base; se = sb + ios_steer[i].size;
+                        if (ne <= sb || nb >= se) continue;
+                        hit = i;
+                        break;
+                    }
+                    if (ac++ < 40)
+                    {
+                        unsigned me = NtCurrentTeb()
+                            ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
+                        if (hit != (unsigned)-1)
+                            dprintf( 2, "[va-arena] rev=ml309 alloc %p+0x%lx tid=%04x type=0x%x -> INSIDE "
+                                     "steer#%u [0x%llx+0x%llx] owner_tid=%04x freed=%u steer_n=%u\n",
+                                     base, (unsigned long)size, me, (unsigned)type, hit,
+                                     (unsigned long long)ios_steer[hit].base,
+                                     (unsigned long long)ios_steer[hit].size,
+                                     ios_steer[hit].tid, ios_steer[hit].freed, ios_steer_n );
+                        else
+                            dprintf( 2, "[va-arena] rev=ml309 alloc %p+0x%lx tid=%04x type=0x%x -> no steer "
+                                     "match (steer_n=%u)\n",
+                                     base, (unsigned long)size, me, (unsigned)type, ios_steer_n );
+                    }
+                }
             }
         }
     }
@@ -11018,6 +11285,8 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             }
             SERVER_END_REQ;
         }
+        /* ml293 (task #52): PA-arena recommit must read back as zero. */
+        if (!status) ios_verify_commit_zero( base, size, protect );
     }
 
     if (!status && (attributes & MEM_EXTENDED_PARAMETER_EC_CODE))
@@ -11053,6 +11322,58 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
     ULONG_PTR limit;
 
     TRACE("%p %p %08lx %x %08x\n", process, *ret, *size_ptr, type, protect );
+#ifdef WINE_IOS
+    /* ml284: does ANYTHING allocate/commit executable memory, and where?
+     *
+     * There is already an exec-allocation probe here using ERR(), but the `virtual` debug
+     * channel is filtered by MYTHIC_QUIET -- err:virtual: appears ZERO times in the logs,
+     * including the uncapped first-30 lines it should always emit. So its silence carries
+     * no information, and I must not read "no exec allocations happen" from it. (That is
+     * the same mistake as the [unexec] probe, whose filters made me wrongly retract the
+     * V8-code-space theory.) Working probes on this side all use raw dprintf(2) --
+     * [iat-sync], [jit-pool], [steer], [x86-ptr] -- so use that.
+     *
+     * Covers BOTH allocate entry points: [exec-req] hooks only NtProtectVirtualMemory, but
+     * VirtualAlloc(MEM_COMMIT, PAGE_EXECUTE_READWRITE) grants exec through
+     * NtAllocateVirtualMemory, and VirtualAlloc2/placeholders through the Ex variant --
+     * which V8 commonly uses for its code cage. Unfiltered by address, capped only by
+     * count, so silence here really does mean "never requested". */
+    /* ml288: narrowed. The first cut logged EVERY exec allocation and fired 52 times in
+     * ml287, each a dprintf(2) syscall inside NtAllocateVirtualMemory. CEF's own depth then
+     * dropped from 8 verbose lines (pref_proxy_config_tracker, 3 runs running) to 4
+     * (VariationsSetupComplete, 2 runs running) exactly when that probe shipped. Two runs is
+     * not proof against variance, but a probe that may perturb what it measures has to go on
+     * a diet -- and its finding is already banked: exec allocations DO happen, the two 16MB
+     * PAGE_EXECUTE_READWRITE ones get no [jit-pool] anon RWX carve, and there is no
+     * EXHAUSTED. Only the large ones carry information, so log those. */
+    /* ml290: re-widened to ALL sizes (cap 20).
+     *
+     * [guest-caller] named the caller of the recurring fault: chrome_elf.dll (+0x6c4a2 on
+     * two different threads, plus +0xd7d6e and +0x10d4c0). chrome_elf is Chromium's early
+     * loader, and its job is installing INTERCEPTION THUNKS -- it patches ntdll entry points
+     * to jump into thunk memory it allocates itself. If that memory is not executable, the
+     * first call through a hooked function lands on a non-executable page: our fault
+     * exactly, at a stable small offset, and unrelated to proxying (ruled out in ml290 --
+     * the fault still fired 23x with --no-proxy-server active).
+     *
+     * The >=1MB narrowing I applied in ml288 hides precisely the evidence needed, because
+     * interception allocations are ONE PAGE each -- e.g. the three consecutive
+     * req_addr=0x73d172{c,d,e}000 size=0x1000 protect=0x40 requests seen earlier, at
+     * explicit addresses in the ntdll band. Cap 20 keeps the syscall cost far below the 52
+     * of the first cut while restoring the small-allocation signal, so each request can be
+     * matched against the [jit-pool] anon RWX carves that follow. */
+    if (protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+    {
+        static int execalloc_n;
+        if (execalloc_n < 20)
+        {
+            execalloc_n++;
+            dprintf( 2, "[exec-alloc] %s #%d req_addr=%p size=0x%llx type=0x%x protect=0x%x\n",
+                     "NtAllocateVirtualMemory", execalloc_n, ret ? *ret : NULL,
+                     (unsigned long long)(size_ptr ? *size_ptr : 0), type, protect );
+        }
+    }
+#endif
 
 #ifdef WINE_IOS
     {
@@ -11620,6 +11941,55 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
         if (is_jumbo) ios_jumbo_census( jumbo_hint, jumbo_size, st ? NULL : *ret, (unsigned)st );
         if (!st && *size_ptr >= 0x10000000 && *size_ptr < 0x40000000 && (type & MEM_RESERVE))
             ios_bigres_note( *ret, *size_ptr );
+
+        /* iOS-Mythic ml310 (task #54): SYSCALL-BOUNDARY census of arena-band allocations.
+         *
+         * ml310's [va-arena] probe inside allocate_virtual_memory's reserve branch logged 26 lines,
+         * ALL of them size=0x20000000 type=0x2000 (jemalloc's MEM_RESERVE-only arenas) and NOT ONE
+         * of the 0x3000 FEXMem_ThreadState allocations -- even though three of those landed on
+         * duplicate addresses that run (0x7d00001000, 0x7d80001000, 0x7ea0001000). So the small
+         * MEM_COMMIT|MEM_RESERVE|MEM_TOP_DOWN allocations that actually collide are served by some
+         * other path and that probe can never see them.
+         *
+         * Log here instead, at the syscall exit, where *ret is final no matter which internal route
+         * produced it (normal allocate_virtual_memory, the steer retry ladder, the soft-pool commit
+         * path, or the jumbo hint fallback). Placed in BOTH NtAllocateVirtualMemory and
+         * NtAllocateVirtualMemoryEx because FEX's ARM64EC AllocatorHooks calls ::VirtualAlloc2, so
+         * the Ex variant is the one FEX actually uses. Reports size/type/tid plus whether the
+         * address falls inside a live ios_steer[] reservation. */
+        /* ml311: gate on MEM_RESERVE. The ml310 cut logged every arena-band result and the 60-line
+         * cap was consumed entirely by tid 006c's MEM_COMMIT-only (type=0x1000) 64KB commits
+         * marching through its own jemalloc reservation -- all legitimate, and none of them the
+         * FEXMem_ThreadState allocation being hunted, which carries
+         * MEM_COMMIT|MEM_RESERVE|MEM_TOP_DOWN (0x103000). Reserving allocations are the only ones
+         * that can CHOOSE an address, so they are the only ones that can collide. */
+        if (!st && *ret && (uint64_t)(uintptr_t)*ret >= 0x7C00000000ULL)
+        {
+            static int nc;
+            uint64_t nb = (uint64_t)(uintptr_t)*ret;
+            unsigned i, hit = (unsigned)-1;
+            for (i = 0; i < ios_steer_n; i++)
+            {
+                if (!ios_steer[i].base) continue;
+                if (nb < ios_steer[i].base || nb >= ios_steer[i].base + ios_steer[i].size) continue;
+                hit = i; break;
+            }
+            /* ml312: mark the arena in use for EVERY allocation that lands in it, reserving or
+             * committing alike -- a commit is just as much a claim on the memory as a reserve, and
+             * the reclaim must not recycle either. Note this runs unconditionally, outside the
+             * logging cap, so the flag can never depend on how much has been printed. */
+            if (hit != (unsigned)-1 && nb != ios_steer[hit].base) ios_steer[hit].inuse = 1;
+
+            if ((type & MEM_RESERVE) && nc++ < 80)
+            {
+                dprintf( 2, "[va-exit] rev=ml312 %p+0x%lx type=0x%x tid=%04x steer=%s%u freed=%u steer_n=%u\n",
+                         *ret, (unsigned long)*size_ptr, (unsigned)type,
+                         NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0,
+                         hit == (unsigned)-1 ? "NONE#" : "INSIDE#",
+                         hit == (unsigned)-1 ? ios_steer_n : hit,
+                         hit == (unsigned)-1 ? 0 : ios_steer[hit].freed, ios_steer_n );
+            }
+        }
         return st;
     }
 #else
@@ -11723,6 +12093,58 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
     ULONG attributes = 0;
     USHORT machine = 0;
     unsigned int status;
+#ifdef WINE_IOS
+    /* ml284: does ANYTHING allocate/commit executable memory, and where?
+     *
+     * There is already an exec-allocation probe here using ERR(), but the `virtual` debug
+     * channel is filtered by MYTHIC_QUIET -- err:virtual: appears ZERO times in the logs,
+     * including the uncapped first-30 lines it should always emit. So its silence carries
+     * no information, and I must not read "no exec allocations happen" from it. (That is
+     * the same mistake as the [unexec] probe, whose filters made me wrongly retract the
+     * V8-code-space theory.) Working probes on this side all use raw dprintf(2) --
+     * [iat-sync], [jit-pool], [steer], [x86-ptr] -- so use that.
+     *
+     * Covers BOTH allocate entry points: [exec-req] hooks only NtProtectVirtualMemory, but
+     * VirtualAlloc(MEM_COMMIT, PAGE_EXECUTE_READWRITE) grants exec through
+     * NtAllocateVirtualMemory, and VirtualAlloc2/placeholders through the Ex variant --
+     * which V8 commonly uses for its code cage. Unfiltered by address, capped only by
+     * count, so silence here really does mean "never requested". */
+    /* ml288: narrowed. The first cut logged EVERY exec allocation and fired 52 times in
+     * ml287, each a dprintf(2) syscall inside NtAllocateVirtualMemory. CEF's own depth then
+     * dropped from 8 verbose lines (pref_proxy_config_tracker, 3 runs running) to 4
+     * (VariationsSetupComplete, 2 runs running) exactly when that probe shipped. Two runs is
+     * not proof against variance, but a probe that may perturb what it measures has to go on
+     * a diet -- and its finding is already banked: exec allocations DO happen, the two 16MB
+     * PAGE_EXECUTE_READWRITE ones get no [jit-pool] anon RWX carve, and there is no
+     * EXHAUSTED. Only the large ones carry information, so log those. */
+    /* ml290: re-widened to ALL sizes (cap 20).
+     *
+     * [guest-caller] named the caller of the recurring fault: chrome_elf.dll (+0x6c4a2 on
+     * two different threads, plus +0xd7d6e and +0x10d4c0). chrome_elf is Chromium's early
+     * loader, and its job is installing INTERCEPTION THUNKS -- it patches ntdll entry points
+     * to jump into thunk memory it allocates itself. If that memory is not executable, the
+     * first call through a hooked function lands on a non-executable page: our fault
+     * exactly, at a stable small offset, and unrelated to proxying (ruled out in ml290 --
+     * the fault still fired 23x with --no-proxy-server active).
+     *
+     * The >=1MB narrowing I applied in ml288 hides precisely the evidence needed, because
+     * interception allocations are ONE PAGE each -- e.g. the three consecutive
+     * req_addr=0x73d172{c,d,e}000 size=0x1000 protect=0x40 requests seen earlier, at
+     * explicit addresses in the ntdll band. Cap 20 keeps the syscall cost far below the 52
+     * of the first cut while restoring the small-allocation signal, so each request can be
+     * matched against the [jit-pool] anon RWX carves that follow. */
+    if (protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+    {
+        static int execalloc_n;
+        if (execalloc_n < 20)
+        {
+            execalloc_n++;
+            dprintf( 2, "[exec-alloc] %s #%d req_addr=%p size=0x%llx type=0x%x protect=0x%x\n",
+                     "NtAllocateVirtualMemoryEx", execalloc_n, ret ? *ret : NULL,
+                     (unsigned long long)(size_ptr ? *size_ptr : 0), type, protect );
+        }
+    }
+#endif
 
     TRACE( "%p %p %08lx %x %08x %p %u\n",
           process, *ret, *size_ptr, type, protect, parameters, count );
@@ -12021,6 +12443,55 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         if (is_jumbo) ios_jumbo_census( jumbo_hint, jumbo_size, st ? NULL : *ret, (unsigned)st );
         if (!st && *size_ptr >= 0x10000000 && *size_ptr < 0x40000000 && (type & MEM_RESERVE))
             ios_bigres_note( *ret, *size_ptr );
+
+        /* iOS-Mythic ml310 (task #54): SYSCALL-BOUNDARY census of arena-band allocations.
+         *
+         * ml310's [va-arena] probe inside allocate_virtual_memory's reserve branch logged 26 lines,
+         * ALL of them size=0x20000000 type=0x2000 (jemalloc's MEM_RESERVE-only arenas) and NOT ONE
+         * of the 0x3000 FEXMem_ThreadState allocations -- even though three of those landed on
+         * duplicate addresses that run (0x7d00001000, 0x7d80001000, 0x7ea0001000). So the small
+         * MEM_COMMIT|MEM_RESERVE|MEM_TOP_DOWN allocations that actually collide are served by some
+         * other path and that probe can never see them.
+         *
+         * Log here instead, at the syscall exit, where *ret is final no matter which internal route
+         * produced it (normal allocate_virtual_memory, the steer retry ladder, the soft-pool commit
+         * path, or the jumbo hint fallback). Placed in BOTH NtAllocateVirtualMemory and
+         * NtAllocateVirtualMemoryEx because FEX's ARM64EC AllocatorHooks calls ::VirtualAlloc2, so
+         * the Ex variant is the one FEX actually uses. Reports size/type/tid plus whether the
+         * address falls inside a live ios_steer[] reservation. */
+        /* ml311: gate on MEM_RESERVE. The ml310 cut logged every arena-band result and the 60-line
+         * cap was consumed entirely by tid 006c's MEM_COMMIT-only (type=0x1000) 64KB commits
+         * marching through its own jemalloc reservation -- all legitimate, and none of them the
+         * FEXMem_ThreadState allocation being hunted, which carries
+         * MEM_COMMIT|MEM_RESERVE|MEM_TOP_DOWN (0x103000). Reserving allocations are the only ones
+         * that can CHOOSE an address, so they are the only ones that can collide. */
+        if (!st && *ret && (uint64_t)(uintptr_t)*ret >= 0x7C00000000ULL)
+        {
+            static int nc;
+            uint64_t nb = (uint64_t)(uintptr_t)*ret;
+            unsigned i, hit = (unsigned)-1;
+            for (i = 0; i < ios_steer_n; i++)
+            {
+                if (!ios_steer[i].base) continue;
+                if (nb < ios_steer[i].base || nb >= ios_steer[i].base + ios_steer[i].size) continue;
+                hit = i; break;
+            }
+            /* ml312: mark the arena in use for EVERY allocation that lands in it, reserving or
+             * committing alike -- a commit is just as much a claim on the memory as a reserve, and
+             * the reclaim must not recycle either. Note this runs unconditionally, outside the
+             * logging cap, so the flag can never depend on how much has been printed. */
+            if (hit != (unsigned)-1 && nb != ios_steer[hit].base) ios_steer[hit].inuse = 1;
+
+            if ((type & MEM_RESERVE) && nc++ < 80)
+            {
+                dprintf( 2, "[va-exit] rev=ml312 %p+0x%lx type=0x%x tid=%04x steer=%s%u freed=%u steer_n=%u\n",
+                         *ret, (unsigned long)*size_ptr, (unsigned)type,
+                         NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0,
+                         hit == (unsigned)-1 ? "NONE#" : "INSIDE#",
+                         hit == (unsigned)-1 ? ios_steer_n : hit,
+                         hit == (unsigned)-1 ? 0 : ios_steer[hit].freed, ios_steer_n );
+            }
+        }
         return st;
     }
 #else

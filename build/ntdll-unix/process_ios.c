@@ -973,18 +973,147 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
              * The new buffer intentionally leaks (once per helper launch);
              * RtlDestroyProcessParameters only frees the params block itself. */
             {
-                static const char sp[] = " --single-process";
+                /* ml279: also raise CEF's OWN verbosity.
+                 *
+                 * Across every run that reached CEF init, cef_log.txt ends on the SAME four
+                 * lines -- chrome_main_delegate / process_singleton_win / os_crypt_win /
+                 * network_change_notifier_win -- and then goes silent. A consistent stopping
+                 * point (not scattered crash sites) says CEF is getting somewhere specific
+                 * and dying there, but Chromium's default verbosity only emits WARNING and
+                 * ERROR, so whatever it attempts next is simply never written down.
+                 *
+                 * --enable-logging routes Chromium's logging to the --log-file it already
+                 * has, and --v=1 turns on VLOG(1) across the codebase, which covers browser
+                 * startup, CefBrowserHost creation and the compositor bring-up -- exactly
+                 * the stretch after network_change_notifier that we cannot currently see.
+                 * Cheap: one command-line append, no code paths changed, and if CEF dies at
+                 * the same place the log now says what it was doing. */
+                /* ml281: it must be --enable-logging=FILE, not bare --enable-logging.
+                 *
+                 * Bare --enable-logging makes Chromium log to STDERR and ignore --log-file.
+                 * The verbose output WAS produced -- the user saw it filling a rendered
+                 * conhost window in the virtual desktop -- but cef_log.txt received only
+                 * the usual 4 WARNING/ERROR lines, so none of it was readable by us. (The
+                 * 58 INFO/VERBOSE lines already in that file are all stamped 0428/, from
+                 * whatever Windows box this Steam install was copied off.)
+                 * --enable-logging=file routes the same output through the --log-file the
+                 * command line already carries, which we can pull. */
+                /* ml282: add --log-severity=verbose.
+                 *
+                 * --enable-logging=file --v=1 still produced ONLY 2 WARNING + 2 ERROR lines.
+                 * That severity profile is itself the diagnosis: it is exactly
+                 * LOGSEVERITY_WARNING, which is a CefSettings field the HOST APP sets, and
+                 * CefSettings overrides Chromium's --v. So Steam is capping CEF's logging.
+                 *
+                 * CEF reads the --log-severity switch when the app leaves log_severity at
+                 * LOGSEVERITY_DEFAULT, and Steam's own webhelper command line does NOT pass
+                 * one (checked in webhelper.txt), so this may be honoured. If the next run
+                 * still shows only WARNING/ERROR then Steam sets log_severity explicitly and
+                 * no command line can raise it -- at which point the answer is to capture
+                 * the webhelper's STDERR instead, which we know carries the output because it
+                 * was visibly filling a rendered conhost window. */
+                /* ml287: steer proxy resolution AWAY from the in-process V8 PAC resolver.
+                 *
+                 * CEF's own verbose trace dies immediately after
+                 *   pref_proxy_config_tracker_impl.cc(191) set chrome proxy config service
+                 * and the fault is libcef.dll+0x59ef805 calling a pointer into a private
+                 * PAGE_READWRITE PartitionAlloc region -- memory nothing ever requested
+                 * execute on ([exec-req]: 5 requests, all succeeded, none in that band).
+                 *
+                 * On Windows Chromium resolves proxies either through WinHTTP or through a
+                 * V8-based PAC resolver, and under --single-process that resolver runs
+                 * IN-PROCESS. Starting V8 means JIT, which needs executable memory we cannot
+                 * grant on iOS -- so a call into a non-executable region right after proxy
+                 * setup is exactly what that would look like.
+                 *
+                 * --no-proxy-server disables proxy resolution outright (Steam connects
+                 * directly here), and --winhttp-proxy-resolver forces the WinHTTP path
+                 * instead of the V8 one if anything still resolves. Two flags, no code
+                 * change: if the webhelper now survives past proxy setup, the diagnosis is
+                 * confirmed and V8 is the wall; if it dies identically, V8/PAC is ruled out
+                 * and the bad pointer is unrelated to proxying. */
+                /* ml297 CORRECTION to the block above: the "private PAGE_READWRITE
+                 * PartitionAlloc region" attribution was WRONG. ml293/294 showed those 512MB
+                 * regions are FEX's OWN host reservations (all 23 [bigres] requests carry guest
+                 * rsp=0/rip=0, two per thread at FEX thread init), and ml294's [vname] map proves
+                 * FEXMem_ThreadState is the only NAMED region in that band. The V8/PAC theory was
+                 * also refuted: the fault fired 23 times with --no-proxy-server already active.
+                 * The flags stay (harmless, and they do force the WinHTTP path), but they are not
+                 * the fix and the comment above should not be read as a live diagnosis.
+                 *
+                 * ml297 NEW TEST -- PartitionAlloc BackupRefPtr.
+                 *
+                 * ml296 got the deepest run yet (8,616 lines, 230 modules, ZERO 0xc0000005) and
+                 * died instead with 0xc000001d = STATUS_ILLEGAL_INSTRUCTION at chrome_elf.dll
+                 * +0xd7d70 -- which offline disassembly had already identified as a bare `ud2`,
+                 * i.e. Chromium's IMMEDIATE_CRASH(), reached from a CHECK site that loads 0xAA
+                 * poison and the string "refcount". That is PartitionAlloc's BackupRefPtr refcount
+                 * integrity check. It never appears in cef_log.txt because IMMEDIATE_CRASH traps
+                 * without logging, so Chromium's own log can never explain it.
+                 *
+                 * BRP is a security hardening feature, not a functional requirement, and it is
+                 * runtime-gated by the PartitionAllocBackupRefPtr base::Feature. Disabling it
+                 * removes the DETECTOR, not whatever corrupts the refcount -- so this is a
+                 * diagnostic, not a fix, and if it works the underlying corruption (most likely a
+                 * mis-emulated atomic RMW on PA's pool at 0x78xxxxxxxx -- note our atomic probes
+                 * only ever fire on faults, so a silently-wrong-but-successful atomic would be
+                 * invisible) still has to be found. Both outcomes are informative: surviving past
+                 * the ud2 confirms refcount integrity is the wall, while dying identically means
+                 * the ud2 is not BRP and the CHECK must be re-identified.
+                 *
+                 * HAZARD this must avoid: Steam ALREADY passes --disable-features=...,DcheckIsFatal,
+                 * ... and Chromium's CommandLine takes the LAST occurrence of a switch. Appending a
+                 * second --disable-features= would silently override Steam's whole list and make
+                 * DCHECKs fatal, inventing new crashes and corrupting the experiment. So splice
+                 * into the existing value instead of adding a switch. */
+                static const char sp[] = " --single-process --enable-logging=file --v=1 --log-severity=verbose"
+                                         " --no-proxy-server --winhttp-proxy-resolver";
+                static const char dfs[] = "--disable-features=";
+                static const char brp[] = ",PartitionAllocBackupRefPtr";
                 int sl = sizeof(sp) - 1;
-                WCHAR *nbuf = malloc( (cl_len + sl + 1) * sizeof(WCHAR) );
+                int dfl = sizeof(dfs) - 1, bl = sizeof(brp) - 1;
+                int df_end = -1;
+                {
+                    int p, k;
+                    for (p = 0; p + dfl <= (int)cl_len; p++)
+                    {
+                        for (k = 0; k < dfl; k++) if (cl[p + k] != (WCHAR)dfs[k]) break;
+                        if (k == dfl)
+                        {
+                            df_end = p + dfl;
+                            while (df_end < (int)cl_len && cl[df_end] != ' ' && cl[df_end] != '"') df_end++;
+                            break;
+                        }
+                    }
+                }
+                if (df_end < 0) bl = 0;   /* no existing list -> splice nothing, report it */
+                WCHAR *nbuf = malloc( (cl_len + bl + sl + 1) * sizeof(WCHAR) );
                 if (nbuf)
                 {
-                    memcpy( nbuf, cl, cl_len * sizeof(WCHAR) );
-                    for (j = 0; j < sl; j++) nbuf[cl_len + j] = (WCHAR)sp[j];
-                    nbuf[cl_len + sl] = 0;
+                    int o = 0;
+                    if (bl)
+                    {
+                        memcpy( nbuf, cl, df_end * sizeof(WCHAR) );
+                        o = df_end;
+                        for (j = 0; j < bl; j++) nbuf[o++] = (WCHAR)brp[j];
+                        memcpy( nbuf + o, cl + df_end, (cl_len - df_end) * sizeof(WCHAR) );
+                        o += (int)cl_len - df_end;
+                    }
+                    else
+                    {
+                        memcpy( nbuf, cl, cl_len * sizeof(WCHAR) );
+                        o = (int)cl_len;
+                    }
+                    for (j = 0; j < sl; j++) nbuf[o++] = (WCHAR)sp[j];
+                    nbuf[o] = 0;
                     params->CommandLine.Buffer = nbuf;
-                    params->CommandLine.Length = (cl_len + sl) * sizeof(WCHAR);
+                    params->CommandLine.Length = o * sizeof(WCHAR);
                     params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
-                    dprintf(2, "[proc-gate] steamwebhelper: injected --single-process (task #34)\n");
+                    dprintf(2, "[proc-gate] steamwebhelper: injected --single-process + CEF verbosity"
+                               " + no-proxy; BRP-disable %s (ml297)\n",
+                            bl ? "SPLICED into Steam's existing --disable-features list"
+                               : "NOT applied (no --disable-features found -- refusing to add a "
+                                 "second one, it would override Steam's list)");
                 }
             }
         }

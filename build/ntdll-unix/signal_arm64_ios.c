@@ -1602,6 +1602,19 @@ static void *ios_mach_exception_thread( void *arg )
                          * surface the fault instead of corrupting it away. */
                         extern unsigned long long ios_jit_module_base_for_va( unsigned long long va,
                                                                               unsigned long long *size_out );
+                        /* ml306 (task #53): capture Wine's committed-state BEFORE recovery mutates
+                         * anything. This is THE discriminator for whether zero-fill is safe here:
+                         *   VPROT_COMMITTED (0x20) set  -> page held live data; zeros = DATA LOSS or
+                         *                                  a masked use-after-free. ml305's fatal
+                         *                                  (null+0x90 through a pointer read from
+                         *                                  this band, [reclaim-recover] firing
+                         *                                  mid-exception) is the suspected result.
+                         *   clear                       -> lazy-reservation first touch; zeros are
+                         *                                  the contract and recovery is benign.
+                         * Measurement only for now -- behaviour unchanged until at least one run
+                         * says how the 2-4 events per run split. */
+                        extern unsigned char ios_reclaim_page_vprot( unsigned long long va );
+                        unsigned char pg_vprot = ios_reclaim_page_vprot( pg );
                         unsigned long long mod_size = 0;
                         unsigned long long mod_base = ios_jit_module_base_for_va( pg, &mod_size );
                         int mpr = mprotect( (void *)(uintptr_t)pg, RR_PAGE, PROT_READ | PROT_WRITE );
@@ -1627,9 +1640,11 @@ static void *ios_mach_exception_thread( void *arg )
                         int rcn = __sync_fetch_and_add(&rc, 1);
                         if (rcn < 40 || (rcn % 50) == 0)
                             dprintf(STDERR_FILENO,
-                                "[reclaim-recover] pg=0x%llx fault=0x%llx mprotect=%d(errno=%d) mmap=%d reuse-cancel=%d retry#%u\n",
+                                "[reclaim-recover] pg=0x%llx fault=0x%llx mprotect=%d(errno=%d) mmap=%d reuse-cancel=%d retry#%u vprot=0x%02x %s\n",
                                 (unsigned long long)pg, (unsigned long long)fa, mpr, errno_save,
-                                used_mmap, reuse, rr_n[s]);
+                                used_mmap, reuse, rr_n[s], pg_vprot,
+                                (pg_vprot & 0x20) ? "WAS-COMMITTED(zeros=DATA-LOSS/UAF!)"
+                                                  : "not-committed(lazy first touch, zeros OK)");
                         if (mpr == 0 || used_mmap) handled = 1;
                     }
                 }
@@ -4603,6 +4618,63 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                         for (i = 0; i < 24; i += 6)
                             ERR("  [emit-dump]   +%-4d %08x %08x %08x %08x %08x %08x\n",
                                 (i - 12) * 4, w[i], w[i+1], w[i+2], w[i+3], w[i+4], w[i+5]);
+                    }
+                }
+                /* ml270 (#48): WHERE does the corrupt guest RSP come from?
+                 *
+                 * Signature across runs: RSP alone is garbage while the other guest
+                 * registers stay valid -- "plausible-ptr gregs=11/16", and the probe's own
+                 * legend reads "high => only rsp clobbered". The bad value is structured,
+                 * not random:
+                 *   ml260 rsp=0x40001131  addr=0x40001131  addr=0xe0001131
+                 *   ml270 rsp=0x80001131  addr=0x80001131
+                 * low 28 bits constant at 0x0001131, only the TOP NIBBLE varies (4/8/e) --
+                 * which is where ARM64 NZCV lives (4=Z, 8=N, e=NZC).
+                 *
+                 * In ARM64EC guest RSP is SRA register x23, spilled/filled via
+                 * State.gregs[RSP]. Three outcomes need different fixes:
+                 *   x23 garbage but gregs[RSP] VALID  -> a fill/spill bug clobbered the reg
+                 *   both garbage                       -> corruption happened earlier
+                 *   top nibble == flags[24] (NZCV)     -> a FLAGS word is being used as RSP
+                 * Print all three rather than pattern-matching hex, which has misled before. */
+                {
+                    static int rspq;
+                    /* Get the TEB the same way the [tsd275] dump above does — a POSIX
+                     * signal handler has no mach thread_t to hand, and x18 is zero here. */
+                    uintptr_t tsd_r;
+                    uintptr_t teb_r;
+                    __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_r));
+                    tsd_r &= ~7ULL;
+                    teb_r = (uintptr_t)*(void **)(tsd_r + 275 * 8);
+
+                    if (rspq < 6 && teb_r)
+                    {
+                        void *cpuarea_r = *(void**)(teb_r + 0x1788);
+                        if (cpuarea_r)
+                        {
+                            uint64_t *frame_r = *(uint64_t**)((char*)cpuarea_r + 0x30);
+                            if (frame_r)
+                            {
+                                rspq++;
+                                /* ml272: offsets CONFIRMED from FEX's own [state-offsets]
+                                 * line -- rip=0x18 gregs=0x20 gregs[RSP]=0x40
+                                 * callret_sp=0xb0 callret_sp_base=0xb8 flags=0x3f0.
+                                 * The first cut of this probe read gregs[RSP] at 0x28,
+                                 * which is gregs[1] = RCX, so every "gregs[RSP]=0" it
+                                 * printed was meaningless. Also print callret_sp, since
+                                 * the dispatcher's `ldr x17,[x28,#176]` reads exactly
+                                 * that field and x17==0 is the #42 storm's trigger. */
+                                ERR("  [rsp-forensics] x23(SRA RSP)=%p  gregs[RSP]=%p  "
+                                    "NZCV/flags[24]=0x%08x  callret_sp=%p base=%p  x28=%p%s\n",
+                                    (void*)(uintptr_t)REGn_sig(23, context),
+                                    (void*)(uintptr_t)frame_r[0x40/8],
+                                    (unsigned)((uint32_t*)frame_r)[0x408/4],
+                                    (void*)(uintptr_t)frame_r[0xb0/8],
+                                    (void*)(uintptr_t)frame_r[0xb8/8],
+                                    (void*)frame_r,
+                                    frame_r[0xb0/8] ? "" : "  <== callret_sp is ZERO (#42 trigger)");
+                            }
+                        }
                     }
                 }
                 ERR("  insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",

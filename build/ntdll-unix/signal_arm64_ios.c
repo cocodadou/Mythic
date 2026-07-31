@@ -1143,6 +1143,46 @@ static void *ios_mach_exception_thread( void *arg )
                 } else {
                     rw_addr = ios_jit_anon_alias_lookup(fault_addr);
                 }
+                /* ml348 DISCRIMINATOR: a write fault with NO alias is a
+                 * different bug from a write fault whose instruction we can't
+                 * decode, and the two need opposite fixes. Without this the
+                 * handler just declines and the thread spins on one address
+                 * (ml347). Report which case it is, plus the page's ACTUAL
+                 * protection — "r-x, no alias" names an exec-downgraded page
+                 * that never got dual-mapped. Capped. */
+                if (!rw_addr && (uintptr_t)fault_pc >= 0x100000000ULL)
+                {
+                    static int noalias_n;
+                    if (noalias_n < 8)
+                    {
+                        mach_vm_address_t na = (mach_vm_address_t)fault_addr;
+                        mach_vm_size_t ns = 0;
+                        vm_region_basic_info_data_64_t ni;
+                        mach_msg_type_number_t nc = VM_REGION_BASIC_INFO_COUNT_64;
+                        mach_port_t no = MACH_PORT_NULL;
+                        uint32_t ninsn = 0;
+                        mach_vm_size_t ngot = 0;
+                        noalias_n++;
+                        mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)fault_pc, 4,
+                                               (mach_vm_address_t)&ninsn, &ngot);
+                        if (mach_vm_region(mach_task_self(), &na, &ns, VM_REGION_BASIC_INFO_64,
+                                           (vm_region_info_t)&ni, &nc, &no) == KERN_SUCCESS)
+                            dprintf(STDERR_FILENO,
+                                "[store-noalias] #%d rev=ml348 addr=0x%llx insn=0x%08x pc=0x%llx "
+                                "NO pool/anon alias | region 0x%llx+0x%llx prot=%d max=%d "
+                                "(prot without W = exec-downgraded page that never got dual-mapped)\n",
+                                noalias_n, (unsigned long long)fault_addr, ninsn,
+                                (unsigned long long)fault_pc,
+                                (unsigned long long)na, (unsigned long long)ns,
+                                ni.protection, ni.max_protection);
+                        else
+                            dprintf(STDERR_FILENO,
+                                "[store-noalias] #%d rev=ml348 addr=0x%llx insn=0x%08x pc=0x%llx "
+                                "NO alias and NO region (unmapped) — genuine bad pointer\n",
+                                noalias_n, (unsigned long long)fault_addr, ninsn,
+                                (unsigned long long)fault_pc);
+                    }
+                }
                 if (rw_addr && (uintptr_t)fault_pc >= 0x100000000ULL)
                 {
                     uint32_t insn = *(uint32_t *)(uintptr_t)fault_pc;
@@ -1438,6 +1478,39 @@ static void *ios_mach_exception_thread( void *arg )
                             memcpy((void *)rw_addr, &neon_state.__v[rt], 16);
                             emulated = 1;
                         }
+                    }
+                    /* ml350: STRB (register offset): 0011 1000 001 Rm opt S 10 Rn Rt
+                     * (mask 0xffe00c00, val 0x38200800). FEX's own STLRB backpatch
+                     * rewrites to DMB+`strb wN,[xM,xzr]` — chrome_elf writing its
+                     * interception thunk bytes to an anon-RWX page hit this and
+                     * looped (ml349: insn 0x383f68c8). fault_addr is already the
+                     * final address; no base/offset math needed. */
+                    else if ((insn & 0xffe00c00) == 0x38200800)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint8_t *)rw_addr = (uint8_t)state.__x[rt];
+                        emulated = 1;
+                    }
+                    /* ml350: STRH (register offset): 0111 1000 001 ... (val 0x78200800) */
+                    else if ((insn & 0xffe00c00) == 0x78200800)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint16_t *)rw_addr = (uint16_t)state.__x[rt];
+                        emulated = 1;
+                    }
+                    /* ml350 DISCRIMINATOR: alias EXISTS but the instruction is not
+                     * in this decode list — every such miss previously cost a full
+                     * run to name (ml349's STRB-reg took one). Print the insn so
+                     * the next gap is a one-line diagnosis. Capped. */
+                    if (!emulated)
+                    {
+                        static int undecoded_n;
+                        if (undecoded_n < 8)
+                            dprintf(STDERR_FILENO,
+                                "[store-undecoded] #%d rev=ml350 insn=0x%08x pc=0x%llx addr=0x%llx "
+                                "rw_addr=0x%llx — alias OK, ADD THIS ENCODING to the case-4 emulator\n",
+                                ++undecoded_n, insn, (unsigned long long)fault_pc,
+                                (unsigned long long)fault_addr, (unsigned long long)rw_addr);
                     }
                     if (emulated)
                     {
@@ -2593,7 +2666,7 @@ skip_reclaim_band: ;
                                     off += n;
                                 }
                                 close(fd);
-                                dprintf(STDERR_FILENO, "[mach_exc] DUMPED JIT pool RW alias (%zd bytes) to %s\n", off, path);
+                                dprintf(STDERR_FILENO, "[mach_exc] DUMPED JIT pool RW alias (%zd bytes) to %s rev=ml347\n", off, path);
                             }
                             else
                             {
@@ -3017,15 +3090,23 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
         ios_thread_registry[idx].trampoline = trampoline;
     }
 
-    /* Set exception port for this thread (shared port) */
+    /* Set exception port for this thread (shared port).
+     * ml353: also claim EXC_BAD_INSTRUCTION. udf-class faults (executing
+     * zeroed/garbage memory) previously bypassed us entirely and went
+     * straight to StikDebug's task port — the app log was BLIND to the
+     * instant-vanish deaths (ml351/ml354); only a hand-captured StikDebug
+     * console named the pc. With the mask widened, the UNHANDLED dump
+     * (pool-ledger, owner, insn stream, backtrace) self-documents them
+     * before the decline escalates. EXC_BREAKPOINT (BRK JIT protocol) is a
+     * DIFFERENT mask bit and still flows to StikDebug untouched. */
     kern_return_t kr = thread_set_exception_ports( pe_thread,
-                                      EXC_MASK_BAD_ACCESS,
+                                      EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION,
                                       ios_exc_port,
                                       (exception_behavior_t)(EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES),
                                       ARM_THREAD_STATE64 );
     if (kr != KERN_SUCCESS) { ERR("mach exc set ports: kr=%d thread=0x%x\n", kr, pe_thread); return; }
 
-    ERR("Mach exception handler registered thread 0x%x (idx=%d), teb=%p tramp=%p usd=%p\n",
+    ERR("Mach exception handler registered thread 0x%x (idx=%d), teb=%p tramp=%p usd=%p mask=ba+bi rev=ml353\n",
         pe_thread, idx, (void*)teb, trampoline, (void*)ios_exc_usd);
 }
 #endif
@@ -5642,7 +5723,19 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     }
 
 bus_fatal:
-    ERR("BUS at pc=%p addr=%p exec=%d\n", pc, siginfo->si_addr, is_exec_fault);
+    if (is_exec_fault)
+    {
+        /* ml345: an instruction-fetch abort on a readable-but-NX page arrives
+         * as SIGBUS (KERN_PROTECTION_FAILURE), but it is an EXECUTE access
+         * violation, not a data-alignment fault. Raising 80000002 here sent
+         * FEX's unaligned-atomic handler decoding DATA bytes at the bogus pc
+         * as atomics (ml344 "Unhandled non-JIT atomic" death). */
+        rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        rec.NumberParameters = 2;
+        rec.ExceptionInformation[0] = EXCEPTION_EXECUTE_FAULT;
+        rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
+    }
+    ERR("BUS at pc=%p addr=%p exec=%d rev=ml345\n", pc, siginfo->si_addr, is_exec_fault);
 #endif
     setup_exception( sigcontext, &rec );
 }
@@ -6713,21 +6806,52 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
 /* Best-effort PE module name from the export directory at pe_base (the
  * original unix-view image stays mapped). Returns "(exe)" for images
  * without exports, "?" when headers look wrong. */
+/* ml347: FAULT-SAFE. This runs on the Mach exception handler thread while a
+ * module may be mid-load (PE pages unreadable). The old raw derefs nested-
+ * faulted the handler thread inside its own dump loop — no reply ever sent,
+ * original faulting thread parked (ml345) or the debugger killed the app
+ * (ml346). Every read goes through mach_vm_read_overwrite. */
 static const char *ios_pe_module_name( uint64_t base )
 {
-    const unsigned char *p = (const unsigned char *)(uintptr_t)base;
-    uint32_t e_lfanew, exp_rva, name_rva;
+    static char namebuf[64];   /* single exception-handler thread only */
+    unsigned char hdr[2];
+    uint32_t e_lfanew = 0, pe_sig = 0, exp_rva = 0, name_rva = 0;
+    mach_vm_size_t got = 0;
+    uint64_t name_addr, page_left, want;
 
     if (!base) return "?";
-    if (p[0] != 'M' || p[1] != 'Z') return "?";
-    e_lfanew = *(const uint32_t *)(p + 0x3c);
+    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)base, 2,
+                               (mach_vm_address_t)hdr, &got) != KERN_SUCCESS || got != 2)
+        return "?";
+    if (hdr[0] != 'M' || hdr[1] != 'Z') return "?";
+    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(base + 0x3c), 4,
+                               (mach_vm_address_t)&e_lfanew, &got) != KERN_SUCCESS || got != 4)
+        return "?";
     if (e_lfanew == 0 || e_lfanew > 0x1000) return "?";
-    if (memcmp(p + e_lfanew, "PE\0\0", 4)) return "?";
-    exp_rva = *(const uint32_t *)(p + e_lfanew + 0x88);   /* PE32+ export dir RVA */
+    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(base + e_lfanew), 4,
+                               (mach_vm_address_t)&pe_sig, &got) != KERN_SUCCESS || got != 4)
+        return "?";
+    if (pe_sig != 0x00004550) return "?";
+    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(base + e_lfanew + 0x88), 4,
+                               (mach_vm_address_t)&exp_rva, &got) != KERN_SUCCESS || got != 4)
+        return "?";
     if (!exp_rva || exp_rva > 0x10000000) return "(exe)";
-    name_rva = *(const uint32_t *)(p + exp_rva + 0x0c);
+    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(base + exp_rva + 0x0c), 4,
+                               (mach_vm_address_t)&name_rva, &got) != KERN_SUCCESS || got != 4)
+        return "(exe)";
     if (!name_rva || name_rva > 0x10000000) return "(exe)";
-    return (const char *)(p + name_rva);
+    /* Clamp the name read to the containing page so a mapped name page next
+     * to an unmapped one doesn't fail the whole read. */
+    name_addr = base + name_rva;
+    page_left = 0x4000 - (name_addr & 0x3fff);
+    want = sizeof(namebuf) - 1;
+    if (want > page_left) want = page_left;
+    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)name_addr, want,
+                               (mach_vm_address_t)namebuf, &got) != KERN_SUCCESS || got == 0)
+        return "(exe)";
+    namebuf[got < sizeof(namebuf) ? got : sizeof(namebuf) - 1] = 0;
+    namebuf[sizeof(namebuf) - 1] = 0;
+    return namebuf;
 }
 
 void ios_dump_all_thread_stacks(void)

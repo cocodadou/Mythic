@@ -149,6 +149,8 @@ struct ios_jit_mapping {
                          * entries may share one pe_base; translation picks
                          * the entry owned by the current thread's process,
                          * falling back to the NULL-owner (parent) entry. */
+    unsigned short machine_cached;  /* ml349: PE machine word, read fault-safely once */
+    unsigned char  machine_valid;   /* 0 = machine_cached not yet populated */
 };
 static struct ios_jit_mapping ios_jit_mappings[IOS_JIT_MAX_MAPPINGS];
 static int ios_jit_mapping_count = 0;
@@ -1896,6 +1898,8 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
         ios_jit_mappings[slot].reloc_rva = 0;
         ios_jit_mappings[slot].reloc_size = 0;
         ios_jit_mappings[slot].owner_peb = NULL;
+        ios_jit_mappings[slot].machine_cached = 0;   /* ml349: slot reuse invalidates memo */
+        ios_jit_mappings[slot].machine_valid = 0;
         __sync_synchronize();
         ios_jit_mappings[slot].pe_base = pe_base;
         if (slot == ios_jit_mapping_count) ios_jit_mapping_count++;
@@ -2374,10 +2378,37 @@ static int ios_va_is_x86_code( uint64_t va )
         off   = va - b;
         if (!t_sz || off < t_off || off >= t_off + t_sz) return 0;   /* data, not code */
 
-        img = (const unsigned char *)b;
-        e_lfanew = *(const unsigned int *)(img + 0x3C);
-        if (e_lfanew + 6 > sz) return 0;
-        return *(const unsigned short *)(img + e_lfanew + 4) == 0x8664;  /* IMAGE_FILE_MACHINE_AMD64 */
+        /* ml349: the header read must be FAULT-SAFE — a mapping whose PE
+         * header page is unmapped (freed private copy, decommitted image)
+         * wedged the [x86-ptr] scan thread forever right here (ml348:
+         * `ldr w1,[x0,#0x3c]` at 0x73e4a7003c, 8 identical faults, run
+         * killed). Read once per mapping slot via mach_vm_read_overwrite and
+         * memoize; ios_jit_add_mapping resets machine_valid on slot reuse.
+         * Unreadable header → treat as non-x86 (translation stays on, which
+         * is the correct behavior for EC/data and harmless for a dead copy). */
+        (void)img; (void)e_lfanew;
+        if (!ios_jit_mappings[i].machine_valid)
+        {
+            unsigned int lfanew = 0;
+            unsigned short mach = 0;
+            mach_vm_size_t got = 0;
+            if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(b + 0x3c), 4,
+                                       (mach_vm_address_t)&lfanew, &got) != KERN_SUCCESS || got != 4
+                || (size_t)lfanew + 6 > sz
+                || mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(b + lfanew + 4), 2,
+                                          (mach_vm_address_t)&mach, &got) != KERN_SUCCESS || got != 2)
+            {
+                static int hdr_unreadable_n;
+                if (hdr_unreadable_n < 8)
+                    dprintf(2, "[x86-ptr] rev=ml349 mapping pe_base=%p+0x%lx header UNREADABLE"
+                            " — classifying non-x86 (#%d)\n",
+                            (void *)b, (unsigned long)sz, ++hdr_unreadable_n);
+                mach = 0;
+            }
+            ios_jit_mappings[i].machine_cached = mach;
+            ios_jit_mappings[i].machine_valid = 1;
+        }
+        return ios_jit_mappings[i].machine_cached == 0x8664;  /* IMAGE_FILE_MACHINE_AMD64 */
     }
     return 0;
 }
@@ -6334,6 +6365,46 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 uintptr_t mb = (uintptr_t)ios_jit_mappings[i].pe_base;
                 if (a >= mb && a < mb + ios_jit_mappings[i].size)
                 {
+                    /* ml352: containment alone LIES when the entry is STALE.
+                     * rsaenh.dll unloaded, windows.ui.dll later mapped INSIDE
+                     * rsaenh's old range; this early-out then skipped
+                     * windows.ui's pool copy entirely, and every translate
+                     * routed its code into rsaenh's dead copy — whose bytes at
+                     * that offset are section padding: ZEROS → udf → dead run
+                     * (ml351, and the run-to-run "variance" = VA-recycling
+                     * roulette). The add_mapping stale-purge never fires
+                     * because this early-out precedes it. Validate the entry:
+                     * its pe_base must still hold a PE header whose
+                     * SizeOfImage matches the entry. Fault-safe reads — the
+                     * stale base may be unmapped. Invalid → skip the entry;
+                     * the fresh copy below re-registers and add_mapping's
+                     * overlap purge tombstones the stale one. */
+                    {
+                        unsigned short mz = 0;
+                        unsigned int lfanew = 0, imgsz = 0;
+                        mach_vm_size_t got = 0;
+                        int entry_ok =
+                            mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)mb, 2,
+                                                   (mach_vm_address_t)&mz, &got) == KERN_SUCCESS &&
+                            got == 2 && mz == 0x5A4D &&
+                            mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(mb + 0x3c), 4,
+                                                   (mach_vm_address_t)&lfanew, &got) == KERN_SUCCESS &&
+                            got == 4 && lfanew && lfanew < 0x1000 &&
+                            mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(mb + lfanew + 0x50), 4,
+                                                   (mach_vm_address_t)&imgsz, &got) == KERN_SUCCESS &&
+                            got == 4 &&
+                            (imgsz == ios_jit_mappings[i].size ||
+                             ((imgsz + 0x3fffu) & ~0x3fffu) == ios_jit_mappings[i].size);
+                        if (!entry_ok)
+                        {
+                            dprintf(2, "[jit-pool] STALE containment rev=ml352: entry pe=%p+0x%lx "
+                                    "no longer matches what is mapped there (mz=%04x lfanew=0x%x imgsz=0x%x) "
+                                    "— ignoring entry, copying fresh image for %p\n",
+                                    (void *)mb, (unsigned long)ios_jit_mappings[i].size,
+                                    mz, lfanew, imgsz, base);
+                            continue;
+                        }
+                    }
                     ERR("iOS JIT: %p already in mapping %d (%p+0x%lx)\n",
                         base, i, (void*)mb, (unsigned long)ios_jit_mappings[i].size);
                     /* If write was requested (e.g. IAT lives in a section that
@@ -6404,6 +6475,28 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         break;
                     }
                 }
+            }
+
+            /* ml348: the backward scan finds the NEAREST MZ below, which is not
+             * necessarily the image this page belongs to. A standalone exec
+             * allocation placed just above a module (ml347: a 4KB RWX page at
+             * 0x73e30b0000, 0x40000 past advapi32's SizeOfImage end) was
+             * attributed to that module, so the module got re-copied while the
+             * page itself got neither exec nor a pool alias — left read-only
+             * with no alias, every guest store to it faulted forever (STLR
+             * w0,[x8], 8+ identical faults, thread dead). Range-check the hit;
+             * on failure fall through to the anonymous-RWX path, which carves a
+             * pool slot AND registers the alias the store emulator needs. */
+            if (image_base &&
+                ((uintptr_t)base < (uintptr_t)image_base ||
+                 (uintptr_t)base + size > (uintptr_t)image_base + image_size))
+            {
+                dprintf(2, "[jit-pool] exec page %p+0x%lx is OUTSIDE nearest image %p+0x%lx "
+                        "(%s) — treating as anonymous RWX rev=ml348\n",
+                        base, (unsigned long)size, image_base, (unsigned long)image_size,
+                        ios_pe_module_name(image_base, image_size));
+                image_base = NULL;
+                image_size = 0;
             }
 
             if (!image_base || !image_size)

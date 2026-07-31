@@ -1,6 +1,19 @@
 // Mythic JIT Script for StikDebug
-// Handles BRK #0xf00d (universal protocol) with x16-based command dispatch
-// Advances PC past ALL BRK instructions to prevent infinite loops
+// Handles BRK #0xf00d (universal protocol) with x16-based command dispatch.
+//
+// ml346 (v2): soft-signal stops (EXC_SOFT_SIGNAL) forward the ORIGINAL signo
+// from medata[1] and are never guarded; raw fault stops forward a mapped
+// signal with a kill-not-detach last resort (detach leaves the task port
+// registered but unserviced -> parked threads).
+// ml345: only genuine BRK instructions are skipped (pc+4). The debugger holds
+// the TASK-level exception port, so every fault the app's own Mach handler
+// declines (KERN_FAILURE) lands HERE — the old "ALWAYS advance PC" behavior
+// skip-stepped real crashes instruction by instruction (and zeroed x0),
+// silently corrupting threads until they wandered into data (ml344: a
+// 4,000-fault +4 walk through shared-cache data ending in a bogus guest
+// exception). Non-BRK stops are now handed back to the process as a unix
+// signal so wine's sigaction handlers run; if the signal cannot be delivered
+// the script detaches so the process dies visibly instead of wandering.
 
 function littleEndianHexStringToNumber(hexStr) {
     const bytes = [];
@@ -36,41 +49,188 @@ log(`Mythic JIT: pid = ${pid}`);
 let attachResponse = send_command(`vAttach;${pid.toString(16)}`);
 log(`Mythic JIT: attached = ${attachResponse}`);
 
+// ml355: STOP SERVICING ANYTHING BUT BRK.
+//
+// Every signal and fault stop costs several synchronous protocol round-trips
+// on StikDebug's side. Wine signals constantly (thread suspend/resume), so the
+// v2 script burned 27s CPU in ~60s and iOS killed StikDebug itself with the
+// scene-update watchdog (0x8BADF00D) — which tore down the debug session and
+// left Mythic to be SIGKILLed with no crash report. That is the "instant
+// vanish, empty StikDebug log" the user kept seeing.
+//
+// Both packets below are best-effort; on an older stub they simply fail and
+// the fault/signal paths further down still work as before.
+//   QSetIgnoredExceptions — debugserver stops intercepting these Mach
+//     exceptions, so they reach the app's OWN handlers (wine registers
+//     thread-level ports for BAD_ACCESS+BAD_INSTRUCTION, and anything it
+//     declines becomes a normal BSD signal into wine's sigaction handlers).
+//   QPassSignals — deliver signals to the inferior without stopping. SIGTRAP
+//     is deliberately EXCLUDED: BRK arrives that way and is our whole job.
+{
+    let ign = send_command(`QSetIgnoredExceptions:EXC_BAD_ACCESS;EXC_BAD_INSTRUCTION`);
+    log(`Mythic JIT: QSetIgnoredExceptions -> ${ign || '(unsupported)'}`);
+    let sigs = [];
+    for (let s = 1; s <= 31; s++) if (s !== 5) sigs.push(s.toString(16));
+    let pass = send_command(`QPassSignals:${sigs.join(';')}`);
+    log(`Mythic JIT: QPassSignals -> ${pass || '(unsupported)'}`);
+}
+
 let detached = false;
+let pending = null;        // stop packet returned by a continue we already sent
+let lastFaultKey = null;   // "tid:pc" of the last non-BRK stop
+let faultRepeats = 0;
+let faultLogs = 0;
+let sigLogs = 0;
+// Hard ceiling on UI log lines: each log() drives a SwiftUI update, and it is
+// scene-update stalls that the watchdog kills for. Use ulog() everywhere
+// inside the stop loop; bare log() only for the few startup lines.
+let logBudget = 40;
+function ulog(msg) { if (logBudget > 0) { logBudget--; log(msg); } }
+
+function looksLikeStop(resp) {
+    return typeof resp === 'string' && /^[TSWX]/.test(resp);
+}
+
+// Forward a unix signal to the stopped thread and remember the next stop.
+// Returns true if the continue was accepted.
+function forwardSignal(sig, tid) {
+    let sigHex = sig.toString(16).padStart(2, '0');
+    let resp = send_command(`vCont;C${sigHex}:${tid};c`);
+    if (!looksLikeStop(resp)) {
+        resp = send_command(`C${sigHex}`);
+    }
+    if (looksLikeStop(resp)) {
+        pending = resp;
+        return true;
+    }
+    return false;
+}
 
 while (!detached) {
-    let brkResponse = send_command(`c`);
+    let brkResponse = pending !== null ? pending : send_command(`c`);
+    pending = null;
+
+    // W/X = inferior exited; nothing left to debug.
+    if (typeof brkResponse === 'string' && /^[WX]/.test(brkResponse)) {
+        ulog(`Mythic JIT: inferior exited (${brkResponse})`);
+        detached = true;
+        continue;
+    }
 
     let tidMatch = /T[0-9a-f]+thread:(?<tid>[0-9a-f]+);/.exec(brkResponse);
     let tid = tidMatch ? tidMatch.groups['tid'] : null;
     let pcMatch = /20:(?<reg>[0-9a-f]{16});/.exec(brkResponse);
     let pc = pcMatch ? pcMatch.groups['reg'] : null;
-    let x16Match = /10:(?<reg>[0-9a-f]{16});/.exec(brkResponse);
-    let x16 = x16Match ? x16Match.groups['reg'] : null;
 
-    if (!tid || !pc || !x16) {
-        log(`Mythic JIT: failed to parse, continuing`);
+    if (!tid || !pc) {
+        ulog(`Mythic JIT: failed to parse, continuing`);
         continue;
     }
 
     let pcNum = littleEndianHexStringToNumber(pc);
 
+    // medata values are hex WITHOUT 0x prefix (ml345 run: EXC_SOFT_SIGNAL
+    // printed as "10003"). metype is a small integer, same either way.
+    let metypeMatch = /metype:([0-9a-f]+);/.exec(brkResponse);
+    let metype = metypeMatch ? parseInt(metypeMatch[1], 16) : 0;
+    let medata = [];
+    let mre = /medata:([0-9a-fx]+);/g, mm;
+    while ((mm = mre.exec(brkResponse)) !== null) medata.push(parseInt(mm[1], 16));
+
+    // EXC_SOFTWARE / EXC_SOFT_SIGNAL (metype 5, medata[0]=0x10003): the
+    // kernel is routing a unix SIGNAL through the debugger — pthread_kill,
+    // wine's suspend signals, fault-conversion signals, all of it. This is
+    // not a fault and not ours to judge: forward the ORIGINAL signo
+    // (medata[1]) untouched, never count repeats (wine legitimately retries
+    // same-pc faults), never detach. v1 misdelivered these as SIGSEGV and
+    // then detached on wine's boot-time retry loop (ml345).
+    if (metype === 5) {
+        let signo = (medata.length > 1 && medata[1] >= 1 && medata[1] <= 31) ? medata[1] : 0;
+        if (sigLogs < 8 || (sigLogs % 500) === 0) {
+            ulog(`Mythic JIT: soft-signal tid=${tid} pc=0x${pcNum.toString(16)} ` +
+                `signo=${signo || '?'} (#${sigLogs})`);
+        }
+        sigLogs++;
+        if (signo === 0 || !forwardSignal(signo, tid)) {
+            // Unknown signo or C unsupported: plain continue and trust the
+            // stub to deliver the pending signal on resume.
+            let resp = send_command(`c`);
+            if (looksLikeStop(resp)) pending = resp;
+        }
+        continue;
+    }
+
     let instrHex = send_command(`m${pcNum.toString(16)},4`);
-    let instrU32 = littleEndianHexToU32(instrHex);
+    let insnOk = typeof instrHex === 'string' && /^[0-9a-fA-F]{8}$/.test(instrHex);
+    let instrU32 = insnOk ? littleEndianHexToU32(instrHex) : 0;
+    // BRK #imm16 = 1101 0100 001 imm16 00000
+    let isBrk = insnOk && ((instrU32 & 0xFFE0001F) >>> 0) === 0xD4200000;
+
+    if (!isBrk) {
+        // A raw fault stop escalated past the app's Mach handler. Never skip
+        // it. Deliver it back to the process as a unix signal so the app's
+        // sigaction handlers (wine segv/bus/ill) get an honest shot at it.
+        let key = `${tid}:${pc}`;
+        faultRepeats = (key === lastFaultKey) ? faultRepeats + 1 : 1;
+        lastFaultKey = key;
+
+        let kcode = medata.length > 0 ? medata[0] : 0;
+        let sig = 11;                                  // SIGSEGV default
+        if (metype === 1) sig = (kcode === 1) ? 11 : 10; // BAD_ACCESS: INVALID→SEGV, PROT→BUS
+        else if (metype === 2) sig = 4;                // BAD_INSTRUCTION → SIGILL
+        else if (metype === 3) sig = 8;                // ARITHMETIC → SIGFPE
+        else if (metype === 6) sig = 5;                // BREAKPOINT (non-BRK) → SIGTRAP
+
+        if (faultLogs < 16) {
+            faultLogs++;
+            ulog(`Mythic JIT: fault (not BRK) tid=${tid} pc=0x${pcNum.toString(16)} ` +
+                `insn=${insnOk ? instrU32.toString(16).padStart(8, '0') : `<${instrHex}>`} ` +
+                `metype=${metype} kcode=${kcode.toString(16)} -> sig ${sig} (repeat ${faultRepeats})`);
+        }
+
+        // NEVER detach here: with the StikDebug window still open the task
+        // exception port stays registered but unserviced, and every later
+        // escalated fault parks its thread forever (ml345 wedged steam.exe's
+        // main thread exactly this way). If the fault truly cannot be
+        // delivered, kill the inferior — a visible death with logs intact.
+        if (faultRepeats >= 8) {
+            ulog(`Mythic JIT: fault at pc=0x${pcNum.toString(16)} undeliverable after ` +
+                `${faultRepeats} tries — killing inferior (visible death beats a parked thread)`);
+            send_command(`k`);
+            detached = true;
+            continue;
+        }
+
+        if (!forwardSignal(sig, tid)) {
+            // Forwarding rejected: plain continue; if the same stop recurs
+            // the guard above eventually kills.
+            let resp = send_command(`c`);
+            if (looksLikeStop(resp)) pending = resp;
+        }
+        continue;
+    }
+
+    // Genuine BRK from here on — the protocol path.
+    lastFaultKey = null;
+    faultRepeats = 0;
+
     let brkImm = extractBrkImmediate(instrU32);
 
-    // ALWAYS advance PC past BRK to prevent infinite loop
+    // Advance PC past the BRK so it cannot re-fire
     let pcPlus4 = numberToLittleEndianHexString(pcNum + 4n);
     send_command(`P20=${pcPlus4};thread:${tid};`);
 
+    let x16Match = /10:(?<reg>[0-9a-f]{16});/.exec(brkResponse);
+    let x16 = x16Match ? x16Match.groups['reg'] : null;
+
     // Skip unknown BRK immediates (PC already advanced)
-    if (brkImm !== 0xf00d && brkImm !== 0x69) {
+    if ((brkImm !== 0xf00d && brkImm !== 0x69) || !x16) {
         // Set x0=0 (failure/skip indicator) so app's SIGTRAP fallback works
         send_command(`P0=${numberToLittleEndianHexString(0n)};thread:${tid};`);
         continue;
     }
 
-    log(`Mythic JIT: BRK #0x${brkImm.toString(16)}`);
+    ulog(`Mythic JIT: BRK #0x${brkImm.toString(16)}`);
 
     // Parse x0 and x1
     let x0Match = /00:(?<reg>[0-9a-f]{16});/.exec(brkResponse);
@@ -80,30 +240,30 @@ while (!detached) {
     let x16Num = littleEndianHexStringToNumber(x16);
 
     if (brkImm === 0xf00d) {
-        log(`Mythic JIT: x16 = ${x16Num}`);
+        ulog(`Mythic JIT: x16 = ${x16Num}`);
 
         if (x16Num === 0n) {
             // CMD_DETACH
-            log(`Mythic JIT: detach`);
+            ulog(`Mythic JIT: detach`);
             send_command(`D`);
             detached = true;
 
         } else if (x16Num === 1n) {
             // CMD_PREPARE_REGION
-            log(`Mythic JIT: prepare addr=0x${x0.toString(16)} size=0x${x1.toString(16)}`);
+            ulog(`Mythic JIT: prepare addr=0x${x0.toString(16)} size=0x${x1.toString(16)}`);
 
             let addr = x0;
             if (x0 === 0n && x1 !== 0n) {
                 let allocResp = send_command(`_M${x1.toString(16)},rx`);
                 if (allocResp && allocResp.length > 0) {
                     addr = BigInt(`0x${allocResp}`);
-                    log(`Mythic JIT: allocated at 0x${addr.toString(16)}`);
+                    ulog(`Mythic JIT: allocated at 0x${addr.toString(16)}`);
                 }
             }
 
             if (addr !== 0n && x1 !== 0n) {
                 let prepResp = prepare_memory_region(addr, x1);
-                log(`Mythic JIT: prepared = ${prepResp}`);
+                ulog(`Mythic JIT: prepared = ${prepResp}`);
             }
 
             send_command(`P0=${numberToLittleEndianHexString(addr)};thread:${tid};`);
@@ -113,7 +273,7 @@ while (!detached) {
             // x0 = TEB address, x1 = size (0x4000 = 16KB iOS page)
             // The app can't map page 0 itself (kernel refuses). The debugger
             // may have different privileges to create this mapping.
-            log(`Mythic JIT: map page zero, TEB=0x${x0.toString(16)} size=0x${x1.toString(16)}`);
+            ulog(`Mythic JIT: map page zero, TEB=0x${x0.toString(16)} size=0x${x1.toString(16)}`);
 
             let success = 0n;
 
@@ -135,7 +295,7 @@ while (!detached) {
                 if (tebData && tebData.length > 0) {
                     // Write it to address 0+tebOff
                     let writeResp = send_command(`M${tebOff.toString(16)},${(tebData.length/2).toString(16)}:${tebData}`);
-                    log(`Mythic JIT: write TEB to page0 offset 0x${tebOff.toString(16)}: ${writeResp}`);
+                    ulog(`Mythic JIT: write TEB to page0 offset 0x${tebOff.toString(16)}: ${writeResp}`);
                     if (writeResp === 'OK') {
                         success = 1n;
                     }
@@ -147,7 +307,7 @@ while (!detached) {
 
     } else if (brkImm === 0x69) {
         // Legacy protocol
-        log(`Mythic JIT: legacy BRK 0x69, x0=0x${x0.toString(16)}`);
+        ulog(`Mythic JIT: legacy BRK 0x69, x0=0x${x0.toString(16)}`);
         if (x0 !== 0n) {
             prepare_memory_region(x0, x0);
         }

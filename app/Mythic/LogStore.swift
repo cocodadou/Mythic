@@ -88,6 +88,10 @@ final class LogStore: ObservableObject {
             guard let cStr = cStr else { return }
             let message = String(cString: cStr)
             LogStore.shared.handleRawLine(message)
+            // ml359: also persist — jit_log lines (incl. the [no-footprint]
+            // verdict) previously reached only the UI view, which dies with
+            // the app; pulled logs never contained them.
+            LogStore.shared.appendToFile(message, level: .info)
         }
     }
 

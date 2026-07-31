@@ -175,6 +175,21 @@ while (!detached) {
         lastFaultKey = key;
 
         let kcode = medata.length > 0 ? medata[0] : 0;
+
+        // EXC_RESOURCE (metype 11) is a task-level advisory, not a thread
+        // fault — MEMORY/HIGH_WATERMARK fires when phys_footprint crosses
+        // the jetsam limit (kcode bits 12:0 = limit in MB; ml359 saw 4096).
+        // The old default injected SIGSEGV into whatever thread the stop
+        // named, crashing an innocent thread at the worst moment. Log and
+        // resume with no signal.
+        if (metype === 11) {
+            ulog(`Mythic JIT: EXC_RESOURCE tid=${tid} kcode=${kcode.toString(16)} ` +
+                `(memory HWM ${kcode & 0x1fff} MB?) — continuing, no signal`);
+            let resp = send_command(`c`);
+            if (looksLikeStop(resp)) pending = resp;
+            continue;
+        }
+
         let sig = 11;                                  // SIGSEGV default
         if (metype === 1) sig = (kcode === 1) ? 11 : 10; // BAD_ACCESS: INVALID→SEGV, PROT→BUS
         else if (metype === 2) sig = 4;                // BAD_INSTRUCTION → SIGILL

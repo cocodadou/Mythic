@@ -1233,7 +1233,17 @@ struct ContentView: View {
             // until skip-copy or .text sharing lands, buy headroom. Virtual
             // is jetsam-exempt; the copy itself is ~212MB real RSS when
             // written.
-            let poolSizeMB = 896
+            // 2026-08-01 (ml364): 1152 MB — ml363 died at MSM depth on pool
+            // EXHAUSTION (bump 858MB, freelist 0, tail-reserve 64MB) when
+            // Chrome's in-proc GPU thread requested a doubled 32MB EC code
+            // buffer; the fallback landed non-executable in the guest band and
+            // FEX scribbled through a garbage CodeBuffer. NOTE the jetsam
+            // ledger note above is STALE: the pool was never exempt and
+            // arrives FULLY DIRTY from StikDebug's TXM blessing writes, so
+            // this +256MB costs +256MB of the 4096MB budget up front. The
+            // ml362/ml363 footprint work (peak 3804→3190) is what pays for
+            // it. The real fix for both sides is still .text sharing.
+            let poolSizeMB = 1152
             logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
             let t0 = CFAbsoluteTimeGetCurrent()
             let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)

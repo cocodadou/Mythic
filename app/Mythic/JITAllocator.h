@@ -22,6 +22,12 @@ JITRegion *jit_region_create(size_t size);
 // Destroy a JIT region and unmap both views.
 void jit_region_destroy(JITRegion *region);
 
+/// Mark an already-mapped range jetsam-exempt (VM_LEDGER_FLAG_NO_FOOTPRINT).
+/// For the production pool, whose pages come from the debugger rather than
+/// jit_region_create(). Logs phys_footprint either side; returns false and
+/// changes nothing if the private ownership API refuses.
+bool jit_make_region_no_footprint(void *addr, size_t size, const char *label);
+
 // Get the RW (writable) pointer. Write generated code here.
 void *jit_region_rw_ptr(JITRegion *region);
 

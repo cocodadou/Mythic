@@ -196,6 +196,72 @@ JITRegion *jit_region_create(size_t size) {
     return region;
 }
 
+// ml358: make an ALREADY-MAPPED region jetsam-exempt.
+//
+// jit_region_create() marks its memory entry NO_FOOTPRINT, but the production
+// pool never goes through it — allocatePool() gets its RX pages from StikDebug
+// (jit26_prepare_region) and vm_remaps the RW alias, so the 896MB pool has
+// been counting against phys_footprint in full this whole time. ml357 died of
+// exactly that ("Terminated due to memory issue" with 848MB of pool written
+// and PartitionAlloc's reserves at 0% committed).
+//
+// mach_make_memory_entry_64 over an existing range hands back an entry for the
+// SAME vm_object both aliases share, so ownership applied to it should re-account
+// resident pages as well as future ones. This is private API on a beta OS: every
+// step is logged, failure is non-fatal, and phys_footprint is sampled either
+// side so the log says whether it actually WORKED rather than whether it was
+// merely attempted.
+bool jit_make_region_no_footprint(void *addr, size_t size, const char *label) {
+    mach_port_t task = mach_task_self();
+    kern_return_t kr;
+
+    uint64_t fp_before = 0, fp_after = 0;
+    task_vm_info_data_t vmi;
+    mach_msg_type_number_t vmi_cnt = TASK_VM_INFO_COUNT;
+    if (task_info(task, TASK_VM_INFO, (task_info_t)&vmi, &vmi_cnt) == KERN_SUCCESS) {
+        fp_before = vmi.phys_footprint;
+    }
+
+    memory_object_size_t entry_size = (memory_object_size_t)size;
+    mach_port_t entry = MACH_PORT_NULL;
+    kr = mach_make_memory_entry_64(
+        task,
+        &entry_size,
+        (memory_object_offset_t)(uintptr_t)addr,
+        MAP_MEM_VM_SHARE | VM_PROT_READ | VM_PROT_WRITE,
+        &entry,
+        MACH_PORT_NULL
+    );
+    if (kr != KERN_SUCCESS || entry == MACH_PORT_NULL) {
+        jit_log("[no-footprint] %s: mach_make_memory_entry_64 failed kr=%d (%s) — pool stays jetsam-counted",
+                label, kr, mach_error_string(kr));
+        return false;
+    }
+    if ((size_t)entry_size < size) {
+        jit_log("[no-footprint] %s: entry covers only %llu of %zu bytes (partial)",
+                label, (unsigned long long)entry_size, size);
+    }
+
+    kr = mach_memory_entry_ownership(entry, TASK_NULL, VM_LEDGER_TAG_DEFAULT,
+                                     VM_LEDGER_FLAG_NO_FOOTPRINT);
+    mach_port_deallocate(task, entry);
+    if (kr != KERN_SUCCESS) {
+        jit_log("[no-footprint] %s: ownership failed kr=%d (%s) — pool stays jetsam-counted",
+                label, kr, mach_error_string(kr));
+        return false;
+    }
+
+    vmi_cnt = TASK_VM_INFO_COUNT;
+    if (task_info(task, TASK_VM_INFO, (task_info_t)&vmi, &vmi_cnt) == KERN_SUCCESS) {
+        fp_after = vmi.phys_footprint;
+    }
+    jit_log("[no-footprint] %s: ownership OK for %zu MB | phys_footprint %llu MB -> %llu MB (delta %lld MB)",
+            label, size >> 20,
+            (unsigned long long)(fp_before >> 20), (unsigned long long)(fp_after >> 20),
+            ((long long)fp_after - (long long)fp_before) >> 20);
+    return true;
+}
+
 void jit_region_destroy(JITRegion *region) {
     if (!region) return;
 

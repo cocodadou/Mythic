@@ -643,8 +643,130 @@ static void *ios_pool_warmer_thread( void *arg )
                  * jumbo-failure sites, and ml121 died before any jumbo call, so
                  * the one measurement that decides whether a 3rd pool is
                  * reachable never fired. Put it on the periodic timer too. */
-                ios_window_inventory( "periodic", 0x7038000000ULL, 0x7400000000ULL );
+                ios_window_inventory( "periodic", 0x7048000000ULL, 0x7400000000ULL );
                 ios_bigres_report( "periodic" );
+            }
+            /* ml358 FOOTPRINT (every cycle, one line): phys_footprint is the
+             * EXACT number jetsam kills on — everything else in this file
+             * measures address space, which is not what got us killed (ml357:
+             * "Terminated due to memory issue" with pools at 0% committed).
+             * The breakdown discriminates who is spending: `internal` = our
+             * dirty anonymous pages (JIT pool copies, guest heap), `compressed`
+             * = what the compressor already absorbed, `phys_footprint` = the
+             * ledger total. Peak is tracked so a pull after death still shows
+             * how close the run got. */
+            {
+                task_vm_info_data_t vmi;
+                mach_msg_type_number_t vmi_cnt = TASK_VM_INFO_COUNT;
+                if (task_info( mach_task_self(), TASK_VM_INFO,
+                               (task_info_t)&vmi, &vmi_cnt ) == KERN_SUCCESS)
+                {
+                    static unsigned long long peak_mb;
+                    unsigned long long fp_mb = (unsigned long long)vmi.phys_footprint >> 20;
+                    if (fp_mb > peak_mb) peak_mb = fp_mb;
+                    dprintf(2, "[footprint] rev=ml358 phys=%llu MB (peak %llu) internal=%llu MB "
+                            "compressed=%llu MB external=%llu MB reusable=%llu MB (cycle=%u)\n",
+                            fp_mb, peak_mb,
+                            (unsigned long long)vmi.internal >> 20,
+                            (unsigned long long)vmi.compressed >> 20,
+                            (unsigned long long)vmi.external >> 20,
+                            (unsigned long long)vmi.reusable >> 20, cycle);
+                }
+            }
+            /* ml359 WHERE does the footprint live? ml359 died at the kernel's
+             * 4096MB high watermark (EXC_RESOURCE MEMORY/HWM) with internal at
+             * 3043MB, and the totals above cannot attribute that to the pool
+             * vs FEX lookup caches vs CEF heap. Walk the address space and
+             * charge private-dirty+swapped pages to each region; the base
+             * addresses identify the owner offline (pool = RX base, FEX bands,
+             * PA pools, guest heap). Every 5th cycle plus cycle 2, because the
+             * walk is tens of thousands of kernel calls. */
+            if (cycle == 2 || (cycle % 5) == 0)
+            {
+                struct { unsigned long long base, size, dirty, res, swap; unsigned tag; } top[12];
+                unsigned long long dirty_by_tag[256];
+                /* ml360 BAND TOTALS: ml360's walk showed the top-12 misses most
+                 * of the spend (2154MB tag-0 spread over 116k regions) and the
+                 * JIT pool showed up NOWHERE despite ~460MB written — either
+                 * its dirty pages are charged oddly or the region is shredded
+                 * into thousands of entries. Aggregate dirty AND resident per
+                 * address band so attribution can't hide in fragmentation.
+                 * Pool bands must be tested FIRST: the RW alias (0x7000000000)
+                 * sits numerically inside the guest range. */
+                enum { B_POOL_RX, B_POOL_RW, B_HOST_LOW, B_GUEST, B_PA, B_FEX, B_OTHER, B_MAX };
+                static const char *band_name[B_MAX] =
+                    { "poolRX", "poolRW", "hostlow", "guest", "pa", "fex", "other" };
+                unsigned long long band_dirty[B_MAX], band_res[B_MAX];
+                uintptr_t prx = (uintptr_t)ios_jit_rx_base_global;
+                uintptr_t prw = (uintptr_t)ios_jit_rw_base_global;
+                size_t pps = ios_jit_pool_size_global;
+                mach_vm_address_t raddr = 0;
+                mach_vm_size_t rsize = 0;
+                natural_t rdepth = 0;
+                unsigned regions = 0, ti, tj;
+                unsigned long long total_dirty = 0;
+                memset( top, 0, sizeof(top) );
+                memset( dirty_by_tag, 0, sizeof(dirty_by_tag) );
+                memset( band_dirty, 0, sizeof(band_dirty) );
+                memset( band_res, 0, sizeof(band_res) );
+                for (;;)
+                {
+                    vm_region_submap_info_data_64_t info;
+                    mach_msg_type_number_t icnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+                    unsigned long long d;
+                    if (mach_vm_region_recurse( mach_task_self(), &raddr, &rsize, &rdepth,
+                                                (vm_region_recurse_info_t)&info, &icnt ) != KERN_SUCCESS)
+                        break;
+                    if (info.is_submap) { rdepth++; continue; }
+                    d = ((unsigned long long)info.pages_dirtied +
+                         (unsigned long long)info.pages_swapped_out) << 14;
+                    {
+                        int b;
+                        if (prx && raddr >= prx && raddr < prx + pps)      b = B_POOL_RX;
+                        else if (prw && raddr >= prw && raddr < prw + pps) b = B_POOL_RW;
+                        else if (raddr < 0x1000000000ULL)                  b = B_HOST_LOW;
+                        else if (raddr >= 0x7000000000ULL && raddr < 0x7400000000ULL) b = B_GUEST;
+                        else if (raddr >= 0x7400000000ULL && raddr < 0x7c00000000ULL) b = B_PA;
+                        else if (raddr >= 0x7c00000000ULL && raddr < 0x8000000000ULL) b = B_FEX;
+                        else b = B_OTHER;
+                        band_dirty[b] += d;
+                        band_res[b] += (unsigned long long)info.pages_resident << 14;
+                    }
+                    if (d)
+                    {
+                        total_dirty += d;
+                        if (info.user_tag < 256) dirty_by_tag[info.user_tag] += d;
+                        /* keep the 12 dirtiest regions (replace current min) */
+                        for (ti = 0, tj = 0; ti < 12; ti++)
+                            if (top[ti].dirty < top[tj].dirty) tj = ti;
+                        if (d > top[tj].dirty)
+                        {
+                            top[tj].base = raddr; top[tj].size = rsize; top[tj].dirty = d;
+                            top[tj].res = (unsigned long long)info.pages_resident << 14;
+                            top[tj].swap = (unsigned long long)info.pages_swapped_out << 14;
+                            top[tj].tag = info.user_tag;
+                        }
+                    }
+                    raddr += rsize;
+                    if (++regions > 200000) { dprintf(2, "[phys-map] TRUNCATED at %u regions\n", regions); break; }
+                }
+                dprintf(2, "[phys-map] rev=ml359 cycle=%u regions=%u total_dirty=%llu MB\n",
+                        cycle, regions, total_dirty >> 20);
+                for (ti = 0; ti < 12; ti++)
+                {
+                    if (!top[ti].dirty) continue;
+                    dprintf(2, "[phys-map]   0x%llx+0x%llx dirty=%llu MB res=%llu MB swap=%llu MB tag=%u\n",
+                            top[ti].base, top[ti].size, top[ti].dirty >> 20,
+                            top[ti].res >> 20, top[ti].swap >> 20, top[ti].tag);
+                }
+                for (ti = 0; ti < 256; ti++)
+                    if (dirty_by_tag[ti] >> 20 >= 32)
+                        dprintf(2, "[phys-map]   tag %u total dirty=%llu MB\n", ti, dirty_by_tag[ti] >> 20);
+                dprintf(2, "[phys-map] bands rev=ml360 (dirty/res MB):");
+                for (ti = 0; ti < B_MAX; ti++)
+                    dprintf(2, " %s=%llu/%llu", band_name[ti],
+                            band_dirty[ti] >> 20, band_res[ti] >> 20);
+                dprintf(2, "\n");
             }
         }
         usleep( 2000000 );
@@ -3102,7 +3224,13 @@ static int ios_va_pressure;
  * never raised to match. Nothing below this floor is mappable, so scanning it
  * is pure waste; clamping both ends keeps the search inside the one real
  * window and restores O(1) placement. */
-static const ULONG_PTR ios_usable_va_floor = 0x7038000000;
+/* ml364: MUST equal 0x7000000000 + the JIT pool size (the pool's RW alias is
+ * remapped at exactly 0x7000000000 by StikJITHelper.allocatePool, and the
+ * first thing wine allocates — the USD page — lands AT this floor because it
+ * is a kernel-pick with this scan clamp). Pool grew 896MB→1152MB after ml363
+ * died on pool exhaustion (bump 858/896MB, freelist 0) at MSM depth, so the
+ * floor moves 0x7038000000 → 0x7048000000 in lockstep. */
+static const ULONG_PTR ios_usable_va_floor = 0x7048000000;
 
 /* ml132 SPILL CAP — makes the 3-pool experiment SAFE to run.
  *

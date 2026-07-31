@@ -3223,11 +3223,11 @@ static uint64_t ios_steer_reclaim_dead( void )
         {
             static int rc_note;
             if (rc_note++ < 12)
-                dprintf(2, "[steer-reclaim] rev=ml330 SKIPPING release of arena #%u [0x%llx+0x%llx] "
-                        "dead_tid=%04x — it HAS interior allocations that outlive the thread; "
+                dprintf(2, "[steer-reclaim] rev=ml332 SKIPPING release of arena #%u [0x%llx+0x%llx] "
+                        "dead_tid=%04x — %u interior allocations still LIVE (outlive the thread); "
                         "releasing it is what corrupted FEX's containers (ml329)\n",
                         i, (unsigned long long)ios_steer[i].base,
-                        (unsigned long long)ios_steer[i].size, ios_steer[i].tid);
+                        (unsigned long long)ios_steer[i].size, ios_steer[i].tid, ios_steer[i].inuse);
             continue;
         }
 
@@ -12001,6 +12001,26 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
              * committing alike -- a commit is just as much a claim on the memory as a reserve, and
              * the reclaim must not recycle either. Note this runs unconditionally, outside the
              * logging cap, so the flag can never depend on how much has been printed. */
+            /* ml331: COUNT interior allocations instead of latching a flag. ml330 made the
+             * flag permanent (an arena with any interior allocation was never released), which
+             * fixed the corruption but leaked VA: ml330 reached 69 arenas / 35GB reserved in the
+             * 64GB window CEF also needs, and FEXCore CreateThread's unchecked aligned_alloc
+             * returned NULL and stored through it (#43 again). Refcount instead: bump here,
+             * drop on interior MEM_RELEASE, and reclaim only at zero. */
+            /* ml331b: bump ONLY on MEM_RESERVE. The ml312 flag deliberately counted commits
+             * too, which was right for a latch but wrong for a refcount: a region that is
+             * reserved then committed would bump twice and be released once, so the count
+             * could never reach zero and the arena would leak exactly as in ml330. The
+             * reservation is the claim on the range; MEM_RELEASE is its only counterpart. */
+            /* ml332: REVERTED to latch semantics. The ml331 refcount gated bumps on
+             * MEM_RESERVE, but jemalloc's interior activity is MEM_COMMIT inside the one
+             * big reservation -- so every arena counted as empty, 8 arenas (4GB) were
+             * released with live contents, and the GuestToHostMap corruption came straight
+             * back (ml331 crash == ml329 crash, minutes after 'released 4096MB'). The
+             * ml312 comment said it: a commit is as much a claim as a reserve. Deeper:
+             * FEX's jemalloc heap is SHARED across threads, so 'owning thread died' was
+             * never a valid release condition at all. VA pressure is solved by smaller
+             * arenas (FEX side), not by releasing shared memory. */
             if (hit != (unsigned)-1 && nb != ios_steer[hit].base) ios_steer[hit].inuse = 1;
 
             if ((type & MEM_RESERVE) && nc++ < 80)
@@ -12503,6 +12523,26 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
              * committing alike -- a commit is just as much a claim on the memory as a reserve, and
              * the reclaim must not recycle either. Note this runs unconditionally, outside the
              * logging cap, so the flag can never depend on how much has been printed. */
+            /* ml331: COUNT interior allocations instead of latching a flag. ml330 made the
+             * flag permanent (an arena with any interior allocation was never released), which
+             * fixed the corruption but leaked VA: ml330 reached 69 arenas / 35GB reserved in the
+             * 64GB window CEF also needs, and FEXCore CreateThread's unchecked aligned_alloc
+             * returned NULL and stored through it (#43 again). Refcount instead: bump here,
+             * drop on interior MEM_RELEASE, and reclaim only at zero. */
+            /* ml331b: bump ONLY on MEM_RESERVE. The ml312 flag deliberately counted commits
+             * too, which was right for a latch but wrong for a refcount: a region that is
+             * reserved then committed would bump twice and be released once, so the count
+             * could never reach zero and the arena would leak exactly as in ml330. The
+             * reservation is the claim on the range; MEM_RELEASE is its only counterpart. */
+            /* ml332: REVERTED to latch semantics. The ml331 refcount gated bumps on
+             * MEM_RESERVE, but jemalloc's interior activity is MEM_COMMIT inside the one
+             * big reservation -- so every arena counted as empty, 8 arenas (4GB) were
+             * released with live contents, and the GuestToHostMap corruption came straight
+             * back (ml331 crash == ml329 crash, minutes after 'released 4096MB'). The
+             * ml312 comment said it: a commit is as much a claim as a reserve. Deeper:
+             * FEX's jemalloc heap is SHARED across threads, so 'owning thread died' was
+             * never a valid release condition at all. VA pressure is solved by smaller
+             * arenas (FEX side), not by releasing shared memory. */
             if (hit != (unsigned)-1 && nb != ios_steer[hit].base) ios_steer[hit].inuse = 1;
 
             if ((type & MEM_RESERVE) && nc++ < 80)

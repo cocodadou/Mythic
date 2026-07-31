@@ -2074,6 +2074,50 @@ skip_reclaim_band: ;
                                          code[8],code[9],code[10],code[11],code[12],code[13],code[14],code[15] );
                             else
                                 dprintf( STDERR_FILENO, "[rsp-trunc]   x86 @rip UNREADABLE\n" );
+
+                            /* iOS-Mythic ml333: is the guest code we EXECUTE the guest code that was
+                             * LOADED?
+                             *
+                             * ml332's fatal was c000001d with the bytes at guest RIP reading
+                             * `cc 0f 0b` = int3; ud2 -- Chromium's IMMEDIATE_CRASH(). But the device's
+                             * own libcef.dll has completely different bytes at that RVA (verified
+                             * offline against the file pulled from the container; single libcef load,
+                             * base confirmed). So in-memory guest code != on-disk guest code, and the
+                             * three explanations need separating rather than guessing:
+                             *   (a) the PE mapping is fine and only the POOL COPY we execute is wrong
+                             *       -- a mapping/copy bug on our side,
+                             *   (b) both differ from the file -- something overwrote guest code,
+                             *   (c) the RIP is bogus and neither is meaningful.
+                             * Print the same 16 bytes from the pool copy next to the PE mapping. If
+                             * they differ, it is (a); if they agree but both differ from the file,
+                             * it is (b). Either answer names the bug; silence is impossible because
+                             * the translate result is printed even when it is an identity. */
+                            {
+                                extern void *ios_jit_translate_addr( void *addr );
+                                unsigned char pcode[16];
+                                void *pool_rip = ios_jit_translate_addr( (void *)cs[0] );
+
+                                g = 0;
+                                if (pool_rip && pool_rip != (void *)cs[0] &&
+                                    mach_vm_read_overwrite( mach_task_self(),
+                                        (mach_vm_address_t)pool_rip, sizeof(pcode),
+                                        (mach_vm_address_t)pcode, &g ) == KERN_SUCCESS &&
+                                    g == sizeof(pcode))
+                                    dprintf( STDERR_FILENO,
+                                             "[guest-code] rev=ml333 pool_rip=%p (PE %p): "
+                                             "%02x %02x %02x %02x %02x %02x %02x %02x"
+                                             " %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                             pool_rip, (void *)cs[0],
+                                             pcode[0],pcode[1],pcode[2],pcode[3],pcode[4],pcode[5],pcode[6],pcode[7],
+                                             pcode[8],pcode[9],pcode[10],pcode[11],pcode[12],pcode[13],pcode[14],pcode[15] );
+                                else
+                                    dprintf( STDERR_FILENO,
+                                             "[guest-code] rev=ml333 pool_rip=%p (PE %p) -- %s\n",
+                                             pool_rip, (void *)cs[0],
+                                             (!pool_rip || pool_rip == (void *)cs[0])
+                                                 ? "NO pool copy for this address (identity translate)"
+                                                 : "pool copy UNREADABLE" );
+                            }
                         }
                     }
                     /* [ec-fault-regs] the faulting insn f8686928 = ldr x8,[x9,x8]:

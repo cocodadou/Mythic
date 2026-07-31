@@ -3197,15 +3197,38 @@ static uint64_t ios_steer_reclaim_dead( void )
          * Keep the inuse flag as a DETECTOR instead: if reclaim ever releases an arena that has
          * interior allocations, say so loudly, so any later corruption in that range can be tied
          * to this event with evidence rather than theory. */
+        /* iOS-Mythic ml330: the ml312 guard WAS right — restored, now with the evidence
+         * the ml313 revert was waiting for.
+         *
+         * ml329 fired this detector 10 times, and cross-referencing [vname] against the
+         * released ranges showed 28 live FEX structures sitting INSIDE arenas being
+         * released — including FEXMem_ThreadState, FEX's per-thread CPU state. Releasing
+         * the arena frees that VA; the next reservation is handed the same range, and two
+         * owners write the same memory. That is exactly the corruption we kept crashing
+         * on: FEX container nodes holding impossible pointers —
+         *   ml326/ml328  IntrusivePooledAllocator::ClaimBufferImpl, list next == NULL
+         *   ml329        GuestToHostMap::AddBlockExecutableRange, std::set child == 4
+         * and #53 is refuted for these (ml329's [reclaim-census]: 0 pages zero-filled all
+         * run), so page reclamation was never the source — VA double-ownership was.
+         *
+         * The arena belongs to a dead thread, but the allocations inside it OUTLIVE that
+         * thread, so "owning thread exited" is not a licence to free the range. Skip it.
+         * Note it stays skipped for the life of the process: an arena with live interior
+         * allocations can never become safe to release just because more time passed.
+         *
+         * The ml313 objection was VA exhaustion (#43) for no demonstrated benefit. The
+         * benefit is now demonstrated, and this is the narrow case — only arenas with
+         * recorded interior allocations are spared; empty ones are still reclaimed. */
         if (ios_steer[i].inuse)
         {
             static int rc_note;
             if (rc_note++ < 12)
-                dprintf(2, "[steer-reclaim] rev=ml313 RELEASING arena #%u [0x%llx+0x%llx] dead_tid=%04x "
-                        "which HAS interior allocations -- if corruption follows in this range, "
-                        "the ml312 guard was right after all\n",
+                dprintf(2, "[steer-reclaim] rev=ml330 SKIPPING release of arena #%u [0x%llx+0x%llx] "
+                        "dead_tid=%04x — it HAS interior allocations that outlive the thread; "
+                        "releasing it is what corrupted FEX's containers (ml329)\n",
                         i, (unsigned long long)ios_steer[i].base,
                         (unsigned long long)ios_steer[i].size, ios_steer[i].tid);
+            continue;
         }
 
         addr = (void *)(uintptr_t)ios_steer[i].base;

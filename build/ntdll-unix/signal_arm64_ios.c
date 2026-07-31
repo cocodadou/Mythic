@@ -455,6 +455,47 @@ typedef struct {
 } ios_exc_reply_t;
 #pragma pack()
 
+/* iOS-Mythic ml329 (#53 discriminator): ring of pages the reclaim-recovery path
+ * zero-filled. Written by the recovery site, dumped by ios_reclaim_pages_report()
+ * from the fatal-SEGV path so "did iOS eat this allocator's memory?" is answered
+ * from recorded fact rather than inferred from Wine's vprot (which reads 0 for
+ * pages FEX allocated through its own VirtualAlloc2 path, so the existing verdict
+ * string says "zeros OK" regardless and cannot settle the question). */
+#define IOS_RRPAGE_MAX 128
+static volatile unsigned long long ios_rr_pages[IOS_RRPAGE_MAX];
+static volatile unsigned ios_rr_pages_n;
+
+void ios_reclaim_note_page( unsigned long long pg );
+void ios_reclaim_note_page( unsigned long long pg )
+{
+    unsigned slot = __sync_fetch_and_add( &ios_rr_pages_n, 1 );
+    ios_rr_pages[slot % IOS_RRPAGE_MAX] = pg;
+}
+
+void ios_reclaim_pages_report( const char *when, unsigned long long fault_addr );
+void ios_reclaim_pages_report( const char *when, unsigned long long fault_addr )
+{
+    unsigned total = ios_rr_pages_n;
+    unsigned shown = total < IOS_RRPAGE_MAX ? total : IOS_RRPAGE_MAX;
+    unsigned i, in_fex_band = 0;
+
+    for (i = 0; i < shown; i++)
+    {
+        unsigned long long pg = ios_rr_pages[i];
+        if (pg >= 0x7C00000000ULL && pg < 0x8000000000ULL) in_fex_band++;
+    }
+    dprintf( STDERR_FILENO,
+             "[reclaim-census] rev=ml329 at=%s fault=0x%llx : %u pages zero-filled this run, "
+             "%u of the last %u are in FEX's host heap band [0x7c,0x80) -- %s\n",
+             when, fault_addr, total, in_fex_band, shown,
+             in_fex_band ? "FEX HEAP WAS ZEROED, #53 is live for this crash"
+                         : "none in FEX's heap; #53 does NOT explain this crash" );
+    for (i = 0; i < shown && i < 16; i++)
+        dprintf( STDERR_FILENO, "[reclaim-census]   pg[%u]=0x%llx%s\n", i,
+                 (unsigned long long)ios_rr_pages[i],
+                 (ios_rr_pages[i] >= 0x7C00000000ULL && ios_rr_pages[i] < 0x8000000000ULL) ? "  <== FEX heap" : "" );
+}
+
 static void *ios_mach_exception_thread( void *arg )
 {
     mach_port_t port = (mach_port_t)(uintptr_t)arg;
@@ -1636,6 +1677,22 @@ static void *ios_mach_exception_thread( void *arg )
                                     (unsigned long long)(pg - mod_base), errno_save);
                         }
                         int reuse = madvise( (void *)(uintptr_t)pg, RR_PAGE, MADV_FREE_REUSE );
+                        /* iOS-Mythic ml329 (#53 DISCRIMINATOR): remember every page we
+                         * zero-fill, so a later crash can be tested against them instead
+                         * of inferred.
+                         *
+                         * ml326+ml328 both died in FEXCore's IntrusivePooledAllocator
+                         * (ClaimBufferImpl) reading a NULL `next` at offset 8 of a
+                         * fextl::list node -- i.e. a list node full of zeros. Those nodes
+                         * are aligned_alloc'd into FEX's jemalloc heap, which lives in the
+                         * same [0x7c,0x80) band this recovery path re-mmaps. That makes
+                         * "iOS reclaimed the page and we handed the allocator zeros" the
+                         * leading hypothesis -- but the existing verdict string reads
+                         * WINE's vprot, which is 0 for memory FEX allocated through its own
+                         * VirtualAlloc2 path, so it prints "zeros OK" either way and cannot
+                         * settle it. Record the pages; ios_reclaim_pages_report() prints
+                         * them at the fatal SEGV so the two can be correlated directly. */
+                        ios_reclaim_note_page( pg );
                         static volatile int rc = 0;
                         int rcn = __sync_fetch_and_add(&rc, 1);
                         if (rcn < 40 || (rcn % 50) == 0)
@@ -4676,6 +4733,17 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                             }
                         }
                     }
+                }
+                /* iOS-Mythic ml329 (#53 discriminator): on a NULL-ish deref -- the exact
+                 * shape of the IntrusivePooledAllocator crash (a list node read at
+                 * offset 8 of a NULL `next`) -- state whether iOS zero-filled any page of
+                 * FEX's host heap this run. Prints the verdict either way, so a run with
+                 * no FEX-band recovery is a real negative that REFUTES #53 for this crash
+                 * rather than silence. */
+                if (siginfo->si_addr && (uintptr_t)siginfo->si_addr < 0x1000)
+                {
+                    extern void ios_reclaim_pages_report( const char *when, unsigned long long fault_addr );
+                    ios_reclaim_pages_report( "fatal-segv", (unsigned long long)(uintptr_t)siginfo->si_addr );
                 }
                 ERR("  insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",
                     p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3]);

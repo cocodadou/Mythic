@@ -344,8 +344,8 @@ static void ios_slot_probe( const char *why )
 {
     /* ml149: probe 0x7000000000 too — it is a genuine 16GB-ALIGNED candidate and
      * the ONLY route to a fourth pool. The GPU carveout [64G,448G) ends at
-     * exactly 0x7000000000, and ios_usable_va_floor is 0x7038000000, so only the
-     * first 896MB of that slot is blocked. If that occupant is ours (or movable)
+     * exactly 0x7000000000, and ios_usable_va_floor is 0x7038000000 (ml423), so only
+     * the first 896MB of that slot is blocked. If that occupant is ours (or movable)
      * a fourth slot exists and the wall disappears without touching Chromium —
      * whose kPoolMaxSize is compile-time and not ours to change. Report what is
      * actually in there rather than assuming it is the xzone. */
@@ -449,6 +449,13 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
     mach_vm_size_t tagb[8] = { 0 };
     int tagid[8];
     int i, j, ntag = 0;
+    /* ml366: free-hole accounting. Image loads need CONTIGUOUS space in this
+     * window (map_image_view's limit_high is non-relaxable), so the number
+     * that predicts a c0000017 DLL-load failure is the LARGEST FREE HOLE,
+     * which nothing measured before. mach_vm_region skips holes, so the gap
+     * between the previous region's end and the next region's start is free. */
+    mach_vm_size_t free_total = 0, free_max = 0;
+    mach_vm_address_t free_max_at = 0;
 
     for (i = 0; i < 8; i++) tagid[i] = -1;
 
@@ -464,6 +471,12 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
         if (mach_vm_region( mach_task_self(), &q, &size, VM_REGION_EXTENDED_INFO,
                             (vm_region_info_t)&einfo, &cnt, &obj ) != KERN_SUCCESS)
             break;
+        if (q > addr)   /* hole between previous region end and this one */
+        {
+            mach_vm_size_t gap = ((q < hi) ? q : hi) - addr;
+            free_total += gap;
+            if (gap > free_max) { free_max = gap; free_max_at = addr; }
+        }
         if (q >= hi) break;
         if (q + size > hi) size = hi - q;
         tag = einfo.user_tag;
@@ -502,7 +515,18 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
             run_at = q; run_sz = size; run_tag = tag; run_pr = prot;
         }
         addr = q + size;
-        if (regions > 4000) break;   /* backstop */
+        /* ml366: the old 4000-region backstop TRUNCATED the census — ml365
+         * reported "occupied 12198 of 15232 MB" over exactly 4001 regions
+         * while the window was in fact fuller; every occupancy number since
+         * the window fragmented past 4000 regions was an undercount. Keep a
+         * runaway backstop only. */
+        if (regions > 100000) { dprintf(2, "[window] TRUNCATED at %u regions\n", regions); break; }
+    }
+    if (addr < hi)   /* tail hole after the last region */
+    {
+        mach_vm_size_t gap = hi - addr;
+        free_total += gap;
+        if (gap > free_max) { free_max = gap; free_max_at = addr; }
     }
     if (run_sz)
         for (j = 0; j < 8; j++)
@@ -518,9 +542,13 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
                 break;
             }
 
-    dprintf(2, "[window] 0x%llx..0x%llx regions=%u occupied=%llu MB of %llu MB (%s)\n",
+    dprintf(2, "[window] 0x%llx..0x%llx regions=%u occupied=%llu MB of %llu MB "
+            "free=%llu MB maxhole=%llu MB@0x%llx rev=ml366 (%s)\n",
             lo_arg, hi_arg, regions, (unsigned long long)(total >> 20),
-            (unsigned long long)((hi_arg - lo_arg) >> 20), why);
+            (unsigned long long)((hi_arg - lo_arg) >> 20),
+            (unsigned long long)(free_total >> 20),
+            (unsigned long long)(free_max >> 20),
+            (unsigned long long)free_max_at, why);
     for (i = 0; i < 6; i++)
         if (counts[i])
             dprintf(2, "[window]   %-7s n=%-5u %llu MB\n",
@@ -655,6 +683,13 @@ static void *ios_pool_warmer_thread( void *arg )
              * = what the compressor already absorbed, `phys_footprint` = the
              * ledger total. Peak is tracked so a pull after death still shows
              * how close the run got. */
+            /* ml398 (task #60): sample the beacon-marked chrome_ipc pump
+             * thread's Mach state each cycle — see ios_pump_sample() in
+             * signal_arm64_ios.c. */
+            {
+                extern void ios_pump_sample(void);
+                ios_pump_sample();
+            }
             {
                 task_vm_info_data_t vmi;
                 mach_msg_type_number_t vmi_cnt = TASK_VM_INFO_COUNT;
@@ -977,15 +1012,42 @@ static void ios_pool_owner_search( const uint64_t *wanted, unsigned nwanted )
  * so the margin should be large; if [soft-pool] COLLISION appears, this design
  * needs the full own-and-broker-the-window treatment before it can be trusted. */
 #define IOS_SOFT_MAX 8
-static struct { uint64_t base, size, committed; unsigned commits, collisions; } ios_soft[IOS_SOFT_MAX];
+static struct { uint64_t base, size, committed; unsigned commits, collisions; unsigned cage; } ios_soft[IOS_SOFT_MAX];
 static unsigned ios_soft_n;
+
+/* ml433 (#72): the V8/cppgc cage holdback.
+ *
+ * Single-process CEF means exactly ONE process-wide cppgc/V8 cage: an 8GB
+ * reservation the guest requires 8GB-ALIGNED. On Windows' 128TB that is free;
+ * in our 64GB usable band the only 8GB-aligned stretch outside the PA pool
+ * slots is [0x7200000000, 0x7400000000), and top-down furniture placement
+ * fills its tail with DLL image copies long before CEF asks (~85s in). The
+ * guest's fallback — reserve size+align-64K = 16383MB and trim — needs a 16GB
+ * gap that cannot exist here, so PA retries three times and abort()s the
+ * webhelper (ml432, one minute after the first-ever BrowserReady).
+ *
+ * So reserve the stretch at boot, before any furniture can land in it, and
+ * hand it to the first 8GB jumbo ask. It deliberately stops 64KB short of
+ * 0x7400000000: that page is the PA guard pool's home base (guard-style base
+ * = slot - 64KB, see the jumbo walk), which stays REAL and untouched. The
+ * guest is told it got the full 8GB — the top 64KB overlaps only PA's
+ * never-committed forbidden zone, and a stray commit there is absorbed by an
+ * ios_soft tail entry. */
+#define IOS_CAGE_BASE      0x7200000000ULL
+#define IOS_CAGE_REAL_SIZE 0x1ffff0000ULL   /* 8GB - 64KB */
+static int ios_cage_holdback_live;
 
 static int ios_soft_find( uint64_t addr )
 {
+    /* ml434: smallest matching range wins — the 4GB soft cages sit INSIDE the
+     * 16GB soft pools' claimed ranges, and first-match would shadow them. */
     unsigned i;
+    int best = -1;
     for (i = 0; i < ios_soft_n; i++)
-        if (addr >= ios_soft[i].base && addr < ios_soft[i].base + ios_soft[i].size) return (int)i;
-    return -1;
+        if (addr >= ios_soft[i].base && addr < ios_soft[i].base + ios_soft[i].size
+            && (best < 0 || ios_soft[i].size < ios_soft[best].size))
+            best = (int)i;
+    return best;
 }
 
 /* Is this 16GB-aligned slot free of any pool we already handed out? */
@@ -1110,6 +1172,24 @@ static void ios_bigres_commit( void *addr, size_t size )
             ios_bigres_tab[i].commits++;
             return;
         }
+}
+
+/* ml433 (#72): drop released ranges so [bigres-use] stops double-counting the
+ * guest's reserve/free alignment retries — ml432 reported 163,840MB "reserved"
+ * when all but ~72GB had already been freed again (the same base regranted up
+ * to 9 times). Exact-base match only: jumbo grants are released whole. */
+static void ios_bigres_release( void *base )
+{
+    uint64_t a = (uint64_t)(uintptr_t)base;
+    unsigned i;
+    for (i = 0; i < ios_bigres_cnt; i++)
+    {
+        if (ios_bigres_tab[i].base != a) continue;
+        dprintf(2, "[bigres-free] 0x%llx +%lluMB released rev=ml433\n",
+                (unsigned long long)a, (unsigned long long)(ios_bigres_tab[i].size >> 20));
+        ios_bigres_tab[i] = ios_bigres_tab[--ios_bigres_cnt];
+        return;
+    }
 }
 
 static void ios_bigres_report( const char *why )
@@ -3230,7 +3310,7 @@ static int ios_va_pressure;
  * is a kernel-pick with this scan clamp). Pool grew 896MB→1152MB after ml363
  * died on pool exhaustion (bump 858/896MB, freelist 0) at MSM depth, so the
  * floor moves 0x7038000000 → 0x7048000000 in lockstep. */
-static const ULONG_PTR ios_usable_va_floor = 0x7048000000;
+static const ULONG_PTR ios_usable_va_floor = 0x7038000000;   /* ml423: paired with poolSizeMB=896 (formula: 0x7000000000 + pool bytes; 1024 tried ml421-422, jetsam'd) */
 
 /* ml132 SPILL CAP — makes the 3-pool experiment SAFE to run.
  *
@@ -6298,6 +6378,22 @@ static void *ios_share_probe_thread(void *arg)
  *
  * Wrapper for mprotect, adds PROT_EXEC if forced by force_exec_prot
  */
+/* ml374: non-zero while the MACH EXCEPTION-SERVER thread is running wine's
+ * page/SEH machinery on behalf of a faulting thread.
+ *
+ * That thread is a bare pthread with NO wine TEB, and every wine log macro
+ * (ERR/WARN/TRACE/FIXME) ends in __wine_dbg_output, which reads thread-local
+ * state and faults. It has now killed two runs from two different sites —
+ * ml370 (__wine_dbg_header+0x100, my WARN in the cross-thread fault handler)
+ * and ml374 (__wine_dbg_output+0x18, mprotect_exec's unconditional ERR reached
+ * via mprotect_range). Both looked like guest crashes at a host pc with no log
+ * lines, because the thread that logs is the thread that died.
+ *
+ * RULE: any code reachable from ios_mach_deliver_guest_exception must use
+ * dprintf(2,...), never a wine log macro. This flag lets shared helpers that
+ * legitimately log on normal threads stay silent on that one. */
+volatile int ios_in_mach_exc;
+
 static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 {
     /* ml247: catch WHO narrows maxprot on pool pages.
@@ -6336,7 +6432,8 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
     }
     if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
     {
-        TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );
+        if (!ios_in_mach_exc)                   /* ml374: see ios_in_mach_exc */
+            TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );
         if (!mprotect( base, size, unix_prot | PROT_EXEC )) return 0;
         /* exec + write may legitimately fail, in that case fall back to write only */
         if (!(unix_prot & PROT_WRITE)) return -1;
@@ -6350,21 +6447,41 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
      *
      * Apply only on the PROT_WRITE-add path; non-write protect changes go
      * through the regular mprotect below. */
-    ERR("mprotect_exec(%p, 0x%lx, %c%c%c)\n", base, (unsigned long)size,
-        (unix_prot & PROT_READ)  ? 'r' : '-',
-        (unix_prot & PROT_WRITE) ? 'w' : '-',
-        (unix_prot & PROT_EXEC)  ? 'x' : '-');
+    if (!ios_in_mach_exc)                       /* ml374: see ios_in_mach_exc */
+        ERR("mprotect_exec(%p, 0x%lx, %c%c%c)\n", base, (unsigned long)size,
+            (unix_prot & PROT_READ)  ? 'r' : '-',
+            (unix_prot & PROT_WRITE) ? 'w' : '-',
+            (unix_prot & PROT_EXEC)  ? 'x' : '-');
     if ((unix_prot & PROT_WRITE) && !(unix_prot & PROT_EXEC))
     {
+        /* ml391 (task #60): try WITHOUT VM_PROT_COPY first.  COPY forcibly
+         * privatizes the mapping object — on a MAP_SHARED section view it
+         * silently disconnects the view from the section: writes land in a
+         * private copy and every other pseudo-process reads the section's
+         * original zeros ([sec-test] ZEROS; killed the SteamChrome
+         * webhelper-init handshake and every CSharedMemStream).  When maxprot
+         * permits WRITE (anon memory, temp-file-backed shared sections, the
+         * JIT pool's vm_remap alias) the plain request succeeds and sharing
+         * is preserved; it also re-asserts write past the iOS silent
+         * mmap-downgrade.  Only when maxprot lacks WRITE (code-signed PE
+         * files — the IAT case this path was built for) fall back to +COPY,
+         * where privatizing is correct since PE data is per-process anyway. */
         kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)base, size,
                                       FALSE,  /* set_maximum */
-                                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                                      VM_PROT_READ | VM_PROT_WRITE);
+        if (kr == KERN_SUCCESS) return 0;
+        kr = vm_protect(mach_task_self(), (vm_address_t)base, size,
+                        FALSE,  /* set_maximum */
+                        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
         if (kr == KERN_SUCCESS) {
-            ERR("iOS vm_protect RW+COPY OK at %p+0x%lx\n", base, (unsigned long)size);
+            if (!ios_in_mach_exc)
+                ERR("iOS vm_protect RW+COPY OK at %p+0x%lx (plain RW refused — privatized)\n",
+                    base, (unsigned long)size);
             return 0;
         }
-        ERR("iOS vm_protect RW failed kr=%d at %p+0x%lx — falling to mprotect\n",
-            kr, base, (unsigned long)size);
+        if (!ios_in_mach_exc)
+            ERR("iOS vm_protect RW failed kr=%d at %p+0x%lx — falling to mprotect\n",
+                kr, base, (unsigned long)size);
     }
 
     if (unix_prot & PROT_EXEC)
@@ -8095,7 +8212,13 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
                 {
                 static unsigned long vs_storm;
-                if (ios_storm_gate( &vs_storm ))
+                static unsigned vs_fails;
+                /* ml366: FAILED must never be storm-gated — ml365's mmdevapi
+                 * c0000017 loads left NO [va-scan] evidence because boot-time
+                 * SLOW lines had already spent this site's storm budget. A
+                 * failure is the one verdict worth a line every time (own
+                 * generous cap so a retry loop cannot flood the log). */
+                if (ptr ? ios_storm_gate( &vs_storm ) : (vs_fails++ < 256))
                 dprintf( 2, "[va-scan] %s window=%p..%p size=%p align=%p %s tries=%u skips=%u"
                             " | seen=%p..%p views=%u maxgap=%p stop=%s"
                             " | firstfail=%p errno=%d(%s) %s%s\n",
@@ -9528,7 +9651,19 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
     status = map_image_view( &view, image_info, size, limit_low, limit_high, alloc_type );
-    if (status) goto done;
+    /* ml366: NAME the image whose placement failed. ml365's mmdevapi load
+     * returned c0000017 with zero attributable evidence — the [va-scan]
+     * FAILED line was storm-gated and nothing tied a placement failure to a
+     * DLL. One line here closes that gap for every future load failure. */
+    if (status)
+    {
+        static unsigned imgfail;
+        if (imgfail++ < 64)
+            ERR( "[img-map-fail] rev=ml366 %s status=%x size=%zx limits=%lx..%lx\n",
+                 nt_name ? debugstr_us(nt_name) : "?", status, (size_t)size,
+                 (unsigned long)limit_low, (unsigned long)limit_high );
+        goto done;
+    }
     status = map_image_into_view( view, nt_name, unix_fd, image_info, machine, shared_fd, needs_close );
     if (status == STATUS_SUCCESS)
     {
@@ -9872,6 +10007,16 @@ void virtual_init(void)
     size = (char *)address_space_start - (char *)0x10000;
     if (size && mmap_is_in_reserved_area( (void*)0x10000, size ) == 1)
         anon_mmap_fixed( (void *)0x10000, size, PROT_READ | PROT_WRITE, 0 );
+
+    /* ml433 (#72): hold back the only 8GB-aligned stretch in the guest band
+     * before top-down placement can put furniture in it — see IOS_CAGE_BASE. */
+    if (anon_mmap_fixed( (void *)(uintptr_t)IOS_CAGE_BASE, IOS_CAGE_REAL_SIZE, PROT_NONE, 0 ) != MAP_FAILED)
+    {
+        ios_cage_holdback_live = 1;
+        dprintf( 2, "[cage] holdback reserved 0x%llx+0x%llx rev=ml433\n",
+                 (unsigned long long)IOS_CAGE_BASE, (unsigned long long)IOS_CAGE_REAL_SIZE );
+    }
+    else dprintf( 2, "[cage] holdback reserve FAILED (errno %d) rev=ml433\n", errno );
 }
 
 
@@ -10562,6 +10707,28 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
 
     size = max( reserve_size, commit_size );
     if (size < 1024 * 1024) size = 1024 * 1024;  /* Xlib needs a large stack */
+#ifdef WINE_IOS
+    /* iOS-Mythic ml422 (#70): first CreateBrowser (ml421) died on a genuine
+     * STACK_OVERFLOW — 256+ frames of libcef recursion ran a webhelper thread
+     * stack dry. Chromium sizes its worker stacks for pure-x64 frames, but
+     * under ARM64EC the emulated x64 frames interleave with native ARM64
+     * frames (EC thunks, wine internals, our exception rethrows), which
+     * consume MORE stack than the same call tree on real x64 Windows.
+     * ml423: the 4MB floor was consumed too ([stack-ovf] reserve=0x400000) —
+     * Chromium calibrates its renderer main threads for the 8MB Windows
+     * default, so match it. Cost is VA only: the mapping is anonymous and
+     * lazy, so untouched reserve pages never count against the 4096MB jetsam
+     * footprint. If 8MB ALSO overflows, the [stack-ovf] three-window stack
+     * fingerprint names the recursion cycle — chase that, not more size. */
+    if (guard_page && size < 8 * 1024 * 1024)
+    {
+        static int floored;
+        if (floored < 12 && ++floored <= 12)
+            dprintf( 2, "[stack-floor] rev=ml424 #%d thread stack reserve 0x%lx -> 0x800000\n",
+                     floored, (unsigned long)size );
+        size = 8 * 1024 * 1024;
+    }
+#endif
     size = ROUND_SIZE( 0, size, granularity_mask );
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
@@ -10807,6 +10974,21 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
     return ret;
 }
 
+/* iOS-Mythic ml420 (#69): BUS self-heal support. ml419's fatal chain began
+ * with a committed, plain-READ libcef .rdata page whose host protection had
+ * been stripped BEHIND wine's back (no guest NtProtectVirtualMemory touched
+ * the range — the stripper is a raw mprotect/mach_vm call). Report wine's
+ * INTENDED unix prot for the page so bus_handler can put it back and resume
+ * instead of dying. Returns -1 if wine has no committed view of the page.
+ * Lock-free vprot peek (signal context — taking virtual_mutex here could
+ * self-deadlock); racy reads are acceptable for a heal heuristic. */
+int ios_page_expected_prot( const void *addr )
+{
+    BYTE vprot = get_page_vprot( addr );
+    if (!(vprot & VPROT_COMMITTED)) return -1;
+    return get_unix_prot( vprot );
+}
+
 /* Steam S3 (task #29): when virtual_handle_fault can't service a fault,
  * dump the target's memory picture — is it in a Wine file_view (Wine should
  * manage it → our commit/vprot has a gap), or is it a FEX/foreign mapping
@@ -10950,6 +11132,153 @@ void *virtual_setup_exception( void *stack_ptr, size_t size, EXCEPTION_RECORD *r
 #elif defined(VALGRIND_MAKE_WRITABLE)
     VALGRIND_MAKE_WRITABLE( stack, size );
 #endif
+    return stack;
+}
+
+
+/* ml369 (#63): cross-thread variants for in-Mach guest exception delivery.
+ *
+ * ml364-368 contain ZERO segv/ill/bus handler invocations: with StikDebug
+ * attached, a fault our Mach handler declines goes to the task port, the
+ * script's continue marks it HANDLED kernel-side, and BSD signal conversion
+ * never happens (the stub cannot inject signals — no PT_THUPDATE). So wine's
+ * whole signal-side delivery path is unreachable and any unfixable fault
+ * spins at one pc until the script kills the process at 8 repeats.
+ *
+ * These helpers let the Mach exception-server thread run the same
+ * fault-service + dispatch-frame logic against the FAULTING thread (which
+ * the exception message keeps suspended). Current-thread dependencies are
+ * parameterized away:
+ *   - stack bounds come from the TARGET's TEB (no WOW branch: ARM64EC
+ *     guests are 64-bit);
+ *   - no abort_thread (that would kill the exception SERVER thread) —
+ *     undeliverable returns NULL and the caller declines as before;
+ *   - the enable_write_exceptions/allow_writes report branch acts as
+ *     allow_writes (clears the watch) since ntdll_get_thread_data() would
+ *     read the wrong thread. */
+static BOOL is_inside_thread_stack_teb( void *ptr, struct thread_stack_info *stack, TEB *teb )
+{
+    size_t min_guaranteed = max( page_size * (is_win64 ? 2 : 1), host_page_size );
+
+    stack->start = teb->DeallocationStack;
+    stack->limit = teb->Tib.StackLimit;
+    stack->end   = teb->Tib.StackBase;
+    stack->guaranteed = max( teb->GuaranteedStackBytes, min_guaranteed );
+    stack->is_wow = FALSE;
+    return ((char *)ptr > stack->start && (char *)ptr <= stack->end);
+}
+
+static NTSTATUS grow_thread_stack_teb( char *page, struct thread_stack_info *stack_info, TEB *teb )
+{
+    NTSTATUS ret = 0;
+
+    set_page_vprot_bits( page, host_page_size, VPROT_COMMITTED, VPROT_GUARD );
+    mprotect_range( page, host_page_size, 0, 0 );
+    if (page >= stack_info->start + host_page_size + stack_info->guaranteed)
+    {
+        set_page_vprot_bits( page - host_page_size, host_page_size, VPROT_COMMITTED | VPROT_GUARD, 0 );
+        mprotect_range( page - host_page_size, host_page_size, 0, 0 );
+    }
+    else  /* inside guaranteed space -> overflow exception */
+    {
+        page = stack_info->start + host_page_size;
+        set_page_vprot_bits( page, stack_info->guaranteed, VPROT_COMMITTED, VPROT_GUARD );
+        mprotect_range( page, stack_info->guaranteed, 0, 0 );
+        ret = STATUS_STACK_OVERFLOW;
+    }
+    teb->Tib.StackLimit = page;
+    return ret;
+}
+
+/* ml374: the two entry points below run ON the Mach exception-server thread.
+ * They raise ios_in_mach_exc for their whole extent so shared helpers (notably
+ * mprotect_exec, reached via mprotect_range) skip wine log macros — see the
+ * ios_in_mach_exc comment for why that is fatal rather than merely noisy. */
+NTSTATUS ios_virtual_handle_fault_for_thread( EXCEPTION_RECORD *rec, TEB *teb )
+{
+    NTSTATUS ret = STATUS_ACCESS_VIOLATION;
+    ULONG_PTR err = rec->ExceptionInformation[0];
+    void *addr = (void *)rec->ExceptionInformation[1];
+    char *page = ROUND_ADDR( addr, host_page_mask );
+    BYTE vprot;
+
+    mutex_lock( &virtual_mutex );
+    vprot = get_host_page_vprot( page );
+
+    if (err == EXCEPTION_READ_FAULT && (get_unix_prot( vprot ) & PROT_READ))
+    {
+        /* ml370: dprintf, NEVER a wine log macro — this runs on the Mach
+         * exception-server thread, which has no TEB, and __wine_dbg_header's
+         * per-thread read killed the server on the FIRST fault (fatal pc
+         * symbolized to __wine_dbg_header+0x100). No fault service, no
+         * delivery, whole app killed by the script. */
+        static int reclass_logs;
+        if (reclass_logs < 8)
+        {
+            reclass_logs++;
+            dprintf( 2, "[mach-deliver] read fault on readable page -> write fault, addr %p\n", addr );
+        }
+        err = EXCEPTION_WRITE_FAULT;
+    }
+
+    /* the faulting thread was running guest/JIT code, never a signal
+     * stack, so the is_inside_signal_stack() exclusion is vacuous here */
+    if (vprot & VPROT_GUARD)
+    {
+        struct thread_stack_info stack_info;
+        if (!is_inside_thread_stack_teb( page, &stack_info, teb ))
+        {
+            set_page_vprot_bits( page, host_page_size, 0, VPROT_GUARD );
+            mprotect_range( page, host_page_size, 0, 0 );
+            ret = STATUS_GUARD_PAGE_VIOLATION;
+        }
+        else ret = grow_thread_stack_teb( page, &stack_info, teb );
+    }
+    else if (err == EXCEPTION_WRITE_FAULT)
+    {
+        if (vprot & VPROT_WRITEWATCH)
+        {
+            set_page_vprot_bits( page, host_page_size, 0, VPROT_WRITEWATCH );
+            mprotect_range( page, host_page_size, 0, 0 );
+        }
+        if (get_unix_prot( get_host_page_vprot( page )) & PROT_WRITE)
+        {
+            if ((vprot & VPROT_WRITEWATCH) || is_write_watch_range( page, 1 ))
+                ret = STATUS_SUCCESS;
+        }
+    }
+    mutex_unlock( &virtual_mutex );
+    rec->ExceptionCode = ret;
+    return ret;
+}
+
+void *ios_virtual_setup_exception_for_thread( void *stack_ptr, size_t size, EXCEPTION_RECORD *rec, TEB *teb )
+{
+    char *stack = stack_ptr;
+    struct thread_stack_info stack_info;
+
+    if (!is_inside_thread_stack_teb( stack, &stack_info, teb ))
+    {
+        /* routine in this port — FEX guest stacks are not Wine views */
+        if (!ios_range_writable( stack - size, size )) return NULL;
+        return stack - size;
+    }
+
+    stack -= size;
+    if (stack < stack_info.start + host_page_size) return NULL;  /* overflow on last page */
+    if (stack < stack_info.limit)
+    {
+        char *page = ROUND_ADDR( stack, host_page_mask );
+        mutex_lock( &virtual_mutex );
+        if ((get_host_page_vprot( page ) & VPROT_GUARD) &&
+            grow_thread_stack_teb( page, &stack_info, teb ))
+        {
+            rec->ExceptionCode = STATUS_STACK_OVERFLOW;
+            rec->NumberParameters = 0;
+        }
+        mutex_unlock( &virtual_mutex );
+    }
+    if (!ios_range_writable( stack, size )) return NULL;
     return stack;
 }
 
@@ -11564,6 +11893,13 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
 {
     static const ULONG type_mask = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET;
     ULONG_PTR limit;
+#ifdef WINE_IOS
+    /* ml373: *ret is overwritten with the result, so the [guest-reserve] census
+     * below cannot ask afterwards whether the caller supplied a hint — and a
+     * hinted reserve is invisible to the steering valve (`!*ret`), which is a
+     * different fix. Capture it here. */
+    const int hint_was_set = (ret && *ret) ? 1 : 0;
+#endif
 
     TRACE("%p %p %08lx %x %08x\n", process, *ret, *size_ptr, type, protect );
 #ifdef WINE_IOS
@@ -11732,7 +12068,22 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                  * Wine does NOT own yet something else has mapped. */
                 if (find_view( (void *)(uintptr_t)want, need ))
                 {
-                    /* furniture's own commit — normal path, no bookkeeping */
+                    /* furniture's own commit — normal path, no bookkeeping.
+                     * ml434 (#72): EXCEPT the soft cages, which deliberately sit
+                     * inside the PA guard pool's real (mostly dead) reservation —
+                     * their commits ride the guard view silently, so count them
+                     * and log the first few. A commit near the guard pool's
+                     * ACTIVE bottom would be the collision to watch for. */
+                    if (ios_soft[si].cage)
+                    {
+                        ios_soft[si].commits++;
+                        ios_soft[si].committed += need;
+                        if (ios_soft[si].commits <= 8)
+                            dprintf(2, "[cage-commit] #%u 0x%llx+0x%lx in soft cage 0x%llx (total %lluMB) rev=ml434\n",
+                                    ios_soft[si].commits, (unsigned long long)want, (unsigned long)need,
+                                    (unsigned long long)ios_soft[si].base,
+                                    (unsigned long long)(ios_soft[si].committed >> 20));
+                    }
                 }
                 else if (occupied)
                 {
@@ -11959,8 +12310,27 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
              * be served must never be worse than not steering. */
             int ios_steered = 0;
 
+            /* ml373: floor 256MB -> 32MB.
+             *
+             * ml373 died with the guest window at 15195 MB of 15232 (free=36 MB,
+             * maxhole=3 MB): steamclient64.dll (0x1964000 = 25 MB) could not be
+             * mapped, c0000017 x28, webhelper dead — and the run logged ZERO
+             * [steer] lines, i.e. the valve never fired once. The [window]
+             * histogram says why: the guest band is eaten by n=88 reserves in the
+             * <=512M bucket (8438 MB) and n=151 in the <=64M bucket (4993 MB),
+             * while the valve only ever considered [256MB, 1GB). FEX is NOT the
+             * hog — [vname] totals put 5.4GB of FEXMem_* correctly in [0x7c,0x80)
+             * and only 81MB in the guest band — so this is Steam/CEF's own
+             * reserve-only memory, exactly the 1%-committed kind this valve was
+             * built to move.
+             *
+             * Same target band as before ([0x7c,0x80), which [vname] shows is
+             * ~10GB free), same pressure gate, same fall-back-on-failure rule, so
+             * a steer that cannot be served is still never worse than not
+             * steering. The 1GB ceiling stays: >=1GB reserves are PartitionAlloc
+             * pool business and go through the jumbo path above. */
             if (!*ret && !limit && (type & MEM_RESERVE) && !(type & MEM_COMMIT)
-                && *size_ptr >= 0x10000000 && *size_ptr < 0x40000000
+                && *size_ptr >= 0x2000000 && *size_ptr < 0x40000000
                 && (ios_bigres_reserved_total > (8ull << 30) || ios_va_pressure))
             {
                 SIZE_T want = *size_ptr;
@@ -12030,6 +12400,26 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
             }
             if (!ios_steered)
                 st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
+
+            /* ml373 census: name what still lands in the guest band once the
+             * valve has had its say. The [window] histogram gives sizes but no
+             * owner, so a single wrong guess about WHO reserves the 8.4GB costs a
+             * run. Reserve-only, >=8MB, guest band only, capped — and it prints
+             * whether the request was hinted, since a hinted reserve is invisible
+             * to the valve (`!*ret`) and would need a different fix. */
+            if (!st && *ret && (type & MEM_RESERVE) && !(type & MEM_COMMIT)
+                && *size_ptr >= 0x800000 && (ULONG_PTR)*ret < 0x7400000000ull)
+            {
+                static unsigned gb_n;
+                static ULONG64 gb_total;
+                gb_total += *size_ptr;
+                if (gb_n++ < 48)
+                    dprintf( 2, "[guest-reserve] #%u %p+0x%llx hinted=%d tid=%04x prot=0x%x "
+                                "running_total=%lluMB\n",
+                             gb_n, *ret, (unsigned long long)*size_ptr, hint_was_set,
+                             NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0,
+                             protect, (unsigned long long)(gb_total >> 20) );
+            }
             /* task#29 CEF plan C: a HINTED jumbo reserve that fails placement
              * is retried as kernel-pick. Windows semantics say fail on
              * conflict, but PartitionAlloc-style callers use the returned
@@ -12096,6 +12486,62 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                     dprintf(2, "[jumbo] cand plain slot=0x%llx size=0x%lx st=0x%x\n",
                             (unsigned long long)slot, (unsigned long)csz, (unsigned)st2);
                     if (!st2) sz = csz;
+                }
+                /* ml433 (#72): an 8GB ask is the process-wide V8/cppgc cage and
+                 * must come back 8GB-ALIGNED, or the guest frees it and dies in
+                 * a 16GB overreserve retry loop — serve it from the boot
+                 * holdback, the only aligned stretch left. See IOS_CAGE_BASE. */
+                if (st2 && ios_cage_holdback_live && *size_ptr == 0x200000000ULL)
+                {
+                    SIZE_T csz = IOS_CAGE_REAL_SIZE;
+                    munmap( (void *)(uintptr_t)IOS_CAGE_BASE, IOS_CAGE_REAL_SIZE );
+                    ios_cage_holdback_live = 0;
+                    pick = (void *)(uintptr_t)IOS_CAGE_BASE;
+                    st2 = allocate_virtual_memory( &pick, &csz, type, protect, 0, 0, 0, 0 );
+                    if (!st2 && (uintptr_t)pick == IOS_CAGE_BASE)
+                    {
+                        sz = *size_ptr;   /* report the full 8GB; the real view is 64K short */
+                        if (ios_soft_n < IOS_SOFT_MAX)
+                        {
+                            ios_soft[ios_soft_n].base = IOS_CAGE_BASE + IOS_CAGE_REAL_SIZE;
+                            ios_soft[ios_soft_n].size = 0x200000000ULL - IOS_CAGE_REAL_SIZE;
+                            ios_soft[ios_soft_n].cage = 1;
+                            ios_soft_n++;
+                        }
+                    }
+                    else if (!st2) sz = csz;   /* landed elsewhere: honest grant, no size lie */
+                    dprintf(2, "[cage] grant %p real=0x%llx reported=0x%lx st=0x%x rev=ml433\n",
+                            pick, (unsigned long long)IOS_CAGE_REAL_SIZE,
+                            (unsigned long)(st2 ? 0 : sz), (unsigned)st2);
+                }
+                /* ml434 (#72 layer 2): the 4GB ask is the cppgc caged heap and
+                 * must come back 4GB-ALIGNED. By the time it arrives (~69s) the
+                 * furniture window is 89% full (ml433: free=1701MB, maxhole
+                 * 1557MB) — no real placement can EVER work, aligned or not. But
+                 * the PA guard pool's real 16GB reservation [0x73ffff0000,
+                 * 0x77ffff0000) has ~12MB committed at its very bottom and the
+                 * two soft pools claiming that band have 0 commits ever, so
+                 * SOFT-grant the cage deep inside the dead zone. Commits ride
+                 * the guard view (see [cage-commit] in the soft handler); the
+                 * collision to watch is BRP growing 8GB up from its bottom. */
+                if (st2 && *size_ptr == 0x100000000ULL)
+                {
+                    static const uint64_t cage4_slots[] = { 0x7600000000ULL, 0x7500000000ULL };
+                    unsigned ci;
+                    for (ci = 0; ci < 2 && st2; ci++)
+                    {
+                        if (ios_soft_slot_taken( cage4_slots[ci] )) continue;
+                        if (ios_soft_n >= IOS_SOFT_MAX) break;
+                        ios_soft[ios_soft_n].base = cage4_slots[ci];
+                        ios_soft[ios_soft_n].size = 0x100000000ULL;
+                        ios_soft[ios_soft_n].cage = 1;
+                        ios_soft_n++;
+                        pick = (void *)(uintptr_t)cage4_slots[ci];
+                        sz = *size_ptr;
+                        st2 = 0;
+                        dprintf(2, "[cage] soft-grant %p size=0x%lx (4GB cage in PA guard dead zone) rev=ml434\n",
+                                pick, (unsigned long)sz);
+                    }
                 }
                 if (st2)
                 {
@@ -12460,12 +12906,23 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         if (reserve_offset + alloc_size > ios_jit_pool_size_global / 2 ||
             pool_tail_off < jit_pool_offset)
         {
+            /* iOS-Mythic ml421 (ml420 death): the old "fall through to normal
+             * allocation" is ALWAYS fatal for FEX — the normal path hands back
+             * guest-band memory whose exec-enable silently fails (ml363), and
+             * ClearCache then wild-writes through the unusable buffer
+             * (ml361/ml420: Arm64JITCore::ClearCache+0x5c, dest = 2x the
+             * guest-band base). Fail the allocation HONESTLY instead: FEX's
+             * CodeBuffer ctor (rev=ml364) sees NULL, halves the request down
+             * to 1MB (small carves can still fit pool gaps), and if nothing
+             * fits forces the diagnosable 0xdead fault. Also roll back the
+             * tail reservation — the old path leaked it on every refusal. */
+            __sync_fetch_and_sub(&ios_jit_tail_reserved, alloc_size);
             ERR("NtAllocateVirtualMemoryEx iOS: JIT-pool tail exhausted for FEX EC_CODE %zu bytes\n",
                 (size_t)*size_ptr);
-            dprintf(2, "[jit-pool] TAIL REFUSED (FEX EC_CODE): want=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx — falling to normal alloc (likely fatal for FEX)\n",
-                    (unsigned long)alloc_size, (unsigned long)(reserve_offset + alloc_size),
+            dprintf(2, "[jit-pool] TAIL REFUSED (FEX EC_CODE): want=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx — REFUSING honestly rev=ml421 (was: fall to normal alloc = guest-band non-exec buffer = ClearCache wild write)\n",
+                    (unsigned long)alloc_size, (unsigned long)reserve_offset,
                     (unsigned long)jit_pool_offset, (unsigned long)ios_jit_pool_size_global);
-            /* Fall through to normal allocation */
+            return STATUS_NO_MEMORY;
         }
         else
         {
@@ -12850,6 +13307,9 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
 
     if (size) size = ROUND_SIZE( addr, size, page_mask );
     base = ROUND_ADDR( addr, page_mask );
+
+    /* ml433 (#72): keep the jumbo ledger honest — see ios_bigres_release. */
+    if (type & MEM_RELEASE) ios_bigres_release( base );
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 

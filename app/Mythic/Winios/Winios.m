@@ -532,9 +532,14 @@ void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
     if (dumpSurf < 0) dumpSurf = getenv("MYTHIC_DUMP_SURFACES") != NULL;
     if (dumpSurf) winios_dump_surface_png(hwnd, data, sw, sh, stride);
     static unsigned cnt;
-    if (cnt++ < 12) {
-        fprintf(stderr, "[winios] present hwnd=%p dirty=(%d,%d %dx%d) surf=%dx%d\n",
-                hwnd, dx, dy, dw, dh, sw, sh);
+    /* ml371: was capped at 12 total, which made present LIVENESS
+     * unobservable — a 30-min run's log showed nothing after minute 2 and
+     * read exactly like a frozen present path. First 12, then every 200th
+     * with the running count so silence means silence. */
+    cnt++;
+    if (cnt <= 12 || (cnt % 200) == 0) {
+        fprintf(stderr, "[winios] present #%u hwnd=%p dirty=(%d,%d %dx%d) surf=%dx%d\n",
+                cnt, hwnd, dx, dy, dw, dh, sw, sh);
         fflush(stderr);
     }
     dispatch_async(dispatch_get_main_queue(), ^{

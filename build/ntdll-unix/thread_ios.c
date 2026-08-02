@@ -1132,6 +1132,18 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
                 (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
                 *(void **)(tsd_base + 275 * 8));
         *(void **)(tsd_base + 275 * 8) = NULL;
+        /* iOS-Mythic ml413 (#60): xtajit64 stamps TEB->Instrumentation[8]
+         * (+0x16f8) while this thread holds a FEX shared lock (compile-time
+         * CodeInvalidationMutex read hold). A thread exiting with the stamp
+         * still set is leaking that hold — every later invalidation writer
+         * parks forever behind it. Log-only: names the leaker + the mutex. */
+        {
+            uint64_t held_lock = *(volatile uint64_t *)((char *)NtCurrentTeb() + 0x16f8);
+            if (held_lock)
+                dprintf(2, "[exit-hold] tid=%04x teb=%p EXITING while holding FEX shared lock @0x%llx — read hold LEAKED\n",
+                        (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+                        NtCurrentTeb(), (unsigned long long)held_lock);
+        }
         /* ml173: tell the VA layer this thread is gone so its leaked 512MB steered
          * reserves can be released (see ios_steer_reclaim_dead in virtual_ios.c).
          * A dead thread can never commit into them again, which is what makes

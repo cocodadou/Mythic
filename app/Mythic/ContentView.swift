@@ -721,6 +721,11 @@ struct ContentView: View {
                     setenv("MYTHIC_DESKTOP", "1", 1)
                     setenv("MYTHIC_SCREEN_W", String(deskW), 1)
                     setenv("MYTHIC_SCREEN_H", String(deskH), 1)
+                    // ml371: surfdump ground truth — the "frozen desktop"
+                    // question (fresh pixels never presented vs nothing
+                    // painting upstream) is undecidable from the log alone
+                    // because the [winios] present line caps at 12.
+                    setenv("MYTHIC_DUMP_SURFACES", "1", 1)
                     runWineFullSequence()
                 }
                 .buttonStyle(.borderedProminent)
@@ -1243,7 +1248,32 @@ struct ContentView: View {
             // this +256MB costs +256MB of the 4096MB budget up front. The
             // ml362/ml363 footprint work (peak 3804→3190) is what pays for
             // it. The real fix for both sides is still .text sharing.
-            let poolSizeMB = 1152
+            // 2026-08-01 (ml367): back to 896 MB. ml364 needed 1152 because the
+            // shipped PE DLLs carried DWARF debug sections (llvm-mingw links
+            // -Wl,-debug:dwarf) and the pool copies the ENTIRE image, so 42% of
+            // every copy was debug info with no runtime purpose. Stripping them
+            // (llvm-strip --strip-debug over the bundle) drops projected peak
+            // pool use 894 -> ~653 MB, so 896 restores the ml364-equivalent
+            // headroom (~243 MB) while returning 256 MB of footprint — the pool
+            // is dirty from birth, so its SIZE is what costs, not its usage.
+            // KEEP ios_usable_va_floor PAIRED: 896MB -> 0x7038000000.
+            // 2026-08-02 (ml421): 1024 MB. ml420 (post-#69-fix, deepest run yet:
+            // cycle 41) refilled the stripped 896 pool anyway — head 768MB of
+            // copies + 176MB tail of EC code buffers collided; the doubled 32MB
+            // GPU-thread buffer was refused and the ml361/ml363 ClearCache
+            // wild-write returned (now also honestly REFUSED unix-side,
+            // rev=ml421). +128MB is the depth lever that fits under jetsam:
+            // ml420 peaked 3837 phys; 3837+128=3965 < 4096. Tight — if jetsam
+            // returns, the durable fix is .text sharing, not more pool.
+            // 2026-08-02 (ml423): BACK to 896. Jetsam DID return — ml422 died a
+            // silent EXC_RESOURCE kill at 2.5min (peak 3904, log stops mid-line),
+            // exactly the predicted cost of the +128MB dirty-at-birth pool.
+            // ml421's honest EC_CODE refusal makes pool exhaustion GRACEFUL now
+            // (ctor halving, worst case one thread's 0xdead fault) while jetsam
+            // kills the whole app — 896 + graceful degradation strictly beats
+            // 1024 + jetsam roulette. Durable fix remains .text sharing.
+            // KEEP ios_usable_va_floor PAIRED: 896MB -> 0x7038000000.
+            let poolSizeMB = 896
             logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
             let t0 = CFAbsoluteTimeGetCurrent()
             let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)

@@ -899,8 +899,16 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
      * GL probe as "no GL" and carries on — the same tolerance it shows for a
      * failed error-reporter spawn. Refusing the spawn is strictly better than
      * letting it fault. */
+    /* ml410: vulkandriverquery joins for a THIRD reason. Steam ships it as a
+     * 32-BIT x86 exe (vulkandriverquery64 is the 64-bit sibling); a 32-bit
+     * child needs build_wow64_parameters, whose NtAllocateVirtualMemory below
+     * 2GB can never succeed on iOS (4GB page zero) — assert-abort in the
+     * child's init thread, then garbage execution near the TEB band (the
+     * deterministic 0x73ffd65f40 crash of ml407/ml410). No 32-bit child can
+     * ever work under this port; there is no Vulkan driver here anyway, and
+     * Steam tolerates the refusal exactly like gldriverquery. */
     {
-        static const char * const blocked_names[] = { "steamerrorreporter", "gldriverquery" };
+        static const char * const blocked_names[] = { "steamerrorreporter", "gldriverquery", "vulkandriverquery" };
         const WCHAR *ip = params->ImagePathName.Buffer;
         int ip_len = params->ImagePathName.Length / sizeof(WCHAR);
         unsigned b;
@@ -1066,10 +1074,29 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                  * second --disable-features= would silently override Steam's whole list and make
                  * DCHECKs fatal, inventing new crashes and corrupting the experiment. So splice
                  * into the existing value instead of adding a switch. */
+                /* ml427 (#70 experiment 2): --js-flags=--jitless. Segmentation-
+                 * disable (ml426) took effect (cascade absent from cef_log) and
+                 * the overflow recurred byte-identical ⇒ segmentation exonerated.
+                 * Remaining prime suspect = in-proc renderer/Shared-JS-Context
+                 * bring-up. Jitless V8 interprets without runtime codegen: if the
+                 * recursion involves V8's JIT under FEX, this bypasses it; if the
+                 * overflow persists, V8 codegen is exonerated too. Steam passes
+                 * no --js-flags of its own (webhelper.txt cmdline verified), so
+                 * appending the switch is collision-free. */
                 static const char sp[] = " --single-process --enable-logging=file --v=1 --log-severity=verbose"
-                                         " --no-proxy-server --winhttp-proxy-resolver";
+                                         " --no-proxy-server --winhttp-proxy-resolver --js-flags=--jitless";
                 static const char dfs[] = "--disable-features=";
-                static const char brp[] = ",PartitionAllocBackupRefPtr";
+                /* ml426 (#70): + segmentation-platform features. Four CreateBrowser
+                 * runs died C00000FD in the CreateResponse→BrowserReady gap, and
+                 * cef_log ends mid-segmentation-cascade (segment_result_provider
+                 * fail-spiral: no ML models/signals in our env) at the fault
+                 * instant every time. The bat-level -cef-disable-features attempt
+                 * was IGNORED (Steam only translates known -cef- flags; webhelper
+                 * cmdline showed no trace) — this splice is the layer that works.
+                 * Feature strings verified present in libcef. One variable per
+                 * run: --js-flags=--jitless held in reserve if this fails. */
+                static const char brp[] = ",PartitionAllocBackupRefPtr,SegmentationPlatform"
+                                          ",OptimizationTargetPrediction,OptimizationHints";
                 int sl = sizeof(sp) - 1;
                 int dfl = sizeof(dfs) - 1, bl = sizeof(brp) - 1;
                 int df_end = -1;
@@ -1110,10 +1137,26 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                     params->CommandLine.Length = o * sizeof(WCHAR);
                     params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
                     dprintf(2, "[proc-gate] steamwebhelper: injected --single-process + CEF verbosity"
-                               " + no-proxy; BRP-disable %s (ml297)\n",
+                               " + no-proxy; BRP+segmentation-disable %s (ml426)\n",
                             bl ? "SPLICED into Steam's existing --disable-features list"
                                : "NOT applied (no --disable-features found -- refusing to add a "
                                  "second one, it would override Steam's list)");
+                    /* ml428: ECHO the constructed tail. Two verification channels
+                     * failed silently: clang compiles sp[]/brp[] into immediate
+                     * stores (invisible to any string search of the binary, old
+                     * substrings included), and webhelper.txt truncates the
+                     * logged command line right where our appends land. The
+                     * jitless experiment's first run was VOIDED by that gap —
+                     * every injected-arg experiment from now on is proven by
+                     * this line, not by binary greps or Valve's log. */
+                    {
+                        char tail[136];
+                        int tstart = o > 128 ? o - 128 : 0, ti;
+                        for (ti = 0; ti + tstart < o && ti < 135; ti++)
+                            tail[ti] = (char)nbuf[tstart + ti];
+                        tail[ti] = 0;
+                        dprintf(2, "[proc-gate] cmdline-tail(ml428): ...%s\n", tail);
+                    }
                 }
             }
         }

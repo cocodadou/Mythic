@@ -382,8 +382,16 @@ static void *ios_stale_va_scanner( void *arg )
 static __thread void *ios_my_trampoline = NULL;
 static __thread int ios_my_slot = -1;
 
-/* Thread registry: maps Mach thread port → TEB + trampoline */
-#define IOS_MAX_WINE_THREADS 64
+/* Thread registry: maps Mach thread port → TEB + trampoline.
+ *
+ * ml384: was 64. Steam runs register 90+ threads; entries past the cap were
+ * silently DROPPED while the success ERR still printed, so every late-born
+ * thread resolved to the slot-0 fallback = the INITIAL process's TEB. A
+ * wrong-process TEB means the wrong per-PEB dispatcher, which walks the wrong
+ * ntdll pool copy — services.exe died in LdrShutdownThread with wm=NULL that
+ * way (ml383). The lookup also iterated to ios_thread_count (92+), reading
+ * past the 64-entry array. */
+#define IOS_MAX_WINE_THREADS 512
 
 struct ios_thread_entry {
     thread_t mach_thread;
@@ -396,6 +404,7 @@ static volatile int32_t ios_thread_count = 0;
 static int ios_lookup_thread(thread_t mach_thread, uintptr_t *teb_out, void **tramp_out)
 {
     int count = __sync_fetch_and_add(&ios_thread_count, 0);
+    if (count > IOS_MAX_WINE_THREADS) count = IOS_MAX_WINE_THREADS;
     for (int i = 0; i < count; i++)
     {
         if (ios_thread_registry[i].mach_thread == mach_thread)
@@ -406,6 +415,20 @@ static int ios_lookup_thread(thread_t mach_thread, uintptr_t *teb_out, void **tr
         }
     }
     /* Fallback: use first registered thread */
+    /* ml390 (task #66): a thread that registered CORRECTLY (0184: idx=75 port
+     * 0x4493 teb ok) later resolved to the slot-0 TEB here — either the
+     * exception message named the thread differently than mach_thread_self()
+     * did at registration (name drift), or the entry was clobbered.  Print the
+     * sought name so it can be diffed against the registration line offline. */
+    {
+        static int miss_n;
+        if (miss_n < 32)
+        {
+            miss_n++;
+            ERR( "[reg-miss] #%d port=0x%x not in registry (count=%d) -> slot-0 fallback teb=%p\n",
+                 miss_n, mach_thread, count, count > 0 ? (void *)ios_thread_registry[0].teb : NULL );
+        }
+    }
     if (count > 0)
     {
         *teb_out = ios_thread_registry[0].teb;
@@ -415,6 +438,315 @@ static int ios_lookup_thread(thread_t mach_thread, uintptr_t *teb_out, void **tr
     *teb_out = 0;
     *tramp_out = NULL;
     return 0;
+}
+
+/* ml398 (task #60): the webhelper chrome_ipc pump thread wakes ONCE on
+ * MasterStream_Event, reads a perfectly valid hello ([chrome-mem] proved the
+ * bytes cross), then goes silent — no reply, no re-wait, no further wrapped
+ * syscall.  The EC wrapper stamps TEB->Instrumentation[10] = 'PUMP' at that
+ * wake; the census thread calls this every cycle to sample the thread's Mach
+ * state.  RUNNING with a moving pc = userspace spin (pc locates it);
+ * WAITING = blocked in a syscall the wrappers don't cover (pc/lr name it);
+ * dead port = the thread died silently.  Candidate-TEB reads go through
+ * mach_vm_read_overwrite so a stale registry entry cannot fault the census
+ * thread.  Called from the virtual_ios.c census loop. */
+/* ml405 (task #60): the wanderer often parks PRE-chorus, where no beacon
+ * exists.  Census sweep, no beacon needed: every call, walk registry entries
+ * (newest-first per TEB so corpses lose), and report every thread parked in
+ * the ml404 __ulock_wait signature (WAITING + x0==0x1000001) — lock address
+ * (x1), lock word (owner name for os_unfair_lock), and an 8-frame fp walk.
+ * Each thread reported once (dedupe by port), 60 reports max. */
+static void ios_lock_census(void)
+{
+    static int total_logged;
+    static thread_t seen[64];
+    static int nseen;
+    int count = __sync_fetch_and_add(&ios_thread_count, 0);
+    int i, s;
+    if (count > IOS_MAX_WINE_THREADS) count = IOS_MAX_WINE_THREADS;
+
+    /* iOS-Mythic ml414 (#60): the CodeInvalidationMutex read-holder is alive
+     * somewhere — xtajit64 stamps TEB+0x16f8 (Instrumentation[8]) with the
+     * mutex address while the shared lock is held (CompileCode).  ml414 proved
+     * the leaker neither pthread_exits ([exit-hold] 0) nor gets a guest
+     * redirect ([deliver-hold] 0) — it is parked/frozen in place.  Sweep every
+     * registry thread for the stamp each census pass: names the holder AND
+     * shows where it sits (pc/lr/bt) and whether the debugger froze it
+     * (suspend_count).  A transient hit (mid-compile) is normal noise; the
+     * same teb repeating with the same pc across passes = the leaker. */
+    {
+        static int hold_logged;
+        for (i = count - 1; i >= 0 && hold_logged < 40; i--)
+        {
+            thread_t cand = ios_thread_registry[i].mach_thread;
+            uintptr_t cteb = (uintptr_t)ios_thread_registry[i].teb;
+            uint64_t held = 0;
+            unsigned int ctid = 0;
+            mach_vm_size_t mgot = 0;
+            arm_thread_state64_t st;
+            mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+            struct thread_basic_info bi;
+            mach_msg_type_number_t bcnt = THREAD_BASIC_INFO_COUNT;
+            uint64_t fp, frames[8] = { 0 };
+            int fi;
+            if (!cand || !cteb) continue;
+            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(cteb + 0x16f8), 8,
+                                        (mach_vm_address_t)&held, &mgot ) != KERN_SUCCESS
+                || mgot != 8)
+                continue;
+            if (!held)
+            {
+                /* ml416: a converged rpmalloc-ownership repair leaves its
+                 * breadcrumb (Instrumentation[4]) with the lock long released
+                 * — report it once so the repair is visible even when the
+                 * livelock never got to wedge anything. */
+                static int crumb_logged;
+                uint64_t crumb_owner = 0, crumb_heap = 0;
+                if (crumb_logged >= 12) continue;
+                mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(cteb + 0x16d8), 8,
+                                        (mach_vm_address_t)&crumb_owner, &mgot );
+                mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(cteb + 0x16e0), 8,
+                                        (mach_vm_address_t)&crumb_heap, &mgot );
+                if (!crumb_owner && !crumb_heap) continue;
+                crumb_logged++;
+                mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(cteb + 0x48), 4,
+                                        (mach_vm_address_t)&ctid, &mgot );
+                dprintf(2, "[census-hold] RPMALLOC-REPAIR (converged) teb=0x%llx tid=%04x old_owner=0x%llx heap=0x%llx\n",
+                        (unsigned long long)cteb, ctid, (unsigned long long)crumb_owner,
+                        (unsigned long long)crumb_heap);
+                continue;
+            }
+            mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(cteb + 0x48), 4,
+                                    (mach_vm_address_t)&ctid, &mgot );
+            memset( &bi, 0, sizeof(bi) );
+            thread_info( cand, THREAD_BASIC_INFO, (thread_info_t)&bi, &bcnt );
+            if (thread_get_state( cand, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) != KERN_SUCCESS)
+                memset( &st, 0, sizeof(st) );
+            fp = st.__fp;
+            for (fi = 0; fi < 8 && fp > 0x1000; fi++)
+            {
+                uint64_t rec[2] = { 0, 0 };
+                mgot = 0;
+                if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)fp, sizeof(rec),
+                                            (mach_vm_address_t)rec, &mgot ) != KERN_SUCCESS) break;
+                frames[fi] = rec[1];
+                fp = rec[0];
+            }
+            hold_logged++;
+            /* ml416: Instrumentation[4]/[5] are the rpmalloc ownership-repair
+             * breadcrumbs (old owner_thread TEB / heap ptr) stamped by the
+             * FEX-side drain fix — nonzero means the livelock repair FIRED. */
+            {
+                uint64_t crumb_owner = 0, crumb_heap = 0;
+                mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(cteb + 0x16d8), 8,
+                                        (mach_vm_address_t)&crumb_owner, &mgot );
+                mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(cteb + 0x16e0), 8,
+                                        (mach_vm_address_t)&crumb_heap, &mgot );
+                if (crumb_owner || crumb_heap)
+                    dprintf(2, "[census-hold]   RPMALLOC-REPAIR breadcrumb teb=0x%llx: old_owner=0x%llx heap=0x%llx\n",
+                            (unsigned long long)cteb, (unsigned long long)crumb_owner,
+                            (unsigned long long)crumb_heap);
+            }
+            dprintf(2, "[census-hold] idx=%d port=0x%x teb=0x%llx tid=%04x HOLDS fexlock @0x%llx "
+                    "run_state=%d susp=%d pc=0x%llx lr=0x%llx sp=0x%llx bt: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                    i, cand, (unsigned long long)cteb, ctid, (unsigned long long)held,
+                    bi.run_state, bi.suspend_count,
+                    (unsigned long long)arm_thread_state64_get_pc( st ),
+                    (unsigned long long)st.__lr,
+                    (unsigned long long)arm_thread_state64_get_sp( st ),
+                    (unsigned long long)frames[0], (unsigned long long)frames[1],
+                    (unsigned long long)frames[2], (unsigned long long)frames[3],
+                    (unsigned long long)frames[4], (unsigned long long)frames[5],
+                    (unsigned long long)frames[6], (unsigned long long)frames[7]);
+        }
+    }
+
+    if (total_logged >= 60) return;
+    for (i = count - 1; i >= 0; i--)
+    {
+        thread_t cand = ios_thread_registry[i].mach_thread;
+        arm_thread_state64_t st;
+        mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        struct thread_basic_info bi;
+        mach_msg_type_number_t bcnt = THREAD_BASIC_INFO_COUNT;
+        uint64_t fp, frames[8] = { 0 };
+        uint32_t lockval = 0;
+        vm_size_t got;
+        int fi, dup = 0;
+        if (!cand) continue;
+        for (s = 0; s < nseen; s++) if (seen[s] == cand) dup = 1;
+        if (dup) continue;
+        if (thread_info( cand, THREAD_BASIC_INFO, (thread_info_t)&bi, &bcnt ) != KERN_SUCCESS)
+            continue;
+        if (bi.run_state != TH_STATE_WAITING) continue;
+        if (thread_get_state( cand, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) != KERN_SUCCESS)
+            continue;
+        if (st.__x[0] != 0x1000001) continue;   /* UL_COMPARE_AND_WAIT|ULF_NO_ERRNO */
+        fp = st.__fp;
+        for (fi = 0; fi < 8 && fp > 0x1000; fi++)
+        {
+            uint64_t rec[2] = { 0, 0 };
+            got = 0;
+            if (vm_read_overwrite( mach_task_self(), (vm_address_t)fp, sizeof(rec),
+                                   (vm_address_t)rec, &got ) != KERN_SUCCESS) break;
+            frames[fi] = rec[1];
+            fp = rec[0];
+        }
+        if (st.__x[1] > 0x1000)
+            vm_read_overwrite( mach_task_self(), (vm_address_t)st.__x[1], sizeof(lockval),
+                               (vm_address_t)&lockval, &got );
+        total_logged++;
+        if (nseen < 64) seen[nseen++] = cand;
+        dprintf(2, "[lock-census] idx=%d port=0x%x teb=%p pc=0x%llx lr=0x%llx x1=0x%llx "
+                "x2=0x%llx lockval=0x%x bt: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                i, cand, (void *)ios_thread_registry[i].teb,
+                (unsigned long long)arm_thread_state64_get_pc( st ),
+                (unsigned long long)st.__lr,
+                (unsigned long long)st.__x[1],
+                (unsigned long long)st.__x[2], lockval,
+                (unsigned long long)frames[0], (unsigned long long)frames[1],
+                (unsigned long long)frames[2], (unsigned long long)frames[3],
+                (unsigned long long)frames[4], (unsigned long long)frames[5],
+                (unsigned long long)frames[6], (unsigned long long)frames[7]);
+        if (total_logged >= 60) return;
+    }
+}
+
+/* ml406: beacon TEB list shared with sync.c's [alert-unix] tap.  The pump
+ * entered an alert-wait post-wake WITHOUT passing the EC-side [pump-op]
+ * wrapper (native-aarch64-ntdll routes bypass it); unix-side
+ * NtWaitForAlertByThreadId is the choke point for ALL PE routes. */
+uintptr_t ios_beacon_teb_list[4];
+int ios_beacon_teb_count;
+
+#define IOS_PUMP_MAX 4
+void ios_pump_sample(void)
+{
+    static int samples;
+    static int nbeacons;
+    static thread_t pump_port[IOS_PUMP_MAX];   /* 0 = needs (re-)resolve */
+    static uintptr_t pump_teb[IOS_PUMP_MAX];
+    int i, b;
+    int count = __sync_fetch_and_add(&ios_thread_count, 0);
+    if (count > IOS_MAX_WINE_THREADS) count = IOS_MAX_WINE_THREADS;
+
+    ios_lock_census();
+    if (samples >= 120) return;
+    /* discover beacon TEBs (ml399: server thread and pump can differ) */
+    if (nbeacons < IOS_PUMP_MAX)
+    {
+        for (i = 0; i < count && nbeacons < IOS_PUMP_MAX; i++)
+        {
+            uintptr_t teb = ios_thread_registry[i].teb;
+            uint64_t val = 0;
+            vm_size_t got = 0;
+            int known = 0;
+            if (!teb) continue;
+            for (b = 0; b < nbeacons; b++) if (pump_teb[b] == teb) known = 1;
+            if (known) continue;
+            if (vm_read_overwrite( mach_task_self(),
+                    (vm_address_t)(teb + offsetof(TEB, Instrumentation) + 10 * sizeof(void *)),
+                    sizeof(val), (vm_address_t)&val, &got ) != KERN_SUCCESS) continue;
+            if (val == 0x504d5550)
+            {
+                pump_teb[nbeacons] = teb;
+                pump_port[nbeacons] = 0;
+                ios_beacon_teb_list[nbeacons] = teb;
+                dprintf(2, "[pump-sample] beacon %d teb=%p (idx=%d)\n", nbeacons, (void *)teb, i);
+                nbeacons++;
+                ios_beacon_teb_count = nbeacons;
+            }
+        }
+        if (!nbeacons) return;
+    }
+    /* resolve each beacon TEB to the NEWEST registry entry with a LIVE port.
+     * ml402: TEB VAs recycle; forward first-match picked DEAD threads' stale
+     * entries (dead names -> MACH_SEND_INVALID_DEST forever).  Scan backwards
+     * and validate with thread_info before accepting; a beacon whose port
+     * dies gets re-resolved next cycle, and "no live entry" is itself the
+     * thread-death verdict. */
+    for (b = 0; b < nbeacons; b++)
+    {
+        if (pump_port[b]) continue;
+        for (i = count - 1; i >= 0; i--)
+        {
+            thread_t cand = ios_thread_registry[i].mach_thread;
+            struct thread_basic_info bi;
+            mach_msg_type_number_t bcnt = THREAD_BASIC_INFO_COUNT;
+            if (ios_thread_registry[i].teb != pump_teb[b] || !cand) continue;
+            if (thread_info( cand, THREAD_BASIC_INFO, (thread_info_t)&bi, &bcnt ) != KERN_SUCCESS)
+                continue;
+            pump_port[b] = cand;
+            dprintf(2, "[pump-sample] beacon %d RESOLVED idx=%d port=0x%x teb=%p\n",
+                    b, i, cand, (void *)pump_teb[b]);
+            break;
+        }
+        if (!pump_port[b])
+            dprintf(2, "[pump-sample] beacon %d teb=%p NO LIVE ENTRY (thread dead?)\n",
+                    b, (void *)pump_teb[b]);
+    }
+    for (b = 0; b < nbeacons; b++)
+    {
+        arm_thread_state64_t st;
+        mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        struct thread_basic_info bi;
+        mach_msg_type_number_t bcnt = THREAD_BASIC_INFO_COUNT;
+        kern_return_t kr1, kr2;
+        if (!pump_port[b]) continue;
+        kr1 = thread_get_state( pump_port[b], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt );
+        kr2 = thread_info( pump_port[b], THREAD_BASIC_INFO, (thread_info_t)&bi, &bcnt );
+        samples++;
+        if (kr1 == KERN_SUCCESS)
+        {
+            /* ml404: both IPC threads park at the same shared-cache pc with
+             * x0=0x1000001 (UL_COMPARE_AND_WAIT|ULF_NO_ERRNO = __ulock_wait).
+             * Add the discriminators: x16 = trap number, x1 = ulock ADDRESS
+             * (an os_unfair_lock word stores its OWNER's thread name), the
+             * lock word's current value, and an 8-frame fp walk so the
+             * non-shared-cache frames name the calling subsystem. All reads
+             * fault-safe. */
+            uint64_t fp = st.__fp;
+            uint64_t frames[8] = { 0 };
+            uint32_t lockval = 0;
+            int fi;
+            vm_size_t got;
+            for (fi = 0; fi < 8 && fp > 0x1000; fi++)
+            {
+                uint64_t rec[2] = { 0, 0 };
+                got = 0;
+                if (vm_read_overwrite( mach_task_self(), (vm_address_t)fp, sizeof(rec),
+                                       (vm_address_t)rec, &got ) != KERN_SUCCESS) break;
+                frames[fi] = rec[1];
+                fp = rec[0];
+            }
+            if (st.__x[1] > 0x1000)
+                vm_read_overwrite( mach_task_self(), (vm_address_t)st.__x[1], sizeof(lockval),
+                                   (vm_address_t)&lockval, &got );
+            dprintf(2, "[pump-sample] b%d #%d pc=0x%llx lr=0x%llx sp=0x%llx x0=0x%llx "
+                    "x1=0x%llx x2=0x%llx x16=0x%llx lockval=0x%x run_state=%d flags=%d "
+                    "bt: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                    b, samples,
+                    (unsigned long long)arm_thread_state64_get_pc( st ),
+                    (unsigned long long)st.__lr,
+                    (unsigned long long)arm_thread_state64_get_sp( st ),
+                    (unsigned long long)st.__x[0],
+                    (unsigned long long)st.__x[1],
+                    (unsigned long long)st.__x[2],
+                    (unsigned long long)st.__x[16], lockval,
+                    kr2 == KERN_SUCCESS ? bi.run_state : -1,
+                    kr2 == KERN_SUCCESS ? bi.flags : -1,
+                    (unsigned long long)frames[0], (unsigned long long)frames[1],
+                    (unsigned long long)frames[2], (unsigned long long)frames[3],
+                    (unsigned long long)frames[4], (unsigned long long)frames[5],
+                    (unsigned long long)frames[6], (unsigned long long)frames[7]);
+        }
+        else
+        {
+            dprintf(2, "[pump-sample] b%d #%d port=0x%x DEAD kr1=%d -> re-resolving\n",
+                    b, samples, pump_port[b], kr1);
+            pump_port[b] = 0;
+        }
+    }
 }
 
 /* Diagnostic: first .data fault captured by Mach handler */
@@ -495,6 +827,13 @@ void ios_reclaim_pages_report( const char *when, unsigned long long fault_addr )
                  (unsigned long long)ios_rr_pages[i],
                  (ios_rr_pages[i] >= 0x7C00000000ULL && ios_rr_pages[i] < 0x8000000000ULL) ? "  <== FEX heap" : "" );
 }
+
+/* ml369 (#63): defined after setup_exception (needs save_context and
+ * struct exc_stack_layout); used by the exception loop below. */
+static int ios_mach_deliver_guest_exception( thread_t thread, arm_thread_state64_t *state,
+                                             arm_neon_state64_t *neon, int have_neon,
+                                             int exception, uintptr_t fault_addr,
+                                             uintptr_t thread_teb );
 
 static void *ios_mach_exception_thread( void *arg )
 {
@@ -1005,6 +1344,18 @@ static void *ios_mach_exception_thread( void *arg )
                     uintptr_t rw_pc = rw + (fault_pc - rx);
                     uint32_t insn = *(uint32_t *)(uintptr_t)fault_pc;
 
+                    /* ml431 (#71): per-thread LL/SC monitor for the misaligned
+                     * exclusive emulation below. Only ever touched on the single
+                     * Mach exception-server thread — no locking. */
+                    enum { IOS_EXCL_MON_SLOTS = 64 };
+                    static struct {
+                        mach_port_t thr;
+                        uint64_t addr;
+                        uint64_t val;
+                        uint8_t size;
+                        uint8_t valid;
+                    } ios_excl_mon[IOS_EXCL_MON_SLOTS];
+
                     static const uint32_t LDAXR_MASK  = 0x3FFFFC00u;
                     static const uint32_t LDAR_INST   = 0x08DFFC00u;
                     static const uint32_t LDAPR_INST  = 0x38BFC000u;
@@ -1094,6 +1445,158 @@ static void *ios_mach_exception_thread( void *arg )
                         sys_icache_invalidate((void *)(fault_pc - 4), 8);
                         adjust_pc = -4;
                         patched = 1;
+                    }
+                    /* iOS-Mythic ml431 (#71): misaligned EXCLUSIVE / CAS family.
+                     *
+                     * ml430: Valve's IPCWrapper embeds a CRITICAL_SECTION at an
+                     * odd offset inside a packed shm struct (legal on x86 —
+                     * misaligned LOCK ops are architectural there). wine's EC
+                     * ntdll TryEnterCriticalSection CAS (ldaxr/stlxr on
+                     * LockCount at crit+8) alignment-faults on it. Routing the
+                     * fault through the guest-exception path costs ~ms per
+                     * instruction (FEX emulates one insn per round-trip), which
+                     * stretched an instantaneous acquire until the IPC partner
+                     * retired the shm view mid-acquire -> use-after-free AV ->
+                     * Crashpad terminate, in the CreateResponse->BrowserReady
+                     * gap.
+                     *
+                     * These cases MUST NOT patch the code: the pool-copied
+                     * ntdll .text is shared by every aligned CS in the process;
+                     * rewriting ldaxr/stlxr would destroy their atomicity.
+                     * Instead emulate the single faulting instruction here with
+                     * an LL/SC monitor. This entire block runs on the single
+                     * Mach exception-server thread, so all emulated accesses
+                     * are naturally serialized (no lock needed); the only
+                     * unserialized racers are plain stores from other threads,
+                     * which x86 split-lock semantics don't protect against
+                     * either. mach_vm_read/write keep a freed view from
+                     * faulting the server thread — on failure fall through to
+                     * the honest-AV delivery. */
+                    else if ((insn & LDAXR_MASK) == 0x085FFC00u ||  /* LDAXR* */
+                             (insn & LDAXR_MASK) == 0x085F7C00u)    /* LDXR* */
+                    {
+                        uint32_t Size = (insn >> 30) & 0x3;
+                        uint32_t Rn = (insn >> 5) & 0x1F;
+                        uint32_t Rt = insn & 0x1F;
+                        uint64_t addr = (Rn == 31) ? __darwin_arm_thread_state64_get_sp(state)
+                                                   : state.__x[Rn];
+                        uint64_t val = 0;
+                        mach_vm_size_t got = 0;
+                        if (mach_vm_read_overwrite( mach_task_self(), addr, 1u << Size,
+                                                    (mach_vm_address_t)&val, &got ) == KERN_SUCCESS
+                            && got == (1u << Size))
+                        {
+                            int mi, free_mi = -1;
+                            if (Rt != 31) state.__x[Rt] = val;
+                            for (mi = 0; mi < IOS_EXCL_MON_SLOTS; mi++)
+                            {
+                                if (ios_excl_mon[mi].valid && ios_excl_mon[mi].thr == thread) break;
+                                if (!ios_excl_mon[mi].valid && free_mi < 0) free_mi = mi;
+                            }
+                            if (mi == IOS_EXCL_MON_SLOTS) mi = (free_mi >= 0) ? free_mi : 0;
+                            ios_excl_mon[mi].thr = thread;
+                            ios_excl_mon[mi].addr = addr;
+                            ios_excl_mon[mi].val = val;
+                            ios_excl_mon[mi].size = (uint8_t)Size;
+                            ios_excl_mon[mi].valid = 1;
+                            __darwin_arm_thread_state64_set_pc_fptr(
+                                state, (void *)(uintptr_t)(fault_pc + 4));
+                            static volatile int ex_count;
+                            int n = __sync_add_and_fetch(&ex_count, 1);
+                            if (n <= 8 || (n % 256) == 0)
+                                dprintf(STDERR_FILENO,
+                                        "[mach_exc] UNALIGNED-EXCL rev=ml431 #%d LDAXR pc=0x%llx addr=0x%llx "
+                                        "size=%u val=0x%llx\n",
+                                        n, (unsigned long long)fault_pc,
+                                        (unsigned long long)addr, 1u << Size,
+                                        (unsigned long long)val);
+                            handled = 1;
+                        }
+                    }
+                    else if ((insn & 0x3FE0FC00u) == 0x0800FC00u ||  /* STLXR* */
+                             (insn & 0x3FE0FC00u) == 0x08007C00u)    /* STXR* */
+                    {
+                        uint32_t Size = (insn >> 30) & 0x3;
+                        uint32_t Rs = (insn >> 16) & 0x1F;
+                        uint32_t Rn = (insn >> 5) & 0x1F;
+                        uint32_t Rt = insn & 0x1F;
+                        uint64_t addr = (Rn == 31) ? __darwin_arm_thread_state64_get_sp(state)
+                                                   : state.__x[Rn];
+                        uint64_t szmask = (Size == 3) ? ~0ULL : ((1ULL << (8u << Size)) - 1);
+                        uint64_t stval = (Rt == 31) ? 0 : (state.__x[Rt] & szmask);
+                        uint64_t status = 1;   /* fail-by-default -> loop retries the LDAXR */
+                        int mi;
+                        for (mi = 0; mi < IOS_EXCL_MON_SLOTS; mi++)
+                            if (ios_excl_mon[mi].valid && ios_excl_mon[mi].thr == thread) break;
+                        if (mi < IOS_EXCL_MON_SLOTS && ios_excl_mon[mi].addr == addr
+                            && ios_excl_mon[mi].size == (uint8_t)Size)
+                        {
+                            uint64_t cur = 0;
+                            mach_vm_size_t got = 0;
+                            ios_excl_mon[mi].valid = 0;
+                            if (mach_vm_read_overwrite( mach_task_self(), addr, 1u << Size,
+                                                        (mach_vm_address_t)&cur, &got ) == KERN_SUCCESS
+                                && got == (1u << Size)
+                                && (cur & szmask) == (ios_excl_mon[mi].val & szmask)
+                                && mach_vm_write( mach_task_self(), addr,
+                                                  (vm_offset_t)(uintptr_t)&stval,
+                                                  1u << Size ) == KERN_SUCCESS)
+                                status = 0;
+                        }
+                        else if (mi < IOS_EXCL_MON_SLOTS)
+                            ios_excl_mon[mi].valid = 0;
+                        if (Rs != 31) state.__x[Rs] = status;
+                        __darwin_arm_thread_state64_set_pc_fptr(
+                            state, (void *)(uintptr_t)(fault_pc + 4));
+                        static volatile int sx_count;
+                        int n = __sync_add_and_fetch(&sx_count, 1);
+                        if (n <= 8 || (n % 256) == 0)
+                            dprintf(STDERR_FILENO,
+                                    "[mach_exc] UNALIGNED-EXCL rev=ml431 #%d STLXR pc=0x%llx addr=0x%llx "
+                                    "size=%u status=%llu\n",
+                                    n, (unsigned long long)fault_pc,
+                                    (unsigned long long)addr, 1u << Size,
+                                    (unsigned long long)status);
+                        handled = 1;
+                    }
+                    else if ((insn & 0x3FA07C00u) == 0x08A07C00u)    /* CAS/CASA/CASL/CASAL */
+                    {
+                        uint32_t Size = (insn >> 30) & 0x3;
+                        uint32_t Rs = (insn >> 16) & 0x1F;
+                        uint32_t Rn = (insn >> 5) & 0x1F;
+                        uint32_t Rt = insn & 0x1F;
+                        uint64_t addr = (Rn == 31) ? __darwin_arm_thread_state64_get_sp(state)
+                                                   : state.__x[Rn];
+                        uint64_t szmask = (Size == 3) ? ~0ULL : ((1ULL << (8u << Size)) - 1);
+                        uint64_t cmp = ((Rs == 31) ? 0 : state.__x[Rs]) & szmask;
+                        uint64_t stval = ((Rt == 31) ? 0 : state.__x[Rt]) & szmask;
+                        uint64_t cur = 0;
+                        mach_vm_size_t got = 0;
+                        if (mach_vm_read_overwrite( mach_task_self(), addr, 1u << Size,
+                                                    (mach_vm_address_t)&cur, &got ) == KERN_SUCCESS
+                            && got == (1u << Size))
+                        {
+                            int stored = 0;
+                            if ((cur & szmask) == cmp)
+                                stored = (mach_vm_write( mach_task_self(), addr,
+                                                         (vm_offset_t)(uintptr_t)&stval,
+                                                         1u << Size ) == KERN_SUCCESS);
+                            if ((cur & szmask) == cmp && !stored)
+                                goto skip_unaligned_backpatch;  /* write failed: honest AV path */
+                            if (Rs != 31) state.__x[Rs] = cur & szmask;  /* CAS returns old value in Rs */
+                            __darwin_arm_thread_state64_set_pc_fptr(
+                                state, (void *)(uintptr_t)(fault_pc + 4));
+                            static volatile int cas_count;
+                            int n = __sync_add_and_fetch(&cas_count, 1);
+                            if (n <= 8 || (n % 256) == 0)
+                                dprintf(STDERR_FILENO,
+                                        "[mach_exc] UNALIGNED-EXCL rev=ml431 #%d CAS pc=0x%llx addr=0x%llx "
+                                        "size=%u old=0x%llx swapped=%d\n",
+                                        n, (unsigned long long)fault_pc,
+                                        (unsigned long long)addr, 1u << Size,
+                                        (unsigned long long)cur, (cur & szmask) == cmp);
+                            handled = 1;
+                        }
                     }
 
                     if (patched)
@@ -1781,6 +2284,22 @@ static void *ios_mach_exception_thread( void *arg )
 skip_reclaim_band: ;
             }
 
+            /* ml369 (#63): last-resort in-process guest exception delivery.
+             * Nothing above claimed the fault; declining it is a death
+             * sentence under StikDebug (the stub cannot inject signals, so
+             * wine's segv/bus/ill handlers are unreachable and the fault
+             * spins at one pc until the script kills the app at 8 stops).
+             * Deliver to the guest from here instead. d==2 means the page
+             * machinery fixed it (guard/watch): resume with state as-is. */
+            if (!handled && (req->exception == EXC_BAD_ACCESS ||
+                             req->exception == EXC_BAD_INSTRUCTION))
+            {
+                if (ios_mach_deliver_guest_exception( thread, &state,
+                        &neon_state, have_neon, req->exception,
+                        fault_addr, thread_teb ))
+                    handled = 1;
+            }
+
             if (handled)
                 thread_set_state( thread, ARM_THREAD_STATE64,
                                   (thread_state_t)&state, count );
@@ -1856,13 +2375,47 @@ skip_reclaim_band: ;
                      * owner can be identified and the real fix aimed correctly. */
                     {
                         static volatile uint64_t stuck_page;
+                        static volatile uint64_t stuck_pc;
                         static volatile uint32_t stuck_n;
                         uint64_t fpage = (uint64_t)fault_addr & ~0x3fffull;
+                        /* ml385: NULL-page faults keyed as 1, not 0 — `if (fpage &&`
+                         * excluded them entirely and a NULL-write loop in
+                         * server_ioctl_file ran 3.3M times with no breaker
+                         * (StikDebug's 8-stop kill was the only breaker, and it
+                         * had detached). */
+                        if (!fpage) fpage = 1;
 
-                        if (fpage && fpage == stuck_page)
+                        if (fpage == stuck_page && fault_pc_check == stuck_pc)
                         {
                             uint32_t n = __sync_add_and_fetch(&stuck_n, 1);
-                            if (n == 2048)
+                            /* ml385 LOOP BREAKER: same page AND same pc 50 times
+                             * with zero progress is a livelock, not a recoverable
+                             * fault (guard/watch pages resolve in 1-3). Divert the
+                             * thread to wine's abort_thread so the pseudo-process
+                             * dies cleanly instead of eating the whole run. Native
+                             * unix-code faults (dylib pc) can never be delivered
+                             * to guest SEH anyway. */
+                            if (n >= 50)
+                            {
+                                extern void abort_thread( int status );
+                                uint64_t cur_sp = __darwin_arm_thread_state64_get_sp(state);
+                                dprintf(STDERR_FILENO,
+                                    "[fault-stuck] BREAKING LOOP: page 0x%llx pc 0x%llx repeated %u times "
+                                    "-> diverting thread to abort_thread\n",
+                                    (unsigned long long)fpage, (unsigned long long)fault_pc_check, n);
+                                state.__x[0] = 1;
+                                __darwin_arm_thread_state64_set_sp(state, cur_sp & ~0xfull);
+                                __darwin_arm_thread_state64_set_pc_fptr(state, (void *)abort_thread);
+                                thread_set_state( thread, ARM_THREAD_STATE64,
+                                                  (thread_state_t)&state, count );
+                                handled = 1;
+                                stuck_n = 0;
+                            }
+                            /* ml369: was 2048, which NEVER fired — the
+                             * debugger script kills the app after 8
+                             * identical stops, so the region map has to
+                             * print by the 6th fault to exist at all. */
+                            if (n == 5)
                             {
                                 mach_vm_address_t ra = (mach_vm_address_t)(fpage - 0x8000);
                                 int i;
@@ -1900,6 +2453,7 @@ skip_reclaim_band: ;
                         else
                         {
                             stuck_page = fpage;
+                            stuck_pc = fault_pc_check;
                             stuck_n = 0;
                         }
                     }
@@ -2809,6 +3363,60 @@ skip_reclaim_band: ;
                                     (unsigned long long)buf[9],
                                     (unsigned long long)buf[10],
                                     (unsigned long long)buf[11]);
+
+                                /* ml382 CALLER HUNT for the "-1 pointer" family.
+                                 *
+                                 * Three runs (ml372/378/381) died identically:
+                                 * fault addr 0xffffffffffe01000, insn f8bfc0da.
+                                 * Decoded from the REAL chrome_elf.dll pulled off
+                                 * the phone, the faulting function is
+                                 * chrome_elf+0x65750 = PartitionRoot::Free(root,
+                                 * ptr):
+                                 *   test rdx,rdx / je end        <- handles NULL
+                                 *   and r14, ~(2MB-1)            <- super-page base
+                                 *   mov rdi,[r14+0x1000]         <- FAULTS
+                                 * and the live regs had RDX = RSI = -1, R14 =
+                                 * -1 & ~(2MB-1). So Chromium is freeing (void*)-1.
+                                 * PA handles NULL but not -1, so SOMETHING handed
+                                 * it -1 where NULL (or a real pointer) was due.
+                                 *
+                                 * The existing 12-qword window did not reach the
+                                 * return address, so the caller is still unknown —
+                                 * and guessing it is exactly what burned two
+                                 * theories today. Dump a wide window ONLY for this
+                                 * signature so the caller can be identified offline
+                                 * (a stack qword whose preceding bytes decode as a
+                                 * CALL is a real return address; a function START
+                                 * preceded by ret+padding is just a callback
+                                 * pointer, which is how 0x...9c110 was excluded). */
+                                if (((uint64_t)fault_addr & 0xffffffff00000000ULL) == 0xffffffff00000000ULL)
+                                {
+                                    uint64_t wide[64];
+                                    mach_vm_size_t wgot = 0;
+                                    static int minus1_dumps;
+                                    if (minus1_dumps < 2 &&
+                                        mach_vm_read_overwrite( mach_task_self(),
+                                            (mach_vm_address_t)live_rsp, sizeof(wide),
+                                            (mach_vm_address_t)wide, &wgot ) == KERN_SUCCESS
+                                        && wgot == sizeof(wide))
+                                    {
+                                        unsigned wi;
+                                        minus1_dumps++;
+                                        dprintf(STDERR_FILENO,
+                                            "[minus1-stack] rev=ml382 fault=0x%llx rsp=0x%llx — 64 qwords "
+                                            "(find the CALLER offline: qword whose preceding bytes are E8/FF15)\n",
+                                            (unsigned long long)fault_addr,
+                                            (unsigned long long)live_rsp);
+                                        for (wi = 0; wi < 64; wi += 4)
+                                            dprintf(STDERR_FILENO,
+                                                "[minus1-stack]   +%03x: %016llx %016llx %016llx %016llx\n",
+                                                wi * 8,
+                                                (unsigned long long)wide[wi],
+                                                (unsigned long long)wide[wi+1],
+                                                (unsigned long long)wide[wi+2],
+                                                (unsigned long long)wide[wi+3]);
+                                    }
+                                }
                             }
                             else
                             {
@@ -3081,13 +3689,55 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
         ios_exc_handler_started = 1;
     }
 
-    /* Register this thread in the registry */
-    int idx = __sync_fetch_and_add(&ios_thread_count, 1);
-    if (idx < IOS_MAX_WINE_THREADS)
+    /* Register this thread in the registry.
+     * ml384: replace an existing entry for the same port first — the kernel
+     * recycles thread port names, and a stale entry earlier in the array would
+     * shadow the new registration in ios_lookup_thread (first match wins). */
+    int idx, reg_count = __sync_fetch_and_add(&ios_thread_count, 0);
+    if (reg_count > IOS_MAX_WINE_THREADS) reg_count = IOS_MAX_WINE_THREADS;
+    for (idx = 0; idx < reg_count; idx++)
+        if (ios_thread_registry[idx].mach_thread == pe_thread) break;
+    if (idx == reg_count)
     {
-        ios_thread_registry[idx].mach_thread = pe_thread;
+        idx = __sync_fetch_and_add(&ios_thread_count, 1);
+        if (idx >= IOS_MAX_WINE_THREADS)
+        {
+            ERR("[thread-registry] FULL (%d slots) — thread 0x%x teb=%p NOT registered; "
+                "Mach events on it will resolve to the slot-0 TEB (wrong process!)\n",
+                IOS_MAX_WINE_THREADS, pe_thread, (void *)teb);
+            idx = -1;
+        }
+    }
+    if (idx >= 0)
+    {
+        /* ml390 (task #66): make the replace path LOUD.  If a name gets
+         * recycled while its previous owner still has live guest state, this
+         * overwrite silently redirects that thread's TEB resolution — and a
+         * thread_set_state aimed at the new owner could land on the old one
+         * (zeroed-state suspect).  old_teb!=0 && old_teb!=new_teb = the case
+         * to correlate offline against [reg-miss] and fault dumps. */
+        if (idx < reg_count && ios_thread_registry[idx].teb &&
+            ios_thread_registry[idx].teb != teb)
+            ERR( "[thread-registry] REPLACE idx=%d port=0x%x old_teb=%p new_teb=%p\n",
+                 idx, pe_thread, (void *)ios_thread_registry[idx].teb, (void *)teb );
         ios_thread_registry[idx].teb = teb;
         ios_thread_registry[idx].trampoline = trampoline;
+        __sync_synchronize();
+        ios_thread_registry[idx].mach_thread = pe_thread;
+        /* ml401 (tasks #60/#66): EVERY registry port name proved
+         * MACH_SEND_INVALID_DEST when the census sampler tried to use it —
+         * something deallocates the mach_thread_self() ref after we store the
+         * name, leaving the registry full of dead keys ([pump-sample] blind,
+         * and dead names are exactly what the kernel recycles = the #66
+         * wrong-thread hazard).  Pin extra send refs so the name outlives any
+         * stray deallocate; dead-name lingering after thread exit is harmless
+         * and prevents recycling. */
+        {
+            kern_return_t krr = mach_port_mod_refs( mach_task_self(), pe_thread,
+                                                    MACH_PORT_RIGHT_SEND, 4 );
+            if (krr != KERN_SUCCESS)
+                ERR( "[thread-registry] mod_refs(+4) port=0x%x FAILED kr=%d\n", pe_thread, krr );
+        }
     }
 
     /* Set exception port for this thread (shared port).
@@ -3270,12 +3920,38 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
 
     if (ios_is_arm64ec_cur() && !is_ec_code( frame->pc ))   /* owner-aware (X3) */
     {
-        CONTEXT *user_context = (CONTEXT *)((frame->sp - sizeof(CONTEXT)) & ~15);
+        /* iOS-Mythic ml420 (#69, ml419 root cause): the EcCodeBitMap only covers
+         * PE space (#52), so a resume targeting the JIT pool — FEX's
+         * NtContinueNative after handling a fault host-side ("Handled unaligned
+         * atomic"), with Pc = the faulting host instruction — fails is_ec_code
+         * and gets bounced through KiUserEmulationDispatcher, which installs the
+         * HOST pc as the guest Rip (context_arm_to_x64 maps Pc→Rip verbatim).
+         * The guest then "executes" FEX's own emitted code: xquery MISS → NoExec
+         * trap → c0000005 (ml419 tid 0110, rip=0x155340848). Pool addresses only
+         * ever hold ARM64 code (image copies + FEX emission) — a guest x64 RIP
+         * is never a pool address — so any pool-pc resume is a NATIVE resume. */
+        extern void *ios_jit_rx_base_global;
+        extern size_t ios_jit_pool_size_global;
+        uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+        size_t psz = ios_jit_pool_size_global;
 
-        user_context->ContextFlags = CONTEXT_FULL;
-        NtGetContextThread( GetCurrentThread(), user_context );
-        frame->sp = (ULONG_PTR)user_context;
-        frame->pc = (ULONG_PTR)IOS_PFUNC(KiUserEmulationDispatcher);
+        if (rx && psz && frame->pc >= rx && frame->pc < rx + psz)
+        {
+            static int bounce_saved;
+            if (bounce_saved < 16 && ++bounce_saved <= 16)
+                ERR( "[ec-bounce-pool] native resume kept for pool pc=%p (off=0x%lx) lr=%p — "
+                     "was: KiUserEmulationDispatcher bounce = guest executes host code\n",
+                     (void *)frame->pc, (unsigned long)(frame->pc - rx), (void *)frame->lr );
+        }
+        else
+        {
+            CONTEXT *user_context = (CONTEXT *)((frame->sp - sizeof(CONTEXT)) & ~15);
+
+            user_context->ContextFlags = CONTEXT_FULL;
+            NtGetContextThread( GetCurrentThread(), user_context );
+            frame->sp = (ULONG_PTR)user_context;
+            frame->pc = (ULONG_PTR)IOS_PFUNC(KiUserEmulationDispatcher);
+        }
     }
     return status;
 }
@@ -3775,6 +4451,448 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
 }
 
 
+#ifdef WINE_IOS
+/***********************************************************************
+ *           ios_mach_deliver_guest_exception  (ml369, #63)
+ *
+ * In-process guest exception delivery from the Mach exception-server
+ * thread. ml364-368 contain ZERO segv/ill/bus handler invocations: with
+ * StikDebug attached, a fault this handler declines (KERN_FAILURE) goes to
+ * the task port; the script's continue marks the exception HANDLED
+ * kernel-side and its C<signo> is not honored (the stub cannot inject
+ * signals), so BSD conversion never happens — the instruction re-executes
+ * unmoved until the script kills the whole app at 8 identical stops. That
+ * is the entire "LDAPR undeliverable" family (ml362/366/367/368).
+ *
+ * So deliver here instead: run wine's fault service + dispatch-frame setup
+ * against the FAULTING thread (kept suspended by the exception message),
+ * write the new sp/pc/x18 back via the caller's thread_set_state, and reply
+ * KERN_SUCCESS. thread_set_state restores x18 directly — no sigreturn
+ * zeroing on this path, so no trampoline needed.
+ *
+ * Returns 0 = cannot deliver (caller declines exactly as before),
+ *         1 = state rewritten to enter KiUserExceptionDispatcher,
+ *         2 = fault serviced by page machinery (guard/watch): plain retry.
+ */
+static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_state64_t *state,
+                                                   arm_neon_state64_t *neon, int have_neon,
+                                                   int exception, uintptr_t fault_addr,
+                                                   uintptr_t thread_teb )
+{
+    extern void *ios_jit_rx_base_global;
+    extern size_t ios_jit_pool_size_global;
+    extern NTSTATUS ios_virtual_handle_fault_for_thread( EXCEPTION_RECORD *rec, TEB *teb );
+    extern void *ios_virtual_setup_exception_for_thread( void *stack_ptr, size_t size,
+                                                         EXCEPTION_RECORD *rec, TEB *teb );
+    extern const struct ios_ntdll_funcs *ios_ntdll_funcs_for_peb( void *peb_id );
+    extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+
+    uint64_t pc = arm_thread_state64_get_pc( *state );
+    uintptr_t rxb = (uintptr_t)ios_jit_rx_base_global;
+    TEB *teb = NULL;
+    void *dispatcher;
+    EXCEPTION_RECORD rec = { 0 };
+    struct exc_stack_layout frame;
+    void *frame_addr;
+    ucontext_t uc;
+    struct __darwin_mcontext64 mc;
+    static int deliver_logs;
+
+    /* Pick the faulting thread's TEB by STACK CONTAINMENT, not by
+     * self-consistency alone.
+     *
+     * ml372: both candidates self-verified and pointed at teb
+     * 0x73fffd0000, whose stack is [0x731E7C8000,0x731E8C0000) — but the
+     * faulting sp was 0x73da05fba0, in a completely different region. The
+     * frame was therefore written outside that TEB's stack, and wine's
+     * own dispatcher rejected it downstream:
+     *   call_seh_handlers invalid frame 73da060000 (731E7C8000-731E8C0000)
+     *   NtRaiseException Exception frame is not in stack limits
+     * => NtTerminateProcess(c0000005). A TEB that merely EXISTS is not
+     * this thread's TEB; Tib.Self proves the struct is a TEB, nothing
+     * more. The sp must lie in (DeallocationStack, Tib.StackBase], the
+     * same test is_inside_thread_stack applies, or the exception cannot
+     * be dispatched no matter how correct the frame is.
+     *
+     * All reads go through mach_vm_read_overwrite so a bad candidate
+     * cannot fault this thread (it has no handler of its own). */
+    {
+        uint64_t cand[2] = { state->__x[18], (uint64_t)thread_teb };
+        uint64_t sp = arm_thread_state64_get_sp( *state );
+        int i;
+
+        for (i = 0; i < 2; i++)
+        {
+            uint64_t self = 0, base = 0, dealloc = 0;
+            mach_vm_size_t got = 0;
+
+            if (cand[i] < 0x10000 || (cand[i] & 0xfff)) continue;
+            if (mach_vm_read_overwrite( mach_task_self(),
+                    (mach_vm_address_t)(cand[i] + 0x30), 8,
+                    (mach_vm_address_t)&self, &got ) != KERN_SUCCESS
+                || got != 8 || self != cand[i])
+                continue;
+            if (mach_vm_read_overwrite( mach_task_self(),
+                    (mach_vm_address_t)(cand[i] + 0x08), 8,
+                    (mach_vm_address_t)&base, &got ) != KERN_SUCCESS || got != 8)
+                continue;
+            if (mach_vm_read_overwrite( mach_task_self(),
+                    (mach_vm_address_t)(cand[i] + 0x1478), 8,
+                    (mach_vm_address_t)&dealloc, &got ) != KERN_SUCCESS || got != 8)
+                continue;
+            if (sp > dealloc && sp <= base)
+            {
+                teb = (TEB *)(uintptr_t)cand[i];
+                break;
+            }
+            if (deliver_logs < 24)
+                dprintf( 2, "[mach-deliver] rev=ml372 teb cand%d=0x%llx stack=(0x%llx,0x%llx] does NOT contain sp=0x%llx\n",
+                         i, (unsigned long long)cand[i], (unsigned long long)dealloc,
+                         (unsigned long long)base, (unsigned long long)sp );
+        }
+        if (!teb)
+        {
+            /* ml378: BEST-EFFORT DELIVERY instead of declining.
+             *
+             * ml372 declined here because a frame outside the TEB's stack made
+             * call_seh_handlers reject it and NtRaiseException kill the process.
+             * But declining is not the safe option it looked like: while
+             * StikDebug is attached the declined fault cannot be converted to a
+             * BSD signal at all, so it repeats until the script kills the WHOLE
+             * app after 8 stops — which is exactly how ml378 died
+             * (`DECLINE pc=0x14f5e36cc … no TEB owns this stack`, 8 repeats).
+             *
+             * The reason for declining is also gone: the ml377 ntdll fix makes a
+             * first-step bad frame an ordinary UNHANDLED exception rather than
+             * EXCEPTION_STACK_INVALID + immediate terminate. So delivering on the
+             * guest's own stack now degrades to "the guest sees an unhandled
+             * exception" (its filter runs, its pseudo-process dies) instead of
+             * taking everything down.
+             *
+             * Use any SELF-CONSISTENT TEB (Tib.Self check already done above);
+             * virtual_setup_exception's "outside thread stack" branch handles the
+             * frame placement and verifies writability. */
+            uint64_t cand2[2] = { state->__x[18], (uint64_t)thread_teb };
+            int j;
+            for (j = 0; j < 2 && !teb; j++)
+            {
+                uint64_t self = 0;
+                mach_vm_size_t got = 0;
+                if (cand2[j] < 0x10000 || (cand2[j] & 0xfff)) continue;
+                if (mach_vm_read_overwrite( mach_task_self(),
+                        (mach_vm_address_t)(cand2[j] + 0x30), 8,
+                        (mach_vm_address_t)&self, &got ) == KERN_SUCCESS
+                    && got == 8 && self == cand2[j])
+                    teb = (TEB *)(uintptr_t)cand2[j];
+            }
+            if (deliver_logs < 24)
+            {
+                deliver_logs++;
+                dprintf( 2, "[mach-deliver] rev=ml378 no TEB owns sp=0x%llx (pc=0x%llx x18=0x%llx "
+                            "registry=0x%llx) -> %s\n",
+                         (unsigned long long)sp, (unsigned long long)pc,
+                         (unsigned long long)state->__x[18], (unsigned long long)thread_teb,
+                         teb ? "BEST-EFFORT delivery on guest stack" : "DECLINE (no usable TEB at all)" );
+            }
+            if (!teb) return 0;
+        }
+        thread_teb = (uintptr_t)teb;
+    }
+
+    /* iOS-Mythic ml413 (#60/#66): xtajit64 stamps TEB->Instrumentation[8]
+     * (+0x16f8) with the mutex address while a thread holds a FEX shared lock
+     * (CodeInvalidationMutex read hold during CompileCode). Redirecting such a
+     * thread to KiUserExceptionDispatcher abandons the compile without
+     * unwinding — the read hold leaks and every later writer/reader parks
+     * forever (the ml413 wedge: word=0x40010001). Log-only for now: prove or
+     * refute this path before changing delivery behavior. */
+    {
+        static int deliver_hold_logs;
+        uint64_t held_lock = 0;
+        if (thread_teb)
+            held_lock = *(volatile uint64_t *)((char *)(uintptr_t)thread_teb + 0x16f8);
+        if (held_lock && deliver_hold_logs < 16)
+        {
+            deliver_hold_logs++;
+            dprintf( 2, "[deliver-hold] teb=0x%llx tid=%04x HOLDS FEX shared lock @0x%llx at guest redirect "
+                        "(pc=0x%llx addr=0x%llx) — this delivery leaks the read hold\n",
+                     (unsigned long long)thread_teb,
+                     *(volatile unsigned int *)((char *)(uintptr_t)thread_teb + 0x48),
+                     (unsigned long long)held_lock,
+                     (unsigned long long)pc, (unsigned long long)fault_addr );
+        }
+    }
+
+    /* fabricate a ucontext over the fetched thread state so the existing
+     * conversion helpers (save_context, sig macros) apply unchanged */
+    memset( &uc, 0, sizeof(uc) );
+    memset( &mc, 0, sizeof(mc) );
+    mc.__ss = *state;
+    if (have_neon) mc.__ns = *neon;
+    {
+        arm_exception_state64_t es;
+        mach_msg_type_number_t ecount = ARM_EXCEPTION_STATE64_COUNT;
+        if (thread_get_state( thread, ARM_EXCEPTION_STATE64,
+                              (thread_state_t)&es, &ecount ) == KERN_SUCCESS)
+            mc.__es = es;
+        else
+            mc.__es.__far = fault_addr;
+    }
+    uc.uc_mcontext = &mc;
+
+    if (exception == EXC_BAD_INSTRUCTION)
+        rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+    else
+    {
+        uint32_t esr = (uint32_t)mc.__es.__esr, esr_ec = esr >> 26;
+        NTSTATUS st;
+        rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        rec.NumberParameters = 2;
+        if (esr_ec == 0x20 || esr_ec == 0x21) rec.ExceptionInformation[0] = EXCEPTION_EXECUTE_FAULT;
+        else if (esr & 0x40) rec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
+        else rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
+        rec.ExceptionInformation[1] = fault_addr;
+
+        /* wine's page machinery gets first shot, on the FIRST occurrence —
+         * the ml369 run showed the 0x712bXX..ed5c faults are guest-STACK
+         * pages (guest rsp just below the address, one fault each across 4
+         * sibling threads), exactly what virtual_handle_fault services; in
+         * the Mach-only regime it had never run at all. Guard growth /
+         * write-watch clears resume with no guest exception;
+         * GUARD_PAGE_VIOLATION / STACK_OVERFLOW must be dispatched
+         * immediately (wine semantics — state is consistent, no repeat
+         * gating). */
+        st = ios_virtual_handle_fault_for_thread( &rec, teb );
+        if (!st)
+        {
+            if (deliver_logs < 24)
+            {
+                deliver_logs++;
+                dprintf( 2, "[mach-deliver] rev=ml369 page-serviced pc=0x%llx addr=0x%llx (guard/watch), retrying\n",
+                         (unsigned long long)pc, (unsigned long long)fault_addr );
+            }
+            return 2;
+        }
+        if (st != STATUS_ACCESS_VIOLATION) goto dispatch;
+    }
+
+    /* only claim faults in plausibly GUEST-side execution:
+     *   - the JIT pool (translated guest + FEX-emitted + pool-copied code),
+     *   - pc < 4GB: nothing legitimate executes there (pool base is
+     *     >= 0x119000000, dyld cache >= 0x180000000) — covers the pc=0
+     *     zeroed-EC-dispatch family that killed the ml369 run,
+     *   - the guest VA band (PE VAs / guest pointers as branch targets).
+     * Host dylib and unix-side pcs keep the old decline path —
+     * dispatching a guest exception on those contexts would be wrong. */
+    if (!((rxb && pc >= rxb && pc < rxb + ios_jit_pool_size_global) ||
+          pc < 0x100000000ULL ||
+          (pc >= 0x7000000000ULL && pc < 0x7400000000ULL)))
+        return 0;
+
+    /* transient-retry absorption: races with concurrent mprotect / FEX
+     * invalidation are fixed by re-execution and were free retries under
+     * the decline regime. Dispatch only on the 3rd identical
+     * (thread,pc,addr) fault — still well before the script's 8-stop kill.
+     * Single server thread services all messages: no atomics needed. */
+    {
+        static struct { uint64_t key; uint32_t n; } rep[16];
+        uint64_t key = ((uint64_t)thread << 48) ^ pc ^ ((uint64_t)fault_addr << 1);
+        int slot = (int)((key >> 4) & 15);
+        if (rep[slot].key != key) { rep[slot].key = key; rep[slot].n = 1; return 0; }
+        if (++rep[slot].n < 3) return 0;
+    }
+
+dispatch:
+    /* resolve the dispatcher for the TARGET's pseudo-process (this thread
+     * has no pseudo-process identity, so IOS_PFUNC would always fall back
+     * to the session ntdll) */
+    {
+        void *peb_id = *(void **)(thread_teb + 0x60);
+        const struct ios_ntdll_funcs *f = ios_ntdll_funcs_for_peb( peb_id );
+        dispatcher = f ? f->KiUserExceptionDispatcher : (void *)pKiUserExceptionDispatcher;
+    }
+    if (!dispatcher) return 0;
+
+    rec.ExceptionAddress = (void *)(uintptr_t)pc;
+    {
+        uint64_t pe = ios_jit_reverse_translate( pc, NULL );
+        if (pe) rec.ExceptionAddress = (void *)(uintptr_t)pe;
+    }
+
+    frame_addr = ios_virtual_setup_exception_for_thread(
+        (void *)(SP_sig(&uc) & ~15), sizeof(frame), &rec, teb );
+    if (!frame_addr)
+    {
+        if (deliver_logs < 24)
+        {
+            deliver_logs++;
+            dprintf( 2, "[mach-deliver] rev=ml369 CANNOT deliver pc=0x%llx addr=0x%llx sp=0x%llx (frame unwritable)\n",
+                     (unsigned long long)pc, (unsigned long long)fault_addr,
+                     (unsigned long long)SP_sig(&uc) );
+        }
+        return 0;
+    }
+
+    /* build the dispatch frame locally, then place it with mach_vm_write —
+     * a raw store through a bad target sp would fault THIS thread, which
+     * has no handler of its own and would wedge the whole app.
+     * context_init_empty_xstate stores struct-relative offsets only, so
+     * computing it in the local copy is exact. */
+    memset( &frame, 0, sizeof(frame) );
+    save_context( &frame.context, &uc );
+    frame.rec = rec;
+    context_init_empty_xstate( &frame.context, frame.redzone );
+
+    if (mach_vm_write( mach_task_self(), (mach_vm_address_t)(uintptr_t)frame_addr,
+                       (vm_offset_t)(uintptr_t)&frame, sizeof(frame) ) != KERN_SUCCESS)
+    {
+        if (deliver_logs < 24)
+        {
+            deliver_logs++;
+            dprintf( 2, "[mach-deliver] rev=ml369 mach_vm_write FAILED frame=%p pc=0x%llx\n",
+                     frame_addr, (unsigned long long)pc );
+        }
+        return 0;
+    }
+
+    SP_sig(&uc) = (ULONG_PTR)frame_addr;
+    PC_sig(&uc) = (ULONG_PTR)dispatcher;
+    REGn_sig(18, &uc) = thread_teb;
+
+    *state = mc.__ss;
+
+    if (deliver_logs < 24 || (deliver_logs % 100) == 0)
+        dprintf( 2, "[mach-deliver] rev=ml369 #%d code=%08x pc=0x%llx excaddr=%p addr=0x%llx frame=%p teb=%p disp=%p\n",
+                 deliver_logs, (unsigned int)rec.ExceptionCode,
+                 (unsigned long long)pc, rec.ExceptionAddress,
+                 (unsigned long long)fault_addr, frame_addr, (void *)thread_teb, dispatcher );
+    deliver_logs++;
+
+    /* iOS-Mythic ml422 (#70): a webhelper thread died STATUS_STACK_OVERFLOW
+     * right after the first CreateBrowser (ml421). Name the dying thread's
+     * stack RESERVE so the verdict is direct: a Windows-sized (512KB/1MB)
+     * stack overflowing = EC native-frame inflation → the ml422 4MB floor is
+     * the fix; a 4MB stack STILL overflowing = pathological unbounded
+     * recursion → chase the recursion instead. TEB Tib: StackBase +0x8,
+     * StackLimit +0x10, DeallocationStack +0x1478. */
+    if (rec.ExceptionCode == 0xC00000FD && thread_teb > 0x10000)
+    {
+        static int ovf_logs;
+        if (ovf_logs < 8 && ++ovf_logs <= 8)
+        {
+            unsigned long long sb = *(unsigned long long *)(thread_teb + 0x8);
+            unsigned long long sl = *(unsigned long long *)(thread_teb + 0x10);
+            unsigned long long da = *(unsigned long long *)(thread_teb + 0x1478);
+            dprintf( 2, "[stack-ovf] rev=ml424 teb=%p StackBase=0x%llx StackLimit=0x%llx "
+                     "DeallocationStack=0x%llx reserve=0x%llx (floor now 0x800000)\n",
+                     (void *)thread_teb, sb, sl, da, sb - da );
+
+            /* ml424 (#70 round 2): a 4MB stack STILL overflowed and the SEH
+             * unwinder's pcs went mid-instruction after ~4k frames (walking a
+             * garbage chain), so the unwind cannot name the consumer. Sample
+             * the RAW stack at three depths instead — real frames litter
+             * return addresses, and a recursion cycle repeats at every depth.
+             * Windows: just above the fault (freshest), mid-stack, and just
+             * below StackBase (the recursion's entry). mach reads only. */
+            if (sb > da && sb - da <= 0x4000000 && fault_addr > da && fault_addr < sb)
+            {
+                extern unsigned long long ios_jit_module_base_for_va(unsigned long long va, unsigned long long *size_out);
+                static uint64_t ovf_buf[512];
+                unsigned long long lo = (fault_addr + 0x3fffULL) & ~0x3fffULL;
+                int w;
+                for (w = 0; w < 3; w++)
+                {
+                    unsigned long long wbase = (w == 0) ? lo
+                                             : (w == 1) ? lo + (sb - lo) / 2
+                                             : sb - sizeof(ovf_buf);
+                    mach_vm_size_t got = 0;
+                    int wi, nw, whits = 0;
+                    /* ml425 cycle-density: the ml424 fingerprint proved a repeating
+                     * cycle but capped at 8 prints — COUNT every distinct code-like
+                     * value across the whole window so frames-per-cycle is measured,
+                     * not guessed (the logged cef cascade was only ~45 lines and
+                     * cannot explain 8MB; the counts arbitrate). */
+                    uint64_t uq[24]; int uqn[24]; int nuq = 0, total_code = 0;
+                    if (wbase < lo) wbase = lo;
+                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)wbase,
+                            sizeof(ovf_buf), (mach_vm_address_t)(uintptr_t)ovf_buf, &got ) != KERN_SUCCESS)
+                        continue;
+                    nw = (int)(got / 8);
+                    for (wi = 0; wi < nw; wi++)
+                    {
+                        uint64_t v = ovf_buf[wi];
+                        unsigned long long msz = 0;
+                        unsigned long long mbase = ios_jit_module_base_for_va( v, &msz );
+                        const unsigned char *mb;
+                        const char *mname = "?";
+                        unsigned int e_lf, exp_rva, name_rva;
+                        int k;
+                        if (!mbase) continue;
+                        total_code++;
+                        for (k = 0; k < nuq; k++) if (uq[k] == v) { uqn[k]++; break; }
+                        if (k == nuq && nuq < 24) { uq[nuq] = v; uqn[nuq] = 1; nuq++; }
+                        if (whits >= 8) continue;
+                        mb = (const unsigned char *)(uintptr_t)mbase;
+                        if (mb[0] == 'M' && mb[1] == 'Z' &&
+                            (e_lf = *(const unsigned int *)(mb + 0x3c)) < 0x1000 &&
+                            (exp_rva = *(const unsigned int *)(mb + e_lf + 0x88)) &&
+                            exp_rva < msz &&
+                            (name_rva = *(const unsigned int *)(mb + exp_rva + 0x0c)) &&
+                            name_rva < msz)
+                            mname = (const char *)(mb + name_rva);
+                        else if (mb[0] == 'M' && mb[1] == 'Z')
+                            mname = "(exe)";
+                        dprintf( 2, "[stack-ovf]   w%d +%03x: %llx  %.32s+0x%llx\n",
+                                 w, wi * 8, (unsigned long long)v, mname,
+                                 (unsigned long long)(v - mbase) );
+                        whits++;
+                    }
+                    dprintf( 2, "[stack-ovf]   w%d base=0x%llx scanned=%d code-like=%d distinct=%d\n",
+                             w, wbase, nw, total_code, nuq );
+                    {
+                        int k;
+                        for (k = 0; k < nuq; k++)
+                            if (uqn[k] >= 4)
+                                dprintf( 2, "[stack-ovf]   w%d density: %llx x%d\n",
+                                         w, (unsigned long long)uq[k], uqn[k] );
+                    }
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+/* ml374: the Mach exception-server thread has NO wine TEB, so every wine log
+ * macro reachable from the delivery path dies inside __wine_dbg_output. Two
+ * runs were lost to exactly that — ml370 (my WARN in the cross-thread fault
+ * handler) and ml374 (mprotect_exec's unconditional ERR, reached via
+ * mprotect_range while servicing a guard page) — and both presented as an
+ * unexplained crash at a host pc with NO log lines, because the thread that
+ * does the logging is the thread that died.
+ *
+ * Raising ios_in_mach_exc across the whole call lets shared helpers that
+ * legitimately log on normal threads stay silent here, without every one of
+ * them needing its own iOS special case. Wrapper rather than inline flag
+ * management so no early return can leak the flag set — that would silence
+ * wine's logging process-wide and destroy the next run's diagnostics. */
+static int ios_mach_deliver_guest_exception( thread_t thread, arm_thread_state64_t *state,
+                                             arm_neon_state64_t *neon, int have_neon,
+                                             int exception, uintptr_t fault_addr,
+                                             uintptr_t thread_teb )
+{
+    extern volatile int ios_in_mach_exc;
+    int r;
+
+    ios_in_mach_exc = 1;
+    r = ios_mach_deliver_guest_exception_inner( thread, state, neon, have_neon,
+                                                exception, fault_addr, thread_teb );
+    ios_in_mach_exc = 0;
+    return r;
+}
+#endif  /* WINE_IOS */
+
+
 /***********************************************************************
  *           call_user_apc_dispatcher
  */
@@ -4178,11 +5296,90 @@ static int probe_ptr_ok( uint64_t frame )
     return v >= 0x100000000ull && v < 0x8000000000ull;
 }
 
+#ifdef WINE_IOS
+/* ml375: make wine's own logging survivable in a signal handler.
+ *
+ * THREE runs (ml370/374/375) died at the identical instruction —
+ * `__wine_dbg_header+0x100: ldr w8,[x25,#4]` — and I misread it twice because
+ * my slide arithmetic anchored on the wrong symbol. Deriving the slide from
+ * the FAULTING INSTRUCTION (search the dylib for the reported insn word, match
+ * the delta to a symbol) instead of a guessed anchor is what finally pinned it.
+ *
+ * Cause: wine's ERR/WARN/TRACE reach __wine_dbg_header -> get_info() ->
+ * ntdll_get_thread_data() -> NtCurrentTeb(), and on this port NtCurrentTeb()
+ * resolves through TSD slot 275. A thread that never registered a TEB (threads
+ * CEF/FEX create directly, and anything faulting before its [tsd275] SET) has
+ * slot 275 == NULL, so the very first ERR in a handler dereferences NULL, which
+ * raises another SIGSEGV at the SAME pc, forever — the debugger script then
+ * kills the app after 8 identical stops. The handler dies reporting the fault
+ * it was called to report, which is why the log ends with no explanation.
+ *
+ * This only became fatal once faults started reaching the BSD handlers again
+ * (the ml372 DECLINE path), so it reads like a new bug but is long-latent.
+ *
+ * Fix: before ANY logging, guarantee slot 275 is non-NULL, falling back to the
+ * process-wide signal TEB. Returns 0 when no TEB could be established, and
+ * callers must then use dprintf(2,...) rather than a wine macro. */
+static int ios_make_wine_logging_safe( void )
+{
+    extern pthread_key_t ios_teb_tls_key;
+    extern int ios_teb_tls_key_created;
+    uintptr_t tsd_base;
+    void *teb;
+
+    /* ml376 CORRECTION — ml375's version tested the WRONG SLOT and changed
+     * nothing (zero [dbg-teb] lines, identical crash). Disassembling
+     * __wine_dbg_header settled it instead of another guess:
+     *   1f8628: bl _NtCurrentTeb
+     *   1f862c: add x25, x0, #0x3000        <- x25 = TEB + 0x3000
+     *   1f86ec: ldr w8, [x25, #4]           <- FAULTS
+     * and _NtCurrentTeb is `ldr x0,[page+0xcf8]; b <stub>` =
+     * pthread_getspecific(ios_teb_tls_key) — the PTHREAD KEY, not TSD slot
+     * 275 (slot 275 is only the x18-patcher trampolines' copy; the two are
+     * independent, and the [tsd275] dump prints them side by side for exactly
+     * this reason). With no value for that key NtCurrentTeb() returns NULL,
+     * x25 becomes 0x3000, and the read faults at 0x3004.
+     *
+     * ml376 log confirms such threads exist: `[mach_exc] UNHANDLED #4 …
+     * x18=0x0`.
+     *
+     * Populate the key (and slot 275) from the best TEB available so every
+     * wine log macro in the handler — not just the first — is safe. Returns 0
+     * only when no TEB exists at all, in which case callers must dprintf. */
+    if (ios_teb_tls_key_created && (teb = pthread_getspecific( ios_teb_tls_key )))
+        return 1;
+
+    teb = NULL;
+    __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
+    tsd_base &= ~7ULL;
+    if (tsd_base) teb = *(void **)(tsd_base + 275 * 8);
+    if (!teb) teb = (void *)ios_teb_for_signals;
+    if (!teb) return 0;
+
+    if (ios_teb_tls_key_created) pthread_setspecific( ios_teb_tls_key, teb );
+    if (tsd_base) *(void **)(tsd_base + 275 * 8) = teb;
+    {
+        static int borrow_n;
+        if (borrow_n < 8)
+        {
+            borrow_n++;
+            dprintf( 2, "[dbg-teb] rev=ml376 NtCurrentTeb() was NULL in a signal handler — "
+                        "installed teb=%p (every wine ERR/WARN here would have faulted at 0x3004)\n",
+                     teb );
+        }
+    }
+    return 1;
+}
+#endif
+
 static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { 0 };
     ucontext_t *context = sigcontext;
     DWORD64 esr = get_fault_esr( context );
+#ifdef WINE_IOS
+    const int dbg_ok = ios_make_wine_logging_safe();
+#endif
 
 #ifdef WINE_IOS
     ios_track_signal( signal, context );
@@ -4197,8 +5394,13 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         uint64_t native_x18;
         __asm__ volatile("mov %0, x18" : "=r"(native_x18));
 
-        /* Log first few SEGVs with both native and ucontext x18 */
-        if (total_segv_count <= 5)
+        /* Log first few SEGVs with both native and ucontext x18.
+         * ml375: dprintf when no TEB could be established — a wine macro here
+         * faults inside __wine_dbg_header and loops the handler forever. */
+        if (total_segv_count <= 5 && !dbg_ok)
+            dprintf( 2, "SEGV #%d: pc=%p addr=%p (no TEB — wine logging unsafe)\n",
+                     total_segv_count, pc, siginfo->si_addr );
+        else if (total_segv_count <= 5)
             ERR("SEGV #%d: pc=%p addr=%p uctx_x18=%p disp=%llu mach_exc=%d\n",
                 total_segv_count, pc, siginfo->si_addr,
                 (void*)REGn_sig(18, context),
@@ -4710,20 +5912,35 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                                 (mach_vm_address_t)(state + 0xB0), sizeof(cr),
                                 (mach_vm_address_t)cr, &g2 ) == KERN_SUCCESS && g2 == sizeof(cr))
                         {
-                            unsigned long long depth =
-                                (cr[0] > cr[1]) ? (cr[0] - cr[1]) / 8 : 0;
+                            /* ml381 UNITS FIX. This printed (sp - base) / 8 and
+                             * called it "depth", which is wrong twice over: the
+                             * stack starts at base + 4MB (DefaultLocation) and
+                             * grows DOWN, and entries are 16 bytes, not 8. An
+                             * EMPTY stack therefore printed depth=524288 — and I
+                             * read ml377's 500262 and ml380's 522626 as a
+                             * half-million-entry LEAK and proposed chasing task
+                             * #42, when the true occupancies were 12,013 and 831
+                             * entries (4.6% and 0.3% of the window). Print what
+                             * is actually being asked — entries USED — so it
+                             * cannot be misread again. */
+                            unsigned long long dflt = cr[1] + 0x400000;
+                            unsigned long long used_b = (dflt > cr[0]) ? dflt - cr[0] : 0;
 
-                            ERR("  [callret] sp=%p base=%p depth=%llu\n",
-                                (void *)cr[0], (void *)cr[1], depth );
+                            ERR("  [callret] sp=%p base=%p default=%p used=%llu entries (%llu bytes, %llu%% of 4MB)\n",
+                                (void *)cr[0], (void *)cr[1], (void *)(uintptr_t)dflt,
+                                used_b / 16, used_b, (used_b * 100) / 0x400000 );
 
                             /* ml213: the cap was 0x100000, but a real run had depth=168218
                              * (1.28MB of stack) and the dump was skipped for no good
                              * reason — only the TOP n*8 bytes are ever read, so the total
                              * size never mattered. Bound it generously, purely as a
                              * sanity check against a garbage sp/base pair. */
-                            if (depth && cr[0] - cr[1] <= 0x10000000)
+                            if (used_b && cr[0] - cr[1] <= 0x10000000)
                             {
-                                unsigned n = depth > 8 ? 8 : (unsigned)depth;
+                                /* ml381: qwords to dump from the top of the
+                                 * stack — 2 qwords per 16-byte entry. */
+                                unsigned long long qw = (used_b / 8);
+                                unsigned n = qw > 8 ? 8 : (unsigned)qw;
 
                                 if (mach_vm_read_overwrite( mach_task_self(),
                                         (mach_vm_address_t)(cr[0] - (uint64_t)n * 8),
@@ -5222,8 +6439,10 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     EXCEPTION_RECORD rec = { EXCEPTION_ILLEGAL_INSTRUCTION };
     ucontext_t *context = sigcontext;
 #ifdef WINE_IOS
+    const int ill_dbg_ok = ios_make_wine_logging_safe();  /* ml375: before any ERR */
     ios_track_signal( signal, context );
-    ERR("ILL at pc=%p\n", (void*)PC_sig(context));
+    if (ill_dbg_ok) ERR("ILL at pc=%p\n", (void*)PC_sig(context));
+    else dprintf( 2, "ILL at pc=%p (no TEB — wine logging unsafe)\n", (void*)PC_sig(context) );
     {
         /* iOS-Mythic diagnostic: when we ILL on a zero/empty page, dump full
          * register state + walk back FP chain to find who BR'd here. */
@@ -5480,6 +6699,74 @@ static int ios_emulate_store(ucontext_t *ctx, uint32_t insn, uintptr_t rw_addr)
         }
     }
 
+    /* ml408 (#66→#60): CAS/CASA/CASL/CASAL Ws/Xs, Wt/Xt, [Xn] — LSE
+     * compare-and-swap on the pool RX alias. The [atomic-mem] probe settled
+     * ml264's open question: the page is R-X (prot=5), so ANY write faults —
+     * reading (b) was right, and the fix is the same RW-alias redirect the
+     * plain stores above use. Acquire/release collapse to SEQ_CST (stronger).
+     * Rs receives the observed old value (zero-extended for W forms).
+     * 1x00 1000 1L1 Rs o0 11111 Rn Rt — ml408 killer: 0x88eafe89
+     * CASAL W10, W9, [X20]; ml264 also saw 0xc8f1fd60 CASAL X17, X0, [X11]. */
+    if ((insn & 0xBFA07C00) == 0x88A07C00)
+    {
+        int rs = (insn >> 16) & 0x1F;
+        int sz64 = (insn >> 30) & 1;
+        static int cas_log;
+        if (sz64)
+        {
+            uint64_t exp = ios_get_reg(ctx, rs);
+            __atomic_compare_exchange_n((uint64_t *)rw_addr, &exp, rt_val,
+                                        0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            if (rs != 31) REGn_sig(rs, ctx) = exp;
+        }
+        else
+        {
+            uint32_t exp = (uint32_t)ios_get_reg(ctx, rs);
+            __atomic_compare_exchange_n((uint32_t *)rw_addr, &exp, (uint32_t)rt_val,
+                                        0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            if (rs != 31) REGn_sig(rs, ctx) = exp;
+        }
+        if (cas_log++ < 8)
+            ERR("[cas-emu] CAS%s insn=0x%08x rw=%p rs=%d rt=%d -> emulated on RW alias\n",
+                sz64 ? "64" : "32", insn, (void *)rw_addr, rs, rt);
+        return 1;
+    }
+
+    /* CASP/CASPA/CASPL/CASPAL pair forms (ml264: 0x4866fd64/0x4866fe6a):
+     * 0sz0 1000 0L1 Rs o0 11111 Rn Rt, Rs/Rt even. Hardware caspal on the RW
+     * alias so we stay atomic against FEX's own native RW-alias atomics. */
+    if ((insn & 0xBFA07C00) == 0x08207C00)
+    {
+        int rs = (insn >> 16) & 0x1F;
+        int sz64 = (insn >> 30) & 1;
+        static int casp_log;
+        uint64_t v0 = ios_get_reg(ctx, rs), v1 = ios_get_reg(ctx, rs + 1);
+        uint64_t v2 = ios_get_reg(ctx, rt), v3 = ios_get_reg(ctx, rt + 1);
+        register uint64_t c0 asm("x0") = v0;
+        register uint64_t c1 asm("x1") = v1;
+        register uint64_t c2 asm("x2") = v2;
+        register uint64_t c3 asm("x3") = v3;
+        if (sz64)
+            asm volatile(".arch_extension lse\n\tcaspal x0, x1, x2, x3, [%4]"
+                         : "+r"(c0), "+r"(c1)
+                         : "r"(c2), "r"(c3), "r"(rw_addr)
+                         : "memory");
+        else
+            asm volatile(".arch_extension lse\n\tcaspal w0, w1, w2, w3, [%4]"
+                         : "+r"(c0), "+r"(c1)
+                         : "r"(c2), "r"(c3), "r"(rw_addr)
+                         : "memory");
+        if (rs != 31)
+        {
+            REGn_sig(rs, ctx) = c0;
+            REGn_sig(rs + 1, ctx) = c1;
+        }
+        if (casp_log++ < 8)
+            ERR("[cas-emu] CASP%s insn=0x%08x rw=%p rs=%d rt=%d -> emulated on RW alias\n",
+                sz64 ? "64" : "32", insn, (void *)rw_addr, rs, rt);
+        return 1;
+    }
+
     return 0;  /* unhandled instruction */
 }
 #endif
@@ -5494,6 +6781,7 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { EXCEPTION_DATATYPE_MISALIGNMENT };
 #ifdef WINE_IOS
+    ios_make_wine_logging_safe();   /* ml375: before any ERR/WARN — see helper */
     ios_track_signal( signal, sigcontext );
     static int bus_count = 0;
     bus_count++;
@@ -5719,6 +7007,140 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             }
             ERR("BUS: unhandled store insn=0x%08x at pc=%p addr=%p\n",
                 insn, pc, siginfo->si_addr);
+        }
+
+        /* 3. iOS-Mythic ml420 (#69, ml419 fatal chain): data fault with the
+         * TARGET outside the pool. Two previously-unhandled sub-cases died
+         * insanely here:
+         *
+         *   (a) Darwin delivers PROTECTION faults as SIGBUS (KERN_PROTECTION_
+         *       FAILURE), not SIGSEGV — so every wine-legitimate PROT_NONE
+         *       state (guard page, write-watch, commit-on-fault) that
+         *       segv_handler repairs via virtual_handle_fault was unreachable
+         *       from this handler and fell through to a bogus 80000002.
+         *   (b) pc in the JIT pool + an UNREADABLE target page (ml419: emitted
+         *       libcef sqlite code reading a stripped .rdata page): raising
+         *       80000002 sent FEX down HandleUnalignedAccess (useless — the
+         *       PAGE is the problem, not alignment) and the exception record
+         *       carried the raw host pc into guest dispatch.
+         *
+         * Order: wine repair first; then a safe readability probe decides
+         * honest-AV (unreadable) vs genuine-alignment 80000002 (readable). */
+        if (!is_exec_fault && !(rx && fault >= rx && fault < rx + pool_sz))
+        {
+            EXCEPTION_RECORD vrec = { EXCEPTION_ACCESS_VIOLATION };
+            mach_vm_size_t rd_out = 0;
+            uint64_t rd_buf = 0;
+            kern_return_t rd_kr;
+
+            vrec.NumberParameters = 2;
+            vrec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;  /* refined below if the insn is a store */
+            vrec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
+            vrec.ExceptionAddress = (void *)PC_sig(bus_ctx);
+            {
+                uint32_t f_insn = *(uint32_t *)(uintptr_t)PC_sig(bus_ctx);
+                /* loads have bit22 set in the ld/st register/immediate classes;
+                 * good enough to label the fault direction for wine's repair */
+                if ((f_insn & 0x0a000000) == 0x08000000 && !(f_insn & 0x00400000))
+                    vrec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
+            }
+
+            if (!virtual_handle_fault( &vrec, (void *)SP_sig(bus_ctx) ))
+            {
+                static int bus_healed;
+                if (bus_healed < 16 && ++bus_healed <= 16)
+                    ERR("[bus-heal] virtual_handle_fault repaired addr=%p (pc=%p) — "
+                        "guard/watch/commit state, was fatal before ml420\n",
+                        siginfo->si_addr, pc);
+                ios_fixup_x18_for_return( bus_ctx );
+                return;
+            }
+
+            rd_kr = mach_vm_read_overwrite( mach_task_self(),
+                                            (mach_vm_address_t)(uintptr_t)siginfo->si_addr & ~7ULL,
+                                            8, (mach_vm_address_t)(uintptr_t)&rd_buf, &rd_out );
+
+            /* name the memory once per class — this is the probe that finally
+             * identifies WHAT state the page is in (ml419 had no region info) */
+            {
+                static int busrgn2;
+                if (busrgn2++ < 10)
+                {
+                    mach_vm_address_t ba = (mach_vm_address_t)(uintptr_t)siginfo->si_addr;
+                    mach_vm_size_t bs = 0;
+                    vm_region_basic_info_data_64_t bbi;
+                    mach_msg_type_number_t bbc = VM_REGION_BASIC_INFO_COUNT_64;
+                    mach_port_t bbo = MACH_PORT_NULL;
+                    mach_vm_address_t xa = ba;
+                    mach_vm_size_t xs = 0;
+                    vm_region_extended_info_data_t xi;
+                    mach_msg_type_number_t xc = VM_REGION_EXTENDED_INFO_COUNT;
+                    mach_port_t xo = MACH_PORT_NULL;
+
+                    ERR("[bus-rgn] si_code=%d addr=%p pc=%p pc_in_pool=%d readable=%d\n",
+                        siginfo->si_code, siginfo->si_addr, pc,
+                        (rx && (uintptr_t)pc >= rx && (uintptr_t)pc < rx + pool_sz) ? 1 : 0,
+                        rd_kr == KERN_SUCCESS);
+                    if (mach_vm_region( mach_task_self(), &ba, &bs, VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&bbi, &bbc, &bbo ) == KERN_SUCCESS &&
+                        mach_vm_region( mach_task_self(), &xa, &xs, VM_REGION_EXTENDED_INFO,
+                                        (vm_region_info_t)&xi, &xc, &xo ) == KERN_SUCCESS)
+                        ERR("[bus-rgn]   region=0x%llx+0x%llx prot=%d max=%d share_mode=%d user_tag=%d\n",
+                            (unsigned long long)ba, (unsigned long long)bs,
+                            bbi.protection, bbi.max_protection, xi.share_mode, xi.user_tag);
+                    else
+                        ERR("[bus-rgn]   mach_vm_region FAILED (address unmapped)\n");
+                    {
+                        extern void ios_dump_fault_region( void *addr );
+                        ios_dump_fault_region( siginfo->si_addr );
+                    }
+                }
+            }
+
+            if (rd_kr != KERN_SUCCESS)
+            {
+                /* ml419's exact scenario: wine's bookkeeping says the page is
+                 * committed+readable, but the HOST protection lost READ (a raw
+                 * mprotect/mach call behind wine's back — no guest protect
+                 * call touched the range all run). Put wine's intended prot
+                 * back and resume; the [bus-rgn] dump above names the culprit
+                 * region state for the real fix. Capped: a storm means the
+                 * stripper is active and re-stripping — then die honestly. */
+                extern int ios_page_expected_prot( const void *addr );
+                int want = ios_page_expected_prot( siginfo->si_addr );
+                if (want > 0 && (want & PROT_READ))
+                {
+                    static int rehealed;
+                    if (rehealed < 8 && ++rehealed <= 8)
+                    {
+                        /* 16KB host pages; `host_page_size` in this file is the
+                         * Mach FUNCTION, not a size (see the ml-era note above) */
+                        enum { BUS_HPAGE = 0x4000 };
+                        char *hpage = (char *)((uintptr_t)siginfo->si_addr & ~(uintptr_t)(BUS_HPAGE - 1));
+                        if (!mprotect( hpage, BUS_HPAGE, want ))
+                        {
+                            ERR("[bus-reheal] #%d restored prot=%d on %p (wine says committed"
+                                "+readable; host had stripped it) — resuming\n",
+                                rehealed, want, hpage);
+                            ios_fixup_x18_for_return( bus_ctx );
+                            return;
+                        }
+                        ERR("[bus-reheal] #%d mprotect(%p, want=%d) FAILED errno=%d — falling to AV\n",
+                            rehealed, (void *)hpage, want, errno);
+                    }
+                }
+                /* unreadable target = an access violation, NOT misalignment.
+                 * Deliver the honest AV; FEX's ResetToConsistentState takes the
+                 * reconstruction path for c0000005 and rewrites the record to
+                 * the true guest RIP (proven in ml419's fault #27 flow). */
+                rec = vrec;
+                ERR("BUS->AV: unreadable target addr=%p pc=%p rw=%d rev=ml420\n",
+                    siginfo->si_addr, pc, (int)vrec.ExceptionInformation[0]);
+                goto bus_fatal;
+            }
+            /* readable target: genuine alignment fault — keep 80000002 so FEX's
+             * unaligned-access backpatcher handles it; its NtContinueNative
+             * resume is now honored natively (signal_set_full_context ml420) */
         }
     }
 
@@ -6886,8 +8308,45 @@ void ios_dump_all_thread_stacks(void)
             if (di.dli_fname) { img = strrchr(di.dli_fname, '/'); img = img ? img + 1 : di.dli_fname; }
             if (di.dli_sname) { sym = di.dli_sname; off = st.__pc - (uint64_t)(uintptr_t)di.dli_saddr; }
         }
-        fprintf(stderr, "[thread-stacks] port=0x%x \"%s\" pc=%s`%s+0x%llx\n",
-                threads[i], tname, img, sym, (unsigned long long)off);
+        /* iOS-Mythic ml417 (#68): a pc alone can't tell "blocked in a wait"
+         * from "stopped dead" from "spinning in a fault-retry loop".  ml417
+         * showed FOUR threads (steam.exe's main among them, mid-DllMain of
+         * steamclient64) sampled 37x at __wine_syscall_dispatcher+0xa8 —
+         * `ldr x16,[x18,#0x370]`, which BLOCKS ON NOTHING.  run_state +
+         * suspend_count separate the three cases outright, and at that exact
+         * pc x8 still holds the wine syscall id and x18 the TEB, so the
+         * blocked/looping syscall names itself. */
+        {
+            struct thread_basic_info bi;
+            mach_msg_type_number_t bcnt = THREAD_BASIC_INFO_COUNT;
+            memset(&bi, 0, sizeof(bi));
+            if (thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &bcnt) != KERN_SUCCESS)
+            {
+                bi.run_state = -1;
+                bi.suspend_count = -1;
+            }
+            /* Is the TEB word this pc dereferences (syscall table at TEB+0x370)
+             * actually readable?  If not, the thread is fault-looping/parked on
+             * an unmapped TEB rather than waiting on anything. */
+            char tebstate[40] = "";
+            if (st.__x[18] > 0x10000 && !(st.__x[18] & 0xfff))
+            {
+                uint64_t w = 0;
+                mach_vm_size_t g = 0;
+                if (mach_vm_read_overwrite(mach_task_self(),
+                        (mach_vm_address_t)(st.__x[18] + 0x370), 8,
+                        (mach_vm_address_t)&w, &g) == KERN_SUCCESS && g == 8)
+                    snprintf(tebstate, sizeof(tebstate), " teb+370=0x%llx", (unsigned long long)w);
+                else
+                    snprintf(tebstate, sizeof(tebstate), " teb+370=UNREADABLE");
+            }
+            fprintf(stderr, "[thread-stacks] port=0x%x \"%s\" pc=%s`%s+0x%llx run=%d susp=%d "
+                    "cpu=%d x8=0x%llx x18=0x%llx sp=0x%llx%s\n",
+                    threads[i], tname, img, sym, (unsigned long long)off,
+                    bi.run_state, bi.suspend_count, bi.cpu_usage,
+                    (unsigned long long)st.__x[8], (unsigned long long)st.__x[18],
+                    (unsigned long long)arm_thread_state64_get_sp(st), tebstate);
+        }
         {
             extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
             uint64_t mod = 0, pe_va = ios_jit_reverse_translate(st.__pc, &mod);

@@ -386,15 +386,99 @@ const struct ios_ntdll_funcs *ios_cur_ntdll_funcs(void)
     return NULL;
 }
 
+/* ml369 (#63): same lookup keyed by an explicit PEB — for the Mach
+ * exception-server thread, which has no pseudo-process identity of its own
+ * but delivers guest exceptions into a specific TARGET thread's process. */
+const struct ios_ntdll_funcs *ios_ntdll_funcs_for_peb( void *peb_id )
+{
+    int i, n = ios_proc_ident_count;
+    if (peb_id)
+        for (i = 0; i < n; i++)
+            if (ios_proc_idents[i].peb == peb_id)
+                return ios_proc_idents[i].ntdll_module ? &ios_proc_idents[i].funcs : NULL;
+    return NULL;
+}
+
+/* ml381: find __os_arm64x_dispatch_call_no_redirect's RVA BY SCANNING, not by
+ * hardcoding it.
+ *
+ * The old probe hardcoded RVA 0xC4480, measured against one particular
+ * arm64ec-windows/ntdll.dll build. Rebuilding ntdll (which this port does
+ * routinely — ml377 alone rebuilt it) MOVES that global, and the probe then
+ * dumps an unrelated .data address. In ml380 it printed all-zeros and I nearly
+ * concluded "the ARM64X dispatch globals are NULL in every private EC ntdll
+ * copy" — a fabricated root cause. Verified offline against the CURRENT build:
+ * the real global is at 0xc0bb8 (referenced by 258 exit thunks), NOT 0xc4480.
+ *
+ * Every exit thunk loads it with the pair
+ *   adrp x16, <page> ; ldr x16, [x16, #imm]
+ * so the global is simply the most-referenced .data target of that pattern.
+ * Scanning for it makes the probe correct for any build, forever. Cached.
+ *
+ * 🔑 A hardcoded RVA in a probe is a landmine: it keeps printing plausible
+ * numbers after it stops being right. */
+static unsigned int ios_ec_dispatch_rva( const unsigned char *base )
+{
+    static unsigned int cached;
+    unsigned int e_lfanew, nsec, optsz, sect, i, best_rva = 0, best_hits = 0;
+    unsigned int text_va = 0, text_sz = 0, data_va = 0, data_sz = 0;
+    struct { unsigned int rva, hits; } top[24];
+    unsigned int ntop = 0, off;
+
+    if (cached) return cached;
+    if (!(base[0] == 'M' && base[1] == 'Z')) return 0;
+    e_lfanew = *(const unsigned int *)(base + 0x3c);
+    if (e_lfanew >= 0x1000) return 0;
+    nsec  = *(const unsigned short *)(base + e_lfanew + 6);
+    optsz = *(const unsigned short *)(base + e_lfanew + 20);
+    sect  = e_lfanew + 24 + optsz;
+    for (i = 0; i < nsec && i < 32; i++)
+    {
+        const unsigned char *s = base + sect + i * 40;
+        unsigned int vsz = *(const unsigned int *)(s + 8);
+        unsigned int va  = *(const unsigned int *)(s + 12);
+        if (!memcmp( s, ".text", 5 ))  { text_va = va; text_sz = vsz; }
+        if (!memcmp( s, ".data", 5 ))  { data_va = va; data_sz = vsz; }
+    }
+    if (!text_sz || !data_sz) return 0;
+
+    for (off = 0; off + 8 <= text_sz; off += 4)
+    {
+        unsigned int w0 = *(const unsigned int *)(base + text_va + off);
+        unsigned int w1 = *(const unsigned int *)(base + text_va + off + 4);
+        int immhi, immlo, imm21;
+        unsigned int pc_va, page, tgt, k;
+
+        if ((w0 & 0x9f00001fu) != 0x90000010u) continue;   /* adrp x16, ... */
+        if ((w1 & 0xffc003ffu) != 0xf9400210u) continue;   /* ldr x16,[x16,#imm] */
+        immhi = (int)((w0 >> 5) & 0x7ffff);
+        immlo = (int)((w0 >> 29) & 3);
+        imm21 = (immhi << 2) | immlo;
+        if (imm21 & (1 << 20)) imm21 -= (1 << 21);
+        pc_va = text_va + off;
+        page  = (pc_va & ~0xfffu) + (unsigned int)(imm21 << 12);
+        tgt   = page + (((w1 >> 10) & 0xfff) * 8);
+        if (tgt < data_va || tgt >= data_va + data_sz) continue;
+
+        for (k = 0; k < ntop; k++) if (top[k].rva == tgt) { top[k].hits++; break; }
+        if (k == ntop && ntop < 24) { top[ntop].rva = tgt; top[ntop].hits = 1; ntop++; }
+    }
+    for (i = 0; i < ntop; i++)
+        if (top[i].hits > best_hits) { best_hits = top[i].hits; best_rva = top[i].rva; }
+
+    dprintf( 2, "[thunk-slot] rev=ml381 dispatch-global RVA resolved to 0x%x (%u thunk refs)\n",
+             best_rva, best_hits );
+    cached = best_rva;
+    return best_rva;
+}
+
 /* Thing B probe: a thread wedged in an EC ntdll exit thunk after
  * `blr x16` with x16==1 — the ldr read the ARM64X dispatch global
  * __os_arm64x_dispatch_call_no_redirect and got 1 instead of a code
- * pointer. RVA 0xC4480 in the current arm64ec-windows/ntdll.dll build
- * (adrp 0x1800c4000 + ldr #0x480 against preferred base 0x180000000).
- * Dump the 16-qword neighborhood in EVERY private EC ntdll copy so we
- * can see which copies were initialized (ExitToX64 pointer) and which
- * still hold the on-disk sentinel. lr_va is the wedged thread's lr
- * pre-translated to a module VA (or raw if translation failed). */
+ * pointer. Dump the neighborhood in EVERY private EC ntdll copy so we can see
+ * which copies were initialized (ExitToX64 pointer) and which still hold the
+ * on-disk sentinel. lr_va is the wedged thread's lr pre-translated to a module
+ * VA (or raw if translation failed). */
 void ios_dump_ec_dispatch_slots( unsigned long long lr_va, unsigned long long x9 )
 {
     int i, n = ios_proc_ident_count;
@@ -419,13 +503,20 @@ void ios_dump_ec_dispatch_slots( unsigned long long lr_va, unsigned long long x9
                 (lr_va >= (unsigned long long)(uintptr_t)base &&
                  lr_va < (unsigned long long)(uintptr_t)base + size_img)
                     ? "  <-- lr IS IN THIS IMAGE" : "");
-        q = (const unsigned long long *)(base + 0xC4440);
-        dprintf(2, "[thunk-slot]   +C4440: %016llx %016llx %016llx %016llx\n"
-                   "[thunk-slot]   +C4460: %016llx %016llx %016llx %016llx\n"
-                   "[thunk-slot]   +C4480: %016llx %016llx %016llx %016llx  <- +0x480 = dispatch_call_no_redirect\n"
-                   "[thunk-slot]   +C44A0: %016llx %016llx %016llx %016llx\n",
-                q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7],
-                q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15]);
+        {
+            unsigned int rva = ios_ec_dispatch_rva( base );
+            if (!rva)
+            {
+                dprintf(2, "[thunk-slot]   dispatch-global RVA UNRESOLVED — cannot judge this copy\n");
+                continue;
+            }
+            q = (const unsigned long long *)(base + rva);
+            dprintf(2, "[thunk-slot]   +0x%x dispatch_call_no_redirect=%016llx %s\n"
+                       "[thunk-slot]     neighbours: %016llx %016llx %016llx\n",
+                    rva, q[0],
+                    q[0] ? "(INITIALISED)" : "<== ZERO: blr x16 would branch to NULL",
+                    q[1], q[2], q[3]);
+        }
     }
 }
 #endif

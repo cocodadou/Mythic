@@ -7536,21 +7536,39 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             if (siginfo->si_code == BUS_ADRALN)
             {
                 uint32_t a_insn = *(uint32_t *)(uintptr_t)PC_sig(bus_ctx);
+                /* ml498 census. The old counters CAPPED at 32/16 with no
+                 * running total, so "32 emulated, 0 UNSUPPORTED" said nothing
+                 * about how many faults actually happened or how many were
+                 * refused — and this decode REFUSES SIMD (insn>>26&1). That
+                 * matters now: the login window paints its glyphs correctly
+                 * but leaves large background fills pure black, and a big
+                 * solid fill is exactly where Skia uses wide vector stores
+                 * while glyph blits stay byte-wise. If SIMD stores are being
+                 * dropped, that asymmetry is explained. Counts are unbounded;
+                 * only the log lines are rate-limited, and every line carries
+                 * the totals so silence can never be mistaken for zero. */
+                static unsigned long ua_emu_n, ua_simd_n, ua_other_n;
                 if (ios_emulate_unaligned_guest_access(bus_ctx, a_insn, (uintptr_t)siginfo->si_addr))
                 {
-                    static int ua_emu;
-                    if (ua_emu < 32 && ++ua_emu <= 32)
-                        ERR("[unaligned-guest] emulated insn=0x%08x addr=%p pc=%p rev=ml479\n",
-                            a_insn, siginfo->si_addr, pc);
+                    if (++ua_emu_n <= 16 || (ua_emu_n % 4096) == 0)
+                        ERR("[unaligned-guest] emulated insn=0x%08x addr=%p pc=%p "
+                            "(emu=%lu simd=%lu other=%lu) rev=ml498\n",
+                            a_insn, siginfo->si_addr, pc, ua_emu_n, ua_simd_n, ua_other_n);
                     PC_sig(bus_ctx) += 4;
                     ios_fixup_x18_for_return( bus_ctx );
                     return;
                 }
                 {
-                    static int ua_miss;
-                    if (ua_miss < 16 && ++ua_miss <= 16)
-                        ERR("[unaligned-guest] UNSUPPORTED insn=0x%08x addr=%p pc=%p -- keeping 80000002 rev=ml479\n",
-                            a_insn, siginfo->si_addr, pc);
+                    /* Split the refusals: a SIMD load/store is the suspect,
+                     * anything else is a different animal and must not hide
+                     * inside one undifferentiated "UNSUPPORTED" bucket. */
+                    int is_simd = (a_insn >> 26) & 1;
+                    unsigned long n = is_simd ? ++ua_simd_n : ++ua_other_n;
+                    if (n <= 16 || (n % 4096) == 0)
+                        ERR("[unaligned-guest] REFUSED-%s insn=0x%08x addr=%p pc=%p "
+                            "(emu=%lu simd=%lu other=%lu) -- keeping 80000002 rev=ml498\n",
+                            is_simd ? "SIMD" : "OTHER", a_insn, siginfo->si_addr, pc,
+                            ua_emu_n, ua_simd_n, ua_other_n);
                 }
             }
             /* readable target: genuine alignment fault — keep 80000002 so FEX's

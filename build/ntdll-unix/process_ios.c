@@ -907,8 +907,18 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
      * deterministic 0x73ffd65f40 crash of ml407/ml410). No 32-bit child can
      * ever work under this port; there is no Vulkan driver here anyway, and
      * Steam tolerates the refusal exactly like gldriverquery. */
+    /* ml497: steamsysinfo.exe joins the gate. It faulted (c0000005 inside
+     * steamsysinfo.exe+0xcb78c → crashhandler64) and, because every Windows
+     * "process" here is a pseudo-process inside ONE Mach process, that fault
+     * took the whole app down — NtTerminateProcess(0xffff7001) — killing the
+     * login window after only its 5 blank full-window paints. That is the
+     * "pure black window then crash" run shape. steamsysinfo only gathers the
+     * hardware-survey blob (-query 1 -out-file <tmp>); Steam needs none of it
+     * to reach or use the login UI, and tolerates a failed spawn exactly like
+     * gldriverquery. Refusing it is strictly better than letting it fault. */
     {
-        static const char * const blocked_names[] = { "steamerrorreporter", "gldriverquery", "vulkandriverquery" };
+        static const char * const blocked_names[] = { "steamerrorreporter", "gldriverquery", "vulkandriverquery",
+                                                      "steamsysinfo" };
         const WCHAR *ip = params->ImagePathName.Buffer;
         int ip_len = params->ImagePathName.Length / sizeof(WCHAR);
         unsigned b;

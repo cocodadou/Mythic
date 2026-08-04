@@ -480,6 +480,38 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
  * surf-<hwnd>-latest.png at most every 2s. Ground truth for whether a
  * rendering bug is in the surface bits (wine paint path) or in the
  * compositor (crop/scale). */
+/* ml493: write one surface to an explicitly named PNG. Used both by the
+ * throttled first/latest dump and by the consecutive-frame burst, which
+ * needs frames that are ADJACENT in time — a 2s-throttled "latest" can
+ * never show what changes between one present and the next. */
+static void winios_dump_surface_named(NSData *data, int sw, int sh, int stride, NSString *name) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("winios.surfdump", DISPATCH_QUEUE_SERIAL); });
+    dispatch_async(q, ^{
+        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        NSString *dir = [docs stringByAppendingPathComponent:@"surfdump"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGDataProviderRef dp = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
+        CGImageRef img = CGImageCreate(sw, sh, 8, 32, stride, cs,
+                                       kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
+                                       dp, NULL, false, kCGRenderingIntentDefault);
+        if (img) {
+            NSURL *url = [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:name]];
+            CGImageDestinationRef dest = CGImageDestinationCreateWithURL((__bridge CFURLRef)url, CFSTR("public.png"), 1, NULL);
+            if (dest) {
+                CGImageDestinationAddImage(dest, img, NULL);
+                CGImageDestinationFinalize(dest);
+                CFRelease(dest);
+            }
+            CGImageRelease(img);
+        }
+        CGDataProviderRelease(dp);
+        CGColorSpaceRelease(cs);
+    });
+}
+
 static void winios_dump_surface_png(HWND hwnd, NSData *data, int sw, int sh, int stride) {
     static dispatch_queue_t q;
     static dispatch_once_t once;
@@ -531,15 +563,183 @@ void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
     static int dumpSurf = -1;
     if (dumpSurf < 0) dumpSurf = getenv("MYTHIC_DUMP_SURFACES") != NULL;
     if (dumpSurf) winios_dump_surface_png(hwnd, data, sw, sh, stride);
-    static unsigned cnt;
-    /* ml371: was capped at 12 total, which made present LIVENESS
-     * unobservable — a 30-min run's log showed nothing after minute 2 and
-     * read exactly like a frozen present path. First 12, then every 200th
-     * with the running count so silence means silence. */
-    cnt++;
-    if (cnt <= 12 || (cnt % 200) == 0) {
-        fprintf(stderr, "[winios] present #%u hwnd=%p dirty=(%d,%d %dx%d) surf=%dx%d\n",
-                cnt, hwnd, dx, dy, dw, dh, sw, sh);
+
+    /* ml493: PER-HWND accounting. The counter used to be global, so a
+     * window created late (the login popup, hwnd 0x1010a) had every one of
+     * its early presents fall past the first-12 window and was only ever
+     * sampled 1-in-200 — which is why "was this window ever painted in
+     * full?" could not be answered from ml493's log at all. Identity must
+     * be the window, not a process-wide sequence number.
+     *
+     * Also drives MYTHIC_SURF_SEQ: bursts of N CONSECUTIVE frames, so the
+     * black regions that change every frame can be measured frame-to-frame
+     * offline. The 2s-throttled first/latest dump structurally cannot show
+     * that. Dirty rect goes in the filename so each frame carries the one
+     * fact needed to test "is the black exactly the damage rect?".
+     */
+    static pthread_mutex_t seq_lock = PTHREAD_MUTEX_INITIALIZER;
+    enum { WINIOS_SEQ_SLOTS = 24 };
+    static struct { HWND hwnd; unsigned n; unsigned burst_left; unsigned burst_idx;
+                    unsigned bursts_done; double next_burst;
+                    unsigned sent_rounds; } seq[WINIOS_SEQ_SLOTS];
+    static int seq_used;
+    static int seqFrames = -1, seqBursts, seqMinDim;
+    if (seqFrames < 0) {
+        const char *e = getenv("MYTHIC_SURF_SEQ");
+        seqFrames = e ? atoi(e) : 0;
+        if (seqFrames > 32) seqFrames = 32;
+        seqBursts = 14;       /* ml496: 25s/6 bursts only ever caught the
+                               * window's blank startup — the interactive
+                               * frames, where the black moves, were never
+                               * sampled. 6s x 14 covers them. */
+        seqMinDim = 200;      /* skip taskbar/tooltip-sized windows */
+    }
+
+    unsigned mycnt = 0, dumpIdx = 0;
+    BOOL wantDump = NO;
+    pthread_mutex_lock(&seq_lock);
+    int s = -1;
+    for (int i = 0; i < seq_used; i++) if (seq[i].hwnd == hwnd) { s = i; break; }
+    if (s < 0 && seq_used < WINIOS_SEQ_SLOTS) { s = seq_used++; seq[s].hwnd = hwnd; }
+    if (s >= 0) {
+        mycnt = ++seq[s].n;
+        if (seqFrames > 0 && sw >= seqMinDim && sh >= seqMinDim) {
+            double now = CACurrentMediaTime();
+            if (seq[s].burst_left == 0 && seq[s].bursts_done < (unsigned)seqBursts
+                && now >= seq[s].next_burst) {
+                seq[s].burst_left = (unsigned)seqFrames;
+                seq[s].burst_idx = 0;
+                seq[s].bursts_done++;
+                seq[s].next_burst = now + 6.0;
+            }
+            if (seq[s].burst_left > 0) {
+                seq[s].burst_left--;
+                dumpIdx = seq[s].bursts_done * 100 + seq[s].burst_idx++;
+                wantDump = YES;
+            }
+        }
+    }
+    pthread_mutex_unlock(&seq_lock);
+
+    if (wantDump) {
+        winios_dump_surface_named(data, sw, sh, stride,
+            [NSString stringWithFormat:@"seq-%p-%03u-d%d_%d_%dx%d.png",
+                                       hwnd, dumpIdx, dx, dy, dw, dh]);
+
+        /* ml499: ALPHA census on the very bytes we just dumped. The PNGs are
+         * encoded kCGImageAlphaNoneSkipFirst, so they physically cannot show
+         * whether a black pixel is opaque black or TRANSPARENT — and that is
+         * now the whole question. Chromium composites onto a transparent
+         * background; a BGRX surface that ignores the alpha byte renders
+         * transparent as RGB(0,0,0). Glyphs are opaque and would survive,
+         * which is exactly the text-lands-fill-doesn't asymmetry observed.
+         *
+         * blkA0 vs blkA255 decides it outright:
+         *   black & alpha==0   -> Chromium never painted an opaque background
+         *                         there; we must composite over one.
+         *   black & alpha==255 -> genuinely painted opaque black; alpha is
+         *                         innocent and the hunt moves elsewhere.
+         * Subsampled every 4th pixel — this runs on a paint path. */
+        const uint8_t *px = (const uint8_t *)bits;
+        unsigned long n = 0, a0 = 0, a255 = 0, blk = 0, blkA0 = 0, blkA255 = 0;
+        for (int y = 0; y < sh; y += 2) {
+            const uint8_t *row = px + (size_t)y * stride;
+            for (int x = 0; x < sw; x += 2) {
+                const uint8_t *p = row + (size_t)x * 4;   /* B,G,R,A */
+                uint8_t a = p[3];
+                int is_black = (p[0] | p[1] | p[2]) == 0;
+                n++;
+                if (a == 0) a0++; else if (a == 255) a255++;
+                if (is_black) { blk++; if (a == 0) blkA0++; else if (a == 255) blkA255++; }
+            }
+        }
+        if (n) fprintf(stderr, "[surf-alpha] hwnd=%p seq=%03u black=%.1f%% "
+                       "a0=%.1f%% a255=%.1f%% | of black: a0=%.1f%% a255=%.1f%% rev=ml499\n",
+                       hwnd, dumpIdx, 100.0 * blk / n, 100.0 * a0 / n, 100.0 * a255 / n,
+                       blk ? 100.0 * blkA0 / blk : 0.0, blk ? 100.0 * blkA255 / blk : 0.0);
+        fflush(stderr);
+    }
+
+    /* ml496: log EVERY damage rect for big windows (bounded). The black
+     * regions are the initial blank full-window paints that were never
+     * re-damaged, so the open question is whether the full viewport is ever
+     * damaged again after the page renders — and a 1-in-200 sample can
+     * never answer that. Replaying the full damage history offline shows
+     * exactly which pixels were never covered. */
+    /* ml502 SENTINEL — disambiguates the ml501 alpha result.
+     *
+     * A freshly created window surface is ZERO-filled: RGB 0 AND alpha 0.
+     * Premultiplied transparent is ALSO RGB 0, alpha 0. So "of black:
+     * a0=100%" is equally consistent with "Chromium wrote transparent" and
+     * "nobody ever wrote these pixels" — the alpha census cannot separate
+     * them, and I reported the first as settled when the data did not
+     * support it.
+     *
+     * Fix: after each flush, stamp every currently-zero pixel with a
+     * sentinel. That leaves NO zero pixels behind, so the next flush
+     * classifies every pixel with no bookkeeping at all:
+     *     still SENTINEL -> Chromium never touched it
+     *     back to ZERO   -> Chromium actively wrote transparent
+     *     anything else  -> real content
+     * The NSData copy above already happened, so dumps still show the
+     * surface exactly as Chromium left it (surviving sentinels included).
+     * Writes go to our own DIB while wine holds the surface lock, and only
+     * ever to pixels that are currently invisible black. */
+    static int sentinelMode = -1;
+    if (sentinelMode < 0) sentinelMode = getenv("MYTHIC_SURF_SENTINEL") != NULL;
+    if (sentinelMode && s >= 0 && sw >= 400 && sh >= 400 && seq[s].sent_rounds < 10) {
+        const uint32_t SENT = 0x01FF00FFu;      /* B=FF G=00 R=FF A=01 */
+        uint32_t *px = (uint32_t *)(uintptr_t)bits;
+        unsigned long untouched = 0, rewritten_zero = 0, painted = 0, stamped = 0;
+        for (int y = 0; y < sh; y++) {
+            uint32_t *row = (uint32_t *)((char *)px + (size_t)y * stride);
+            for (int x = 0; x < sw; x++) {
+                uint32_t v = row[x];
+                if (seq[s].sent_rounds) {
+                    if (v == SENT) untouched++;
+                    else if (v == 0) rewritten_zero++;
+                    else painted++;
+                }
+                if (v == 0 || v == SENT) { row[x] = SENT; stamped++; }
+            }
+        }
+        if (seq[s].sent_rounds)
+            fprintf(stderr, "[surf-sentinel] hwnd=%p round=%u untouched=%lu "
+                    "rewritten-zero=%lu painted=%lu (stamped=%lu) rev=ml502\n",
+                    hwnd, seq[s].sent_rounds, untouched, rewritten_zero, painted, stamped);
+        seq[s].sent_rounds++;
+        fflush(stderr);
+    }
+
+    if (mycnt <= 16 || (mycnt % 200) == 0 ||
+        (sw >= 400 && sh >= 400 && mycnt <= 2000)) {
+        /* ml504: bits pointer + content signature per present.
+         *
+         * ml503 showed ~200k pixels changing across the WHOLE window while
+         * the damage rect claimed a 56x52 spinner — the surface flips
+         * wholesale between two states. This decides where the flip lives:
+         *   bits CONSTANT, sig alternating -> one buffer being rewritten
+         *       with stale content; the defect is upstream in Chromium's
+         *       damage preservation.
+         *   bits ALTERNATING               -> two buffers are reaching us
+         *       and the handoff is ours to fix.
+         * Signature is a sparse FNV over a fixed grid so it is cheap enough
+         * to run on every present and still changes when any region flips. */
+        uint32_t sig = 2166136261u;
+        {
+            const uint8_t *b = (const uint8_t *)bits;
+            int ystep = sh > 64 ? sh / 64 : 1, xstep = sw > 64 ? sw / 64 : 1;
+            for (int y = 0; y < sh; y += ystep) {
+                const uint32_t *row = (const uint32_t *)(b + (size_t)y * stride);
+                for (int x = 0; x < sw; x += xstep) {
+                    sig ^= row[x];
+                    sig *= 16777619u;
+                }
+            }
+        }
+        fprintf(stderr, "[winios] present hwnd=%p #%u dirty=(%d,%d %dx%d) surf=%dx%d "
+                "bits=%p sig=%08x rev=ml504\n",
+                hwnd, mycnt, dx, dy, dw, dh, sw, sh, bits, sig);
         fflush(stderr);
     }
     dispatch_async(dispatch_get_main_queue(), ^{

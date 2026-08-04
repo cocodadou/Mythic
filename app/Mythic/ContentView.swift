@@ -387,6 +387,264 @@ struct HoldKeyView: View {
     }
 }
 
+/// Shared state for the expanded thumbstick pad. The pad cannot be drawn by
+/// SwiftUI in place: the game surface is a raw window-level UIView
+/// (MetalHostView.shared) sitting ABOVE the entire SwiftUI hierarchy, so a
+/// SwiftUI pad centred on the key row gets sliced off wherever it overlaps —
+/// no zIndex can fix that, because zIndex only orders siblings *within*
+/// SwiftUI. So the pad is hosted in the window too, added after (and thus
+/// above) the Metal view, and driven from the SwiftUI button through this.
+final class JoystickPadState: ObservableObject {
+    static let shared = JoystickPadState()
+    @Published var held = false
+    @Published var dir: Int = -1
+    @Published var center: CGPoint = .zero      // window coordinates
+}
+
+/// Window-level host for the pad. Transparent and non-interactive: the
+/// SwiftUI button keeps the gesture, this only draws.
+enum JoystickPadHost {
+    /// Own UIWindow, one level above the app's. Being a sibling subview of
+    /// MetalHostView is NOT enough: that view re-adds itself to the window on
+    /// every didMoveToWindow (rotation, re-attach) and DXMT/CoreAnimation can
+    /// reorder around it, so any subview ordering we impose is only true until
+    /// the next layout. A higher windowLevel cannot be undone by anything
+    /// inside the app window, so the pad is unconditionally on top.
+    ///
+    /// Deliberately NOT solved by changing the game surface: the CAMetalLayer
+    /// is window-level precisely because SwiftUI hosting silently dropped
+    /// presents on iOS 26/27 (see MetalHostView) — that is a rendering
+    /// correctness fix and must not be traded away for z-ordering.
+    private static var overlay: PassthroughWindow?
+
+    static func attach(to scene: UIWindowScene) {
+        if overlay == nil {
+            let w = PassthroughWindow(windowScene: scene)
+            w.windowLevel = .normal + 100
+            w.backgroundColor = .clear
+            w.isHidden = false                 // never becomes key: see PassthroughWindow
+            let host = UIHostingController(rootView: JoystickPadOverlay())
+            host.view.backgroundColor = .clear
+            host.view.isUserInteractionEnabled = false
+            w.rootViewController = host
+            overlay = w
+        }
+        overlay?.frame = scene.coordinateSpace.bounds
+    }
+}
+
+/// Transparent, fully click-through window: hitTest always returns nil, so
+/// touches fall through to the app window underneath and the pad can never
+/// steal input from the game surface or the SwiftUI controls.
+final class PassthroughWindow: UIWindow {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
+}
+
+/// The expanded pad, drawn in window space at the button's location.
+struct JoystickPadOverlay: View {
+    @ObservedObject private var s = JoystickPadState.shared
+
+    var body: some View {
+        GeometryReader { _ in
+            // THE one and only joystick face — idle ring and expanded pad are
+            // the same view, never two that swap. That identity is what makes
+            // it seamless: the diameter and the knob offset are plain animated
+            // properties, so releasing lets the knob spring back to centre and
+            // keep wiggling after the ring has already shrunk. Two faces
+            // cross-fading (one in the button, one here) cannot do that — the
+            // wiggle dies with the copy that gets faded out.
+            //
+            // Fixed-size box at a CONSTANT offset. Deliberately not
+            // .position() + .transition(.scale): .position expands the view to
+            // fill the parent (so a .center anchor means mid-screen), and an
+            // offset that changes in the same transaction as `held` gets
+            // animated too — which is what made the pad fly in from the top.
+            // Here the only animatable quantities belong to the face itself.
+            JoystickFace(held: s.held, dir: s.dir)
+                .frame(width: JoystickFace.padRadius * 2,
+                       height: JoystickFace.padRadius * 2)
+                .offset(x: s.center.x - JoystickFace.padRadius,
+                        y: s.center.y - JoystickFace.padRadius)
+                .opacity(s.center == .zero ? 0 : 1)
+        }
+        // MUST ignore the safe area. s.center comes from the button's .global
+        // frame, which is measured from the WINDOW origin; without this the
+        // overlay's hosting view is inset by the safe area, the offset above
+        // is measured from below the status bar, and the pad lands ~59pt too
+        // low — roughly one pad radius, which is exactly why it appeared to
+        // sit under the game strip instead of centred on the button.
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+        .animation(.spring(response: 0.32, dampingFraction: 0.62), value: s.held)
+        .animation(.spring(response: 0.22, dampingFraction: 0.58), value: s.dir)
+    }
+}
+
+/// The joystick face itself, shared by the in-row idle ring and the expanded
+/// window-level pad so both look identical and animate the same way.
+struct JoystickFace: View {
+    var held: Bool
+    var dir: Int
+
+    static let idleDiameter: CGFloat = 22
+    static let padRadius: CGFloat = 58
+    private var idleDiameter: CGFloat { Self.idleDiameter }
+    private var padRadius: CGFloat { Self.padRadius }
+    private let knobTravelRatio: CGFloat = 0.30
+
+    @ViewBuilder private var interior: some View {
+        if #available(iOS 26.0, *) {
+            Circle().fill(.clear).glassEffect(.regular, in: Circle())
+        } else {
+            Circle().fill(.ultraThinMaterial)
+        }
+    }
+
+    private func knobOffset(_ d: CGFloat) -> CGSize {
+        guard dir >= 0, held else { return .zero }
+        let travel = d * knobTravelRatio
+        let a = Double(dir) * 45.0 * .pi / 180.0
+        return CGSize(width: travel * CGFloat(sin(a)), height: -travel * CGFloat(cos(a)))
+    }
+
+    var body: some View {
+        let d = held ? padRadius * 2 : idleDiameter
+        return ZStack {
+            interior
+            Circle().strokeBorder(Color.white.opacity(0.55), lineWidth: held ? 2 : 1.5)
+            Circle()
+                .fill(Color.white)
+                .frame(width: d * 0.42, height: d * 0.42)
+                .overlay(
+                    // Roundness cue. It reads at key size but turns into a
+                    // smudge on the big pad, so it fades out as the ring
+                    // springs open rather than scaling up with it.
+                    Circle()
+                        .trim(from: 0.55, to: 0.70)
+                        .stroke(Color.black.opacity(0.38),
+                                style: StrokeStyle(lineWidth: 1.4, lineCap: .round))
+                        .padding(d * 0.075)
+                        .opacity(held ? 0 : 1)
+                )
+                .offset(knobOffset(d))
+        }
+        .frame(width: d, height: d)
+    }
+}
+
+/// On-screen thumbstick. Idle it is a key-sized ring with a white knob;
+/// press and hold and it expands into a pad you can steer. Travel snaps to
+/// eight d-pad directions, each mapped to the arrow keys Windows games
+/// already understand — diagonals simply hold two keys at once — so this
+/// needs no new input path: it posts through the same winios_post_key queue
+/// as the key buttons, and key state is edge-triggered (only the keys that
+/// actually changed are sent on each snap).
+///
+/// The pad expands DOWNWARD. It must never grow up into the game strip:
+/// that surface is a raw window-level UIView (MetalHostView.shared) drawn
+/// over SwiftUI, so anything overlapping it is simply covered.
+struct JoystickKeyView: View {
+    @State private var held = false
+    @State private var dir: Int = -1        // -1 = centred, else 0=up then clockwise
+    @State private var center: CGPoint = .zero
+    @State private var hosted = false       // overlay window up: it draws the face
+
+    private let deadzone: CGFloat = 14      // pt of travel before a direction registers
+
+    private let vkUp: Int32 = 0x26, vkRight: Int32 = 0x27
+    private let vkDown: Int32 = 0x28, vkLeft: Int32 = 0x25
+
+    private func keys(for d: Int) -> [Int32] {
+        switch d {
+        case 0: return [vkUp]
+        case 1: return [vkUp, vkRight]
+        case 2: return [vkRight]
+        case 3: return [vkDown, vkRight]
+        case 4: return [vkDown]
+        case 5: return [vkDown, vkLeft]
+        case 6: return [vkLeft]
+        case 7: return [vkUp, vkLeft]
+        default: return []
+        }
+    }
+
+    /// Release what is no longer held, press what newly is — never a blanket
+    /// release/re-press, which would make a held direction stutter as the
+    /// thumb wanders inside one sector.
+    private func apply(_ next: Int) {
+        guard next != dir else { return }
+        let old = Set(keys(for: dir)), new = Set(keys(for: next))
+        for vk in old.subtracting(new) { winios_post_key(vk, 0) }
+        for vk in new.subtracting(old) { winios_post_key(vk, 1) }
+        dir = next
+        JoystickPadState.shared.dir = next
+    }
+
+    private func snap(_ t: CGSize) -> Int {
+        let d = (t.width * t.width + t.height * t.height).squareRoot()
+        if d < deadzone { return -1 }
+        // Screen y grows downward; measure clockwise from "up".
+        var a = atan2(t.width, -t.height) * 180 / .pi
+        if a < 0 { a += 360 }
+        return Int((a + 22.5) / 45.0) % 8
+    }
+
+    var body: some View {
+        // The idle ring lives in the row (inset inside the 34x30 button so it
+        // has breathing room). The EXPANDED pad is drawn by the window-level
+        // host at this same centre — see JoystickPadState — so it springs out
+        // of the button in place and is never clipped by the game surface.
+        Color.clear
+            .frame(width: 34, height: 30)
+            .background(Color.white.opacity(held ? 0.30 : 0.15))
+            .cornerRadius(6)
+            .overlay { if !hosted { JoystickFace(held: false, dir: -1) } }
+            .background(
+                GeometryReader { geo in
+                    Color.clear.onAppear {
+                        center = CGPoint(x: geo.frame(in: .global).midX,
+                                         y: geo.frame(in: .global).midY)
+                        JoystickPadState.shared.center = center
+                        if let scene = UIApplication.shared.connectedScenes
+                            .compactMap({ $0 as? UIWindowScene }).first {
+                            JoystickPadHost.attach(to: scene)
+                            hosted = true
+                        }
+                    }
+                    .onChange(of: geo.frame(in: .global)) { _, f in
+                        center = CGPoint(x: f.midX, y: f.midY)
+                        JoystickPadState.shared.center = center
+                    }
+                }
+            )
+            .animation(.spring(response: 0.32, dampingFraction: 0.62), value: held)
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        if !held {
+                            held = true
+                            if let scene = UIApplication.shared.connectedScenes
+                                .compactMap({ $0 as? UIWindowScene }).first {
+                                JoystickPadHost.attach(to: scene)
+                            }
+                            JoystickPadState.shared.center = center
+                            withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
+                                JoystickPadState.shared.held = true
+                            }
+                        }
+                        apply(snap(g.translation))
+                    }
+                    .onEnded { _ in
+                        apply(-1)                        // releases every held arrow
+                        held = false
+                        withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
+                            JoystickPadState.shared.held = false
+                        }
+                    }
+            )
+    }
+}
+
 // SwiftUI wrapper around the placeholder view.
 // iOS software-keyboard → Wine key events. Each character is mapped to a
 // US-layout virtual-key (+ shift where needed) and posted as a down/up pair;
@@ -512,14 +770,24 @@ struct ContentView: View {
     private var portraitBody: some View {
         VStack(spacing: 0) {
             statusHeader
+            // Readouts sit ABOVE the game strip, closest to the surface they
+            // describe: entitlement indicators, then the present/FPS readout,
+            // then the surface itself. (Only the KEY row stays below — it is
+            // input, not instrumentation.)
+            //
+            // NOTE: the surface is a raw window-level view positioned over the
+            // placeholder (MetalHostView.shared), so SwiftUI content laid "on
+            // top" of the strip is covered — these rows must be siblings above
+            // it, never overlays on it.
             if let ents = entitlements {
                 entitlementBadges(ents)
             }
-            Divider()
-            // Game surface strip. NOTE: the surface itself is a raw
-            // window-level view positioned over this placeholder
-            // (MetalHostView.shared) — SwiftUI content laid "on top" of the
-            // strip would be covered. Overlay + key row live BELOW.
+            HStack(spacing: 6) {
+                FPSOverlay()
+                Spacer()
+            }
+            .padding(.horizontal, 8)
+            .padding(.bottom, 4)
             MythicMetalView()
                 .frame(height: 240)
                 .background(Color.black)
@@ -533,11 +801,14 @@ struct ContentView: View {
                         .background(Color.secondary.opacity(0.25))
                         .cornerRadius(6)
                 }
+                JoystickKeyView()
                 Spacer()
-                FPSOverlay()
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
+            // The expanded pad overflows this row; without a raised zIndex the
+            // later VStack siblings (action buttons, log) would draw over it.
+            .zIndex(10)
             Divider()
             actionButtons
             Divider()
@@ -590,18 +861,12 @@ struct ContentView: View {
 
     private var statusHeader: some View {
         HStack {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("JIT Status")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(statusColor)
-                        .frame(width: 10, height: 10)
-                    Text(statusText)
-                        .font(.headline)
-                }
-            }
+            // The "JIT Status" row only ever read "Not tested" — this probe was
+            // never wired to the live state, and the real JIT indicator sits
+            // directly below it. Removed rather than left lying (a status line
+            // that cannot change is worse than none). statusColor/statusText
+            // are kept: enableJITViaStikDebug() and the JIT self-tests still
+            // drive jitStatus, so re-adding a row is a one-liner if wanted.
             Spacer()
             VStack(alignment: .trailing, spacing: 4) {
                 Text("Device")
@@ -691,14 +956,6 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
 
-                Button("Run Wine") {
-                    setenv("MYTHIC_EXE", "cube.exe", 1)
-                    unsetenv("MYTHIC_DESKTOP")
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.orange)
-
                 Button("🎮 Run Steam (S3 smoke test)") {
                     // Steam S3 first boot: virtual desktop (Steam needs a
                     // window manager) + services.exe (SCM → rpcss for Steam's
@@ -726,6 +983,19 @@ struct ContentView: View {
                     // painting upstream) is undecidable from the log alone
                     // because the [winios] present line caps at 12.
                     setenv("MYTHIC_DUMP_SURFACES", "1", 1)
+                    // ml493: bursts of N CONSECUTIVE frames per window. The
+                    // login window's black regions change every frame, which
+                    // the 2s-throttled first/latest dump can never show —
+                    // adjacent frames are the only way to measure what moves.
+                    setenv("MYTHIC_SURF_SEQ", "10", 1)
+                    // ml502 sentinel: DELIBERATELY NOT ENABLED. It stamps
+                    // magenta into currently-black pixels, and on windows
+                    // Chromium does not fully rewrite it SURVIVES and reaches
+                    // the screen (console 0x200bc hit untouched=177891 in one
+                    // round). It answered its question in ml503/ml504 —
+                    // untouched=0 on the login window proved Chromium writes
+                    // every pixel — so it must not ship enabled. Re-enable
+                    // with MYTHIC_SURF_SENTINEL=1 if the question returns.
                     runWineFullSequence()
                 }
                 .buttonStyle(.borderedProminent)
@@ -775,155 +1045,6 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.pink)
 
-                Button("Run Net Test (HTTPS)") {
-                    // Steam S0 smoke test: plain HTTP then HTTPS+certs via
-                    // winhttp -> ws2_32/schannel/bcrypt/crypt32 unixlibs.
-                    setenv("MYTHIC_EXE", "winhttp-test.exe", 1)
-                    unsetenv("MYTHIC_ARGS")
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.teal)
-
-                Button("Run Proc Test (CreateProcess)") {
-                    // Steam S1 smoke test: proc-test.exe spawns
-                    // child-test.exe as a pseudo-process (thread group with
-                    // its own ntdll copy), waits, checks exit code 42.
-                    setenv("MYTHIC_EXE", "proc-test.exe", 1)
-                    unsetenv("MYTHIC_ARGS")
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.indigo)
-
-                Button("Run Desktop (explorer)") {
-                    // Steam S2 round 2: explorer creates the virtual desktop,
-                    // then spawns winemine as a pseudo-process INSIDE it.
-                    // No pixels yet (nulldrv) — validates child windows
-                    // joining the desktop tree + WM_PAINT flow.
-                    // /desktop=shell → wine explorer's REAL taskbar + Start
-                    // menu (EnableShell defaults on for the magic name
-                    // "shell" — same environment Winlator/Mobox show).
-                    // 960x540 landscape matches the presentation area.
-                    let deskW = 960, deskH = 540
-                    setenv("MYTHIC_EXE", "explorer.exe", 1)
-                    setenv("MYTHIC_ARGS",
-                           "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\winemine.exe", 1)
-                    // enables GDI window-surface compositing in the driver
-                    setenv("MYTHIC_DESKTOP", "1", 1)
-                    setenv("MYTHIC_SCREEN_W", String(deskW), 1)
-                    setenv("MYTHIC_SCREEN_H", String(deskH), 1)
-                    // diagnostic: PNG-dump window surfaces to Documents/surfdump/
-                    setenv("MYTHIC_DUMP_SURFACES", "1", 1)
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.purple)
-
-                Button("Run x64 proc tree") {
-                    // X1 ladder rung 1: x86-64 parent (EC session, the
-                    // known-good Thumper config) spawns an x86-64 CHILD
-                    // pseudo-process — isolates FEX/EC child machinery
-                    // from mixed-session and GUI variables.
-                    setenv("MYTHIC_EXE", "proc-test-x64.exe", 1)
-                    unsetenv("MYTHIC_ARGS")
-                    unsetenv("MYTHIC_DESKTOP")
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.orange)
-
-                Button("Run rpcss (R1 boot test)") {
-                    // S3-pre R1: boot rpcss.exe standalone as a pseudo-process
-                    // to prove it comes up, binds its epmapper named-pipe
-                    // endpoint (\\.\pipe\lrpc\epmapper via wineserver), and
-                    // idles alive — de-risks the COM server before wiring the
-                    // launch trigger (R2) and re-adding actxprxy (R3).
-                    setenv("MYTHIC_EXE", "rpcss.exe", 1)
-                    unsetenv("MYTHIC_ARGS")
-                    unsetenv("MYTHIC_DESKTOP")
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.teal)
-
-                Button("Run cmd /c proc tree") {
-                    // Steam S1 ladder: wine's cmd runs the full test tree —
-                    // cmd → proc-test → child(depth 1) → grandchild(depth 0).
-                    // Four processes, three pseudo-process spawns; exit 0
-                    // bubbles up from proc-test's PASS.
-                    setenv("MYTHIC_EXE", "cmd.exe", 1)
-                    setenv("MYTHIC_ARGS",
-                           "/c C:\\windows\\system32\\proc-test.exe", 1)
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.indigo)
-
-                Button("Continue Net Test") {
-                    // VPN gate: the test PE pauses before the Steam stage
-                    // (all TLS code already JIT-compiled by then) so the
-                    // JIT debugger can be detached and VPNs switched.
-                    // This drops C:\mythic-continue.flag to resume it.
-                    _ = mythic_write_continue_flag()
-                }
-                .buttonStyle(.bordered)
-                .tint(.teal)
-
-                Button("Run x64 Hello (FEX/ARM64EC)") {
-                    setenv("MYTHIC_EXE", "hello-x64.exe", 1)
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
-
-                Button("Run x64 fib(30) (FEX/ARM64EC)") {
-                    setenv("MYTHIC_EXE", "fib-x64.exe", 1)
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
-
-                Button("Run x64 fib2 (64-bit math) (FEX/ARM64EC)") {
-                    setenv("MYTHIC_EXE", "fib2-x64.exe", 1)
-                    unsetenv("MYTHIC_ARGS")
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
-
-                Button("Run x64 fib3(25) via argv (FEX/ARM64EC)") {
-                    setenv("MYTHIC_EXE", "fib3-x64.exe", 1)
-                    setenv("MYTHIC_ARGS", "25", 1)
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
-
-                Button("Run x64 heap test (FEX/ARM64EC)") {
-                    setenv("MYTHIC_EXE", "heap-x64.exe", 1)
-                    unsetenv("MYTHIC_ARGS")
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
-
-                Button("Run x64 fileio test (FEX/ARM64EC)") {
-                    setenv("MYTHIC_EXE", "fileio-x64.exe", 1)
-                    unsetenv("MYTHIC_ARGS")
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
-
-                Button("Run x64 fileio test --keep (FEX/ARM64EC)") {
-                    setenv("MYTHIC_EXE", "fileio-x64.exe", 1)
-                    setenv("MYTHIC_ARGS", "--keep", 1)
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
-
                 Button("Run x64 cube (FEX/ARM64EC + DXMT)") {
                     setenv("MYTHIC_EXE", "cube-x64.exe", 1)
                     unsetenv("MYTHIC_ARGS")
@@ -931,42 +1052,6 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.purple)
-
-                Button("Run x64 CheckMSAA isolation test (Thumper vtable[30])") {
-                    setenv("MYTHIC_EXE", "dxchkmsaa-x64.exe", 1)
-                    unsetenv("MYTHIC_ARGS")
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.purple)
-
-                Button("Test JIT") {
-                    runJITTest()
-                }
-                .buttonStyle(.bordered)
-
-                Button("Test JIT (Alt)") {
-                    runJITTestStrategy2()
-                }
-                .buttonStyle(.bordered)
-
-                Button("Test FEX") {
-                    runFEXTest()
-                }
-                .buttonStyle(.bordered)
-                .tint(.purple)
-
-                Button("Start Wineserver") {
-                    startWineserver()
-                }
-                .buttonStyle(.bordered)
-                .tint(.green)
-
-                Button("Start Wine") {
-                    startWineProcess()
-                }
-                .buttonStyle(.bordered)
-                .tint(.orange)
 
                 Button("Run D3D11 Triangle") {
                     runTriangleTest()

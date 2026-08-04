@@ -4579,6 +4579,13 @@ extern const void *crypt32_unix_call_funcs[];
  * when \\.\Nsi can't be opened. See nsi_unixlib_ios.c */
 extern const void *nsi_unix_call_funcs[];
 
+/* iOS-Mythic ml494 (#61 text wall): dwrite's unix side (freetype glyph
+ * rasterisation). Without it every __wine_unix_call from dwrite.dll failed,
+ * so get_glyph_bbox never ran and every glyph run reported an EMPTY bbox —
+ * ml494 measured exactly that (12/12 [dwrite-bounds] EMPTY, [dwrite-ink]
+ * never called). Chromium drew no text anywhere as a result. */
+extern const void *dwrite_unix_call_funcs[];
+
 /* win32u's unix init, statically linked via libwin32u_unix.a. Renamed
  * from __wine_unix_lib_init in build/win32u-unix/build.sh so future
  * statically-linked unix libs can keep their own init without colliding.
@@ -4661,6 +4668,14 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             *funcs = (const void *)crypt32_unix_call_funcs;
             dprintf(2, "[unixlib] module %p (%s) -> crypt32_unix_call_funcs (%p)\n",
                 module, match, (void *)crypt32_unix_call_funcs);
+            status = STATUS_SUCCESS;
+        } else if (match && (strstr(match, "dwrite") || strstr(match, "DWrite"))) {
+            /* case-insensitive on purpose: the PE export name is "DWrite.dll"
+             * while the unix_path is "dwrite.so" — matching only one spelling
+             * would silently leave the text stack dead again. */
+            *funcs = (const void *)dwrite_unix_call_funcs;
+            dprintf(2, "[unixlib] module %p (%s) -> dwrite_unix_call_funcs (%p) rev=ml494\n",
+                module, match, (void *)dwrite_unix_call_funcs);
             status = STATUS_SUCCESS;
         } else if (match && strstr(match, "nsi.dll")) {
             *funcs = (const void *)nsi_unix_call_funcs;

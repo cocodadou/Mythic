@@ -1273,6 +1273,20 @@ struct ContentView: View {
             // kills the whole app — 896 + graceful degradation strictly beats
             // 1024 + jetsam roulette. Durable fix remains .text sharing.
             // KEEP ios_usable_va_floor PAIRED: 896MB -> 0x7038000000.
+            // 2026-08-03 (ml458): STAY at 896 — growth is closed for good.
+            // jetsam killed 1024 twice (ml422 peak 3904) and the no-footprint
+            // exemption is unreachable: all four (entry-flags, owner) variants
+            // return kr=4, and the plain ones expose why — the named entry
+            // covers 16KB of the 896MB object, i.e. the kernel wants an entry
+            // naming the WHOLE object, which we can never build over memory
+            // whose object StikDebug created. Pool stays dirty-from-birth and
+            // jetsam-counted, so SIZE is the cost and 896 is the ceiling.
+            // ⛔ ml457 re-trialed pure-x64 skip-copy (already dead per ml68
+            // above) and it failed again for a different reason: x64 guest
+            // RIPs ARE pool-copy aliases, so the copy is the execution
+            // substrate — steam.exe died in seconds. Do not try a third time.
+            // The remaining levers are USE-side: the 276MB of duplicate copies
+            // (.text sharing) and the 214MB tail of EC code buffers.
             let poolSizeMB = 896
             logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
             let t0 = CFAbsoluteTimeGetCurrent()

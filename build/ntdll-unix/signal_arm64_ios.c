@@ -489,12 +489,17 @@ static void ios_lock_census(void)
             mach_msg_type_number_t bcnt = THREAD_BASIC_INFO_COUNT;
             uint64_t fp, frames[8] = { 0 };
             int fi;
+            uint64_t srw_held = 0;
             if (!cand || !cteb) continue;
             if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(cteb + 0x16f8), 8,
                                         (mach_vm_address_t)&held, &mgot ) != KERN_SUCCESS
                 || mgot != 8)
                 continue;
-            if (!held)
+            /* ml446: slot 6 = CodeBufferWriteMutex ownership — a dead thread
+             * holding ONLY that must not be skipped by the !held early-out */
+            mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(cteb + 0x16e8), 8,
+                                    (mach_vm_address_t)&srw_held, &mgot );
+            if (!held && !srw_held)
             {
                 /* ml416: a converged rpmalloc-ownership repair leaves its
                  * breadcrumb (Instrumentation[4]) with the lock long released
@@ -519,7 +524,55 @@ static void ios_lock_census(void)
             mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(cteb + 0x48), 4,
                                     (mach_vm_address_t)&ctid, &mgot );
             memset( &bi, 0, sizeof(bi) );
-            thread_info( cand, THREAD_BASIC_INFO, (thread_info_t)&bi, &bcnt );
+            {
+                kern_return_t ti_kr = thread_info( cand, THREAD_BASIC_INFO, (thread_info_t)&bi, &bcnt );
+                /* ml445 (#74): DEAD port + live TEB stamp = a cross-terminated
+                 * thread ([thr-term] CROSS-TERM) died holding the FEX shared
+                 * lock — the leak that stalls the world.  Recycling guard: if
+                 * ANY live registry row uses this TEB, the stamp belongs to
+                 * the live generation — do NOT touch it. */
+                if (ti_kr != KERN_SUCCESS && held)
+                {
+                    static uint64_t reaped_tebs[16];
+                    static int reaped_n;
+                    int r, live = 0, already = 0;
+                    for (r = 0; r < reaped_n; r++) if (reaped_tebs[r] == (uint64_t)cteb) already = 1;
+                    for (r = 0; r < count && !live; r++)
+                    {
+                        struct thread_basic_info lbi;
+                        mach_msg_type_number_t lcnt = THREAD_BASIC_INFO_COUNT;
+                        if (r == i || (uintptr_t)ios_thread_registry[r].teb != cteb) continue;
+                        if (ios_thread_registry[r].mach_thread &&
+                            thread_info( ios_thread_registry[r].mach_thread, THREAD_BASIC_INFO,
+                                         (thread_info_t)&lbi, &lcnt ) == KERN_SUCCESS)
+                            live = 1;
+                    }
+                    if (!already && !live && reaped_n < 16)
+                    {
+                        extern void ios_wpm_reap_shared( unsigned long long mutex_addr, unsigned int depth,
+                                                         unsigned long long dead_teb );
+                        extern void ios_srw_reap_exclusive( unsigned long long lock_addr, unsigned long long dead_teb );
+                        uint32_t depth = 1;
+                        uint64_t srw_stamp = 0;
+                        mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(cteb + 0x16f0), 4,
+                                                (mach_vm_address_t)&depth, &mgot );
+                        if (!depth) depth = 1;
+                        /* ml446: slot 6 = &CodeBufferWriteMutex while the JIT
+                         * emission section holds it (JIT.cpp stamp) */
+                        mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(cteb + 0x16e8), 8,
+                                                (mach_vm_address_t)&srw_stamp, &mgot );
+                        reaped_tebs[reaped_n++] = (uint64_t)cteb;
+                        dprintf(2, "[lock-reap] dead port=0x%x tid=%04x teb=0x%llx stamp=0x%llx depth=%u srw=0x%llx — reaping rev=ml446\n",
+                                cand, ctid, (unsigned long long)cteb, (unsigned long long)held, depth,
+                                (unsigned long long)srw_stamp);
+                        ios_wpm_reap_shared( held, depth, (unsigned long long)cteb );
+                        if (srw_stamp) ios_srw_reap_exclusive( srw_stamp, (unsigned long long)cteb );
+                    }
+                    else if (!already && live)
+                        dprintf(2, "[lock-reap] dead port=0x%x teb=0x%llx stamp=0x%llx SKIPPED (teb recycled to live thread) rev=ml445\n",
+                                cand, (unsigned long long)cteb, (unsigned long long)held);
+                }
+            }
             if (thread_get_state( cand, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) != KERN_SUCCESS)
                 memset( &st, 0, sizeof(st) );
             fp = st.__fp;
@@ -558,6 +611,31 @@ static void ios_lock_census(void)
                     (unsigned long long)frames[2], (unsigned long long)frames[3],
                     (unsigned long long)frames[4], (unsigned long long)frames[5],
                     (unsigned long long)frames[6], (unsigned long long)frames[7]);
+            /* ml443: what is the HOLDER itself waiting on?  ml442 showed
+             * CrBrowserMain parked in an alert-wait while holding the
+             * CodeInvalidationMutex write-locked, but its park never crossed
+             * [waiters]' 60s bar (wakes keep resetting the age) — x-ref the
+             * live registration and print its address + lock word NOW. */
+            {
+                extern int ios_alert_waiter_lookup( unsigned int tid, const void **addr, int *age_s, int *inf );
+                const void *waddr = 0;
+                int wage = 0, winf = 0;
+                if (ios_alert_waiter_lookup( (unsigned int)ctid, &waddr, &wage, &winf ))
+                {
+                    unsigned int w = 0xdeaddead;
+                    if (!((uintptr_t)waddr & 1) && (uintptr_t)waddr > 0x10000 && (uintptr_t)waddr < 0x8000000000ULL)
+                    {
+                        uint64_t al = (uintptr_t)waddr & ~3ULL;
+                        uint32_t val = 0;
+                        mach_vm_size_t wgot = 0;
+                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)al, 4,
+                                                    (mach_vm_address_t)&val, &wgot ) == KERN_SUCCESS && wgot == 4)
+                            w = val;
+                    }
+                    dprintf(2, "[census-hold]   WAITING-ON addr=%p age=%ds %s w=%08x rev=ml443\n",
+                            waddr, wage, winf ? "INF" : "TMO", w);
+                }
+            }
         }
     }
 
@@ -620,6 +698,8 @@ uintptr_t ios_beacon_teb_list[4];
 int ios_beacon_teb_count;
 
 #define IOS_PUMP_MAX 4
+extern void ios_alert_ring_dump(void);   /* ml439 (#74): unix/sync.c alert-flow probe */
+extern void ios_alert_waiter_dump(void); /* ml440 (#74): >60s parkers + their lock words */
 void ios_pump_sample(void)
 {
     static int samples;
@@ -630,6 +710,55 @@ void ios_pump_sample(void)
     int count = __sync_fetch_and_add(&ios_thread_count, 0);
     if (count > IOS_MAX_WINE_THREADS) count = IOS_MAX_WINE_THREADS;
 
+    ios_alert_ring_dump();   /* ml439: static ring during a parked-stall = wakes dying PE-side */
+    ios_alert_waiter_dump(); /* ml440: name the lock the parked crowd is starving on */
+    /* ml447: orphan-lock detector — collect live threads' TEB Instr[6]
+     * CodeBufferWriteMutex stamps; a held-exclusive SRW with >=3 waiters that
+     * NO live thread stamps (3 cycles running) has a vanished dead owner. */
+    {
+        extern void ios_orphan_check( const unsigned long long *live_stamps, int nstamps );
+        unsigned long long stamps[64];
+        int ns = 0, si;
+        for (si = 0; si < count && ns < 64; si++)
+        {
+            struct thread_basic_info sbi;
+            mach_msg_type_number_t scnt = THREAD_BASIC_INFO_COUNT;
+            uint64_t stamp = 0;
+            mach_vm_size_t sgot = 0;
+            uintptr_t steb = ios_thread_registry[si].teb;
+            if (!ios_thread_registry[si].mach_thread || !steb) continue;
+            if (thread_info( ios_thread_registry[si].mach_thread, THREAD_BASIC_INFO,
+                             (thread_info_t)&sbi, &scnt ) != KERN_SUCCESS) continue;
+            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(steb + 0x16e8), 8,
+                                        (mach_vm_address_t)&stamp, &sgot ) != KERN_SUCCESS || sgot != 8) continue;
+            if (stamp)
+            {
+                /* ml448: NAME the live S-holder — ml447 run showed the orphan
+                 * detector correctly silent (holder alive+stamped) while the
+                 * whole world queued behind S; this line is the only view of
+                 * who owns it and pairs with its thread-stacks/census rows. */
+                uint32_t stid = 0;
+                mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(steb + 0x48), 4,
+                                        (mach_vm_address_t)&stid, &sgot );
+                dprintf(2, "[stamp-set] LIVE S-holder tid=%04x teb=0x%llx mutex=0x%llx rev=ml448\n",
+                        stid, (unsigned long long)steb, (unsigned long long)stamp);
+                stamps[ns++] = stamp;
+            }
+            /* ml468: the ml467 false orphan was a FEX lock whose LIVE holder
+             * stamps Instrumentation[8] (fexlock, TEB+0x16f8), not [6] — feed
+             * those stamps into the same live set so ios_orphan_check never
+             * strikes a lock a running thread admits to holding. */
+            if (ns < 64)
+            {
+                uint64_t fstamp = 0;
+                if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(steb + 0x16f8), 8,
+                                            (mach_vm_address_t)&fstamp, &sgot ) == KERN_SUCCESS
+                    && sgot == 8 && fstamp)
+                    stamps[ns++] = fstamp;
+            }
+        }
+        ios_orphan_check( stamps, ns );
+    }
     ios_lock_census();
     if (samples >= 120) return;
     /* discover beacon TEBs (ml399: server thread and pump can differ) */
@@ -939,7 +1068,14 @@ static void *ios_mach_exception_thread( void *arg )
                 uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
                 int is_exec_fault = (fault_addr == (uintptr_t)fault_pc);
 
-                if (is_exec_fault && thread_trampoline)
+                /* ml454 (#74): the trampoline requirement gated the WHOLE
+                 * redirect block, but only the in-pool x18-fix branch uses
+                 * it — the outside-pool image→pool translate applies a plain
+                 * PC rewrite (+ x18 via state) and needs no trampoline.  A
+                 * thread with no registered trampoline (the ml452 renderer)
+                 * lost ALL redirects and its image-VA exec fault stormed
+                 * 65k× through guest SEH, re-entering the emission locks. */
+                if (is_exec_fault)
                 {
                     uintptr_t jit_rx = (uintptr_t)ios_jit_rx_base_global;
                     size_t jit_sz = ios_jit_pool_size_global;
@@ -947,7 +1083,7 @@ static void *ios_mach_exception_thread( void *arg )
                     if (fault_pc >= jit_rx && fault_pc < jit_rx + jit_sz)
                     {
                         /* Exec fault IN JIT pool — only fixable if in .text (x18 issue) */
-                        if (ios_jit_addr_is_text(fault_pc) && state.__x[18] == 0 && thread_teb)
+                        if (ios_jit_addr_is_text(fault_pc) && state.__x[18] == 0 && thread_teb && thread_trampoline)
                         {
                             state.__x[17] = fault_pc;
                             __darwin_arm_thread_state64_set_pc_fptr(state, thread_trampoline);
@@ -4768,6 +4904,74 @@ dispatch:
                  (unsigned long long)fault_addr, frame_addr, (void *)thread_teb, dispatcher );
     deliver_logs++;
 
+    /* iOS-Mythic ml461 (#76): identical-fault redelivery TERMINAL. A host-C++
+     * fault misdelivered down the guest SEH path can never be handled — the
+     * guest restores the context and refaults, forever. ml452 stormed 65k×,
+     * ml459 70k×, ml460 326,500× (rpmalloc free-list bucket holding x86 code
+     * bytes; the wedged thread was the chrome-ipc pump and the run died of
+     * log/CPU burn instead of saying anything). No legitimate guest pattern
+     * redelivers the SAME (thread,pc,addr) thousands of times — handled
+     * retries (redirects, USD, unaligned) never reach this point. This sits
+     * at delivery-complete so every route counts, including the goto-dispatch
+     * one that bypasses the rep[] debounce above. Single server thread: no
+     * atomics needed. At the threshold: dump raw memory near the faulting
+     * thread's pointer registers (the ml460 corruption lived at [x10+x9*8]
+     * and register dumps were capped away long before the storm settled),
+     * then terminate honestly. */
+    {
+        static struct { uint64_t key; uint32_t n; } redeliv[16];
+        static volatile int ios_redeliv_terminating;
+        uint64_t rkey = ((uint64_t)thread << 48) ^ pc ^ ((uint64_t)fault_addr << 1);
+        int rslot = (int)((rkey >> 4) & 15);
+        if (redeliv[rslot].key != rkey) { redeliv[rslot].key = rkey; redeliv[rslot].n = 1; }
+        else if (++redeliv[rslot].n == 256)
+            dprintf( 2, "[redeliv] 256 identical redeliveries pc=0x%llx addr=0x%llx — storm forming rev=ml461\n",
+                     (unsigned long long)pc, (unsigned long long)fault_addr );
+        else if (redeliv[rslot].n >= 2000 && !ios_redeliv_terminating)
+        {
+            /* ml463: was `== 2000` + exit(76) — one shot, and exit() on iOS is
+             * the wine_ios_exit shim which LONGJMPS instead of terminating (the
+             * ml462 run sailed straight past its own death sentence and kept
+             * storming with a fexlock held, 11 threads parked behind it).
+             *
+             * ml465: `>=` without a latch was worse — EVERY delivery past 2000
+             * re-dumped the forensics, and the ml464 run wrote 4 MILLION lines
+             * (22k dumps) because the kill did not stop delivery instantly.
+             * Latch it: dump exactly once, then kill and keep killing. Mach
+             * task_terminate first (unshimmable), then the raw _exit syscall,
+             * then park this thread forever so it can never deliver again —
+             * whichever lands first, no second dump is possible. */
+            ios_redeliv_terminating = 1;
+            static const int fregs[] = { 0, 8, 9, 10, 16, 19, 20 };
+            unsigned fi;
+            dprintf( 2, "[redeliv] 2000 identical redeliveries pc=0x%llx addr=0x%llx — unrecoverable host fault misdelivered to guest rev=ml461\n",
+                     (unsigned long long)pc, (unsigned long long)fault_addr );
+            for (fi = 0; fi < sizeof(fregs) / sizeof(fregs[0]); fi++)
+            {
+                uint64_t rv = state->__x[fregs[fi]];
+                uint64_t words[8];
+                mach_vm_size_t got = 0;
+                if (rv < 0x1000 || rv >= 0x800000000000ull) continue;
+                if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rv & ~7ull), 64,
+                                            (mach_vm_address_t)(uintptr_t)words, &got ) != KERN_SUCCESS || got != 64)
+                {
+                    dprintf( 2, "[redeliv-mem] x%d=0x%llx: <unmapped>\n", fregs[fi], (unsigned long long)rv );
+                    continue;
+                }
+                dprintf( 2, "[redeliv-mem] x%d=0x%llx: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
+                         fregs[fi], (unsigned long long)rv,
+                         (unsigned long long)words[0], (unsigned long long)words[1],
+                         (unsigned long long)words[2], (unsigned long long)words[3],
+                         (unsigned long long)words[4], (unsigned long long)words[5],
+                         (unsigned long long)words[6], (unsigned long long)words[7] );
+            }
+            dprintf( 2, "[redeliv] terminating process rev=ml465\n" );
+            task_terminate( mach_task_self() );
+            _exit( 76 );
+            for (;;) pause();
+        }
+    }
+
     /* iOS-Mythic ml422 (#70): a webhelper thread died STATUS_STACK_OVERFLOW
      * right after the first CreateBrowser (ml421). Name the dying thread's
      * stack RESERVE so the verdict is direct: a Windows-sized (512KB/1MB)
@@ -5370,6 +5574,77 @@ static int ios_make_wine_logging_safe( void )
     }
     return 1;
 }
+
+/* iOS-Mythic ml481 (#85): is this fault FOREIGN — i.e. raised by a host
+ * (Apple/SwiftUI/Metal) thread executing host code on host memory?
+ *
+ * ml480's freeze: the app's UI thread (port 0x103) was inside
+ * swift_allocObject -> libsystem_malloc when a trap fired INSIDE malloc (so
+ * the thread already held the malloc zone lock). trap_handler adopted it as a
+ * guest exception, ios_log_guest_exception then faulted (no TEB on that
+ * thread), segv_handler ran, and ios_make_wine_logging_safe called through a
+ * not-yet-bound lazy stub -> dyld -> malloc -> the SAME zone lock. Deadlock:
+ * sampled 22x at cpu=1000 with an unchanging sp. The UI froze for the rest of
+ * the run while every other thread kept going, which is exactly what the user
+ * sees as "a big freeze".
+ *
+ * Our handlers must only adopt faults that belong to the emulated world. A
+ * thread qualifies as ours if it has a TEB (pthread key or TSD slot 275) or is
+ * executing from the JIT pool / guest bands; a fault also stays ours when the
+ * TARGET address is emulator-managed memory (wine guard pages, pool aliases),
+ * since host threads legitimately touch those. Everything else is foreign.
+ *
+ * pthread_getspecific and the raw TSD read are async-signal-safe; nothing here
+ * allocates, so this predicate can run before any logging. */
+static int ios_fault_is_foreign( const void *pc, const void *addr )
+{
+    extern pthread_key_t ios_teb_tls_key;
+    extern int ios_teb_tls_key_created;
+    extern void *ios_jit_rx_base_global;
+    extern void *ios_jit_rw_base_global;
+    extern size_t ios_jit_pool_size_global;
+    uintptr_t p = (uintptr_t)pc, a = (uintptr_t)addr, tsd_base = 0;
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+    uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
+    size_t sz = ios_jit_pool_size_global;
+
+    /* a registered wine/guest thread is always ours */
+    if (ios_teb_tls_key_created && pthread_getspecific( ios_teb_tls_key )) return 0;
+    __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
+    tsd_base &= ~7ULL;
+    if (tsd_base && *(void **)(tsd_base + 275 * 8)) return 0;
+
+    /* TEB-less but running emulated code (threads CEF/FEX create directly) */
+    if (sz && rx && p >= rx && p < rx + sz) return 0;
+    if (sz && rw && p >= rw && p < rw + sz) return 0;
+    if (p >= 0x7000000000ull && p < 0x8000000000ull) return 0;  /* guest | PA | FEX bands */
+
+    /* host code, but touching emulator-managed memory (guard page, pool alias,
+     * guest buffer handed to Metal): the repair paths below are still correct */
+    if (a)
+    {
+        if (sz && rx && a >= rx && a < rx + sz) return 0;
+        if (sz && rw && a >= rw && a < rw + sz) return 0;
+        if (a >= 0x7000000000ull && a < 0x8000000000ull) return 0;
+    }
+    return 1;
+}
+
+/* Decline a foreign fault: report it with write(2)-only logging (the
+ * interrupted thread may hold the malloc lock, so NOTHING here may allocate or
+ * hit an unbound lazy stub), then restore the default disposition so the OS
+ * reports honestly instead of us spinning forever inside our own handler. */
+static void ios_decline_foreign_fault( int sig, const void *pc, const void *addr )
+{
+    static int declined_n;
+    if (declined_n < 8)
+    {
+        declined_n++;
+        dprintf( 2, "[host-fault] sig=%d pc=%p addr=%p on a NON-guest thread — declining to adopt "
+                    "(would have deadlocked in our own handler) rev=ml481\n", sig, pc, addr );
+    }
+    signal( sig, SIG_DFL );
+}
 #endif
 
 static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
@@ -5378,7 +5653,16 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     ucontext_t *context = sigcontext;
     DWORD64 esr = get_fault_esr( context );
 #ifdef WINE_IOS
-    const int dbg_ok = ios_make_wine_logging_safe();
+    int dbg_ok;
+
+    /* ml481 (#85): decide FOREIGN-ness before anything that could allocate —
+     * ios_make_wine_logging_safe() itself is the call that deadlocked in ml480. */
+    if (ios_fault_is_foreign( (void *)PC_sig( context ), siginfo->si_addr ))
+    {
+        ios_decline_foreign_fault( signal, (void *)PC_sig( context ), siginfo->si_addr );
+        return;
+    }
+    dbg_ok = ios_make_wine_logging_safe();
 #endif
 
 #ifdef WINE_IOS
@@ -6769,6 +7053,100 @@ static int ios_emulate_store(ucontext_t *ctx, uint32_t insn, uintptr_t rw_addr)
 
     return 0;  /* unhandled instruction */
 }
+
+/**********************************************************************
+ *		ios_emulate_unaligned_guest_access
+ *
+ * iOS-Mythic ml479 (#83): emulate a PLAIN (non-atomic) misaligned
+ * load/store IN PLACE via memcpy and return 1, or 0 if the form isn't
+ * safely emulatable. Guest x86 MOVs may be arbitrarily misaligned and
+ * MUST succeed; some guest regions (PA-band SM_COW pages, hit by the
+ * 2026-08-04 Steam client) alignment-fault them at the hardware level
+ * (SIGBUS/BUS_ADRALN on a readable+writable page). memcpy is byte-wise
+ * so it cannot re-raise the alignment fault inside the handler. Only
+ * no-writeback addressing forms are accepted (unsigned offset, register
+ * offset, unscaled LDUR/STUR, signed-offset LDP/STP) — pre/post-index
+ * would need a base-register update and FEX doesn't emit them for guest
+ * memory ops. Atomic/exclusive/SIMD forms return 0 so the caller keeps
+ * the existing 80000002 path for FEX's unaligned-atomic machinery.
+ */
+static int ios_emulate_unaligned_guest_access(ucontext_t *ctx, uint32_t insn, uintptr_t addr)
+{
+    int rt = insn & 0x1F;
+
+    if ((insn >> 26) & 1) return 0;  /* SIMD/FP: not handled here */
+
+    /* Load/store register — three no-writeback addressing forms, common
+     * size/opc decode:
+     *   unsigned offset:  size 111 0 01 opc imm12       Rn Rt
+     *   register offset:  size 111 0 00 opc 1 Rm opt S 10 Rn Rt
+     *   unscaled (LDUR/STUR): size 111 0 00 opc 0 imm9 00 Rn Rt */
+    if ((insn & 0x3F000000) == 0x39000000 ||        /* unsigned offset */
+        (insn & 0x3F200C00) == 0x38200800 ||        /* register offset */
+        (insn & 0x3F200C00) == 0x38000000)          /* unscaled */
+    {
+        int size = (insn >> 30) & 3;
+        int opc  = (insn >> 22) & 3;
+        unsigned nbytes = 1u << size;
+
+        if (size == 3 && opc >= 2) return 0;        /* PRFM / undefined */
+        if (size == 2 && opc == 3) return 0;        /* undefined */
+
+        if (opc == 0)                               /* store */
+        {
+            uint64_t v = ios_get_reg(ctx, rt);
+            memcpy((void *)addr, &v, nbytes);
+        }
+        else                                        /* load */
+        {
+            uint64_t v = 0;
+            memcpy(&v, (const void *)addr, nbytes);
+            if (opc >= 2)                           /* sign-extending */
+            {
+                int shift = 64 - 8 * (int)nbytes;
+                int64_t sv = (int64_t)(v << shift) >> shift;
+                v = (opc == 3) ? (uint64_t)(uint32_t)sv : (uint64_t)sv;
+            }
+            if (rt != 31) REGn_sig(rt, ctx) = v;
+        }
+        return 1;
+    }
+
+    /* LDP/STP signed offset (no writeback): opc 101 0 010 L imm7 Rt2 Rn Rt */
+    if ((insn & 0x3F800000) == 0x29000000)
+    {
+        int opc2 = (insn >> 30) & 3;
+        int L = (insn >> 22) & 1;
+        int rt2 = (insn >> 10) & 0x1F;
+        unsigned nb = (opc2 & 2) ? 8 : 4;
+
+        if (opc2 == 3) return 0;                    /* undefined */
+        if (opc2 == 1 && !L) return 0;              /* STGP/undefined */
+
+        if (!L)
+        {
+            uint64_t v1 = ios_get_reg(ctx, rt), v2 = ios_get_reg(ctx, rt2);
+            memcpy((void *)addr, &v1, nb);
+            memcpy((void *)(addr + nb), &v2, nb);
+        }
+        else
+        {
+            uint64_t v1 = 0, v2 = 0;
+            memcpy(&v1, (const void *)addr, nb);
+            memcpy(&v2, (const void *)(addr + nb), nb);
+            if (opc2 == 1)                          /* LDPSW */
+            {
+                v1 = (uint64_t)(int64_t)(int32_t)v1;
+                v2 = (uint64_t)(int64_t)(int32_t)v2;
+            }
+            if (rt != 31) REGn_sig(rt, ctx) = v1;
+            if (rt2 != 31) REGn_sig(rt2, ctx) = v2;
+        }
+        return 1;
+    }
+
+    return 0;
+}
 #endif
 
 
@@ -6781,6 +7159,13 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { EXCEPTION_DATATYPE_MISALIGNMENT };
 #ifdef WINE_IOS
+    /* ml481 (#85): foreign-thread faults must not reach wine logging — see
+     * ios_fault_is_foreign(). Must precede ios_make_wine_logging_safe(). */
+    if (ios_fault_is_foreign( (void *)PC_sig( (ucontext_t *)sigcontext ), siginfo->si_addr ))
+    {
+        ios_decline_foreign_fault( signal, (void *)PC_sig( (ucontext_t *)sigcontext ), siginfo->si_addr );
+        return;
+    }
     ios_make_wine_logging_safe();   /* ml375: before any ERR/WARN — see helper */
     ios_track_signal( signal, sigcontext );
     static int bus_count = 0;
@@ -7138,6 +7523,36 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                     siginfo->si_addr, pc, (int)vrec.ExceptionInformation[0]);
                 goto bus_fatal;
             }
+            /* iOS-Mythic ml479 (#83): readable target + BUS_ADRALN — emulate
+             * PLAIN loads/stores in place before concluding "alignment fault →
+             * 80000002". The 80000002 path only helps ATOMICS (FEX's unaligned
+             * backpatcher); the 2026-08-04 Steam client does misaligned plain
+             * 8-byte MOVs into a PA-band SM_COW region that alignment-faults
+             * at the hardware level (prot=3, readable=1, si_code=1), and the
+             * plain STR fell through FEX's handler into a fatal mislabeled
+             * misalignment (webhelper death loop, ml478). x86 MOVs must simply
+             * succeed. Atomic/exclusive/SIMD forms fail the decode below and
+             * keep the existing 80000002 path unchanged. */
+            if (siginfo->si_code == BUS_ADRALN)
+            {
+                uint32_t a_insn = *(uint32_t *)(uintptr_t)PC_sig(bus_ctx);
+                if (ios_emulate_unaligned_guest_access(bus_ctx, a_insn, (uintptr_t)siginfo->si_addr))
+                {
+                    static int ua_emu;
+                    if (ua_emu < 32 && ++ua_emu <= 32)
+                        ERR("[unaligned-guest] emulated insn=0x%08x addr=%p pc=%p rev=ml479\n",
+                            a_insn, siginfo->si_addr, pc);
+                    PC_sig(bus_ctx) += 4;
+                    ios_fixup_x18_for_return( bus_ctx );
+                    return;
+                }
+                {
+                    static int ua_miss;
+                    if (ua_miss < 16 && ++ua_miss <= 16)
+                        ERR("[unaligned-guest] UNSUPPORTED insn=0x%08x addr=%p pc=%p -- keeping 80000002 rev=ml479\n",
+                            a_insn, siginfo->si_addr, pc);
+                }
+            }
             /* readable target: genuine alignment fault — keep 80000002 so FEX's
              * unaligned-access backpatcher handles it; its NtContinueNative
              * resume is now honored natively (signal_set_full_context ml420) */
@@ -7186,6 +7601,14 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 (void *)PC_sig( context ), siginfo->si_code);
         REGn_sig( 0, context ) = 0;
         PC_sig( context ) += 4;
+        return;
+    }
+    /* ml481 (#85): a BRK/trap raised by HOST code on a host thread (ml480: the
+     * UI thread trapping inside libsystem_malloc) is never a guest exception —
+     * adopting it wedged the app. Check before any logging or save_context. */
+    if (ios_fault_is_foreign( (void *)PC_sig( context ), siginfo->si_addr ))
+    {
+        ios_decline_foreign_fault( signal, (void *)PC_sig( context ), siginfo->si_addr );
         return;
     }
     ios_track_signal( signal, context );

@@ -222,44 +222,81 @@ bool jit_make_region_no_footprint(void *addr, size_t size, const char *label) {
         fp_before = vmi.phys_footprint;
     }
 
-    memory_object_size_t entry_size = (memory_object_size_t)size;
-    mach_port_t entry = MACH_PORT_NULL;
-    kr = mach_make_memory_entry_64(
-        task,
-        &entry_size,
-        (memory_object_offset_t)(uintptr_t)addr,
-        MAP_MEM_VM_SHARE | VM_PROT_READ | VM_PROT_WRITE,
-        &entry,
-        MACH_PORT_NULL
-    );
-    if (kr != KERN_SUCCESS || entry == MACH_PORT_NULL) {
-        jit_log("[no-footprint] %s: mach_make_memory_entry_64 failed kr=%d (%s) — pool stays jetsam-counted",
-                label, kr, mach_error_string(kr));
-        return false;
-    }
-    if ((size_t)entry_size < size) {
-        jit_log("[no-footprint] %s: entry covers only %llu of %zu bytes (partial)",
-                label, (unsigned long long)entry_size, size);
+    /* ml458 (#75): the original single attempt used MAP_MEM_VM_SHARE and always
+     * came back "ownership failed kr=4" (KERN_INVALID_ARGUMENT) — so the 896MB
+     * pool has counted against phys_footprint every run, which is what pins the
+     * pool at a size that now exhausts (ml455/ml456 both died there) and what
+     * jetsam'd the 1024MB attempt at ml421-422.
+     *
+     * kr=4 is a REJECTED ENTRY KIND, not a permissions refusal (that would be
+     * KERN_NO_ACCESS / KERN_PROTECTION_FAILURE): MAP_MEM_VM_SHARE hands back a
+     * copy-style named entry, while the ownership call wants an entry that
+     * names the VM object itself — which is exactly the difference from
+     * jit_region_create()'s MAP_MEM_NAMED_CREATE entry, where this same
+     * ownership call succeeds.
+     *
+     * This is undocumented private API on a beta OS, so instead of betting the
+     * run on one guess, walk a small ladder of (entry-flags, owner) pairs and
+     * let the log say which pair the kernel accepts.  Every step prints its kr;
+     * the winner prints the phys_footprint delta, which is the only honest
+     * proof the exemption took effect (a delta of ≈ the resident pool bytes
+     * means real relief; ≈0 means the kernel accepted the call but kept
+     * charging us). Non-fatal throughout: worst case we are exactly as
+     * jetsam-counted as before. */
+    struct { unsigned int flags; int own_self; const char *name; } variants[] = {
+        { VM_PROT_READ | VM_PROT_WRITE,                    0, "plain/TASK_NULL" },
+        { VM_PROT_READ | VM_PROT_WRITE,                    1, "plain/self" },
+        { MAP_MEM_VM_SHARE | VM_PROT_READ | VM_PROT_WRITE, 1, "share/self" },
+        { MAP_MEM_VM_SHARE | VM_PROT_READ | VM_PROT_WRITE, 0, "share/TASK_NULL" },
+    };
+
+    for (unsigned v = 0; v < sizeof(variants) / sizeof(variants[0]); v++) {
+        memory_object_size_t entry_size = (memory_object_size_t)size;
+        mach_port_t entry = MACH_PORT_NULL;
+        kr = mach_make_memory_entry_64(
+            task,
+            &entry_size,
+            (memory_object_offset_t)(uintptr_t)addr,
+            variants[v].flags,
+            &entry,
+            MACH_PORT_NULL
+        );
+        if (kr != KERN_SUCCESS || entry == MACH_PORT_NULL) {
+            jit_log("[no-footprint] %s: [%s] make_memory_entry failed kr=%d (%s) rev=ml458",
+                    label, variants[v].name, kr, mach_error_string(kr));
+            continue;
+        }
+        if ((size_t)entry_size < size) {
+            jit_log("[no-footprint] %s: [%s] entry covers only %llu of %zu bytes (partial)",
+                    label, variants[v].name, (unsigned long long)entry_size, size);
+        }
+
+        kr = mach_memory_entry_ownership(entry,
+                                         variants[v].own_self ? task : TASK_NULL,
+                                         VM_LEDGER_TAG_DEFAULT,
+                                         VM_LEDGER_FLAG_NO_FOOTPRINT);
+        mach_port_deallocate(task, entry);
+        if (kr != KERN_SUCCESS) {
+            jit_log("[no-footprint] %s: [%s] ownership failed kr=%d (%s) rev=ml458",
+                    label, variants[v].name, kr, mach_error_string(kr));
+            continue;
+        }
+
+        vmi_cnt = TASK_VM_INFO_COUNT;
+        if (task_info(task, TASK_VM_INFO, (task_info_t)&vmi, &vmi_cnt) == KERN_SUCCESS) {
+            fp_after = vmi.phys_footprint;
+        }
+        jit_log("[no-footprint] %s: [%s] ownership OK for %zu MB | phys_footprint %llu MB -> %llu MB "
+                "(delta %lld MB) rev=ml458",
+                label, variants[v].name, size >> 20,
+                (unsigned long long)(fp_before >> 20), (unsigned long long)(fp_after >> 20),
+                ((long long)fp_after - (long long)fp_before) >> 20);
+        return true;
     }
 
-    kr = mach_memory_entry_ownership(entry, TASK_NULL, VM_LEDGER_TAG_DEFAULT,
-                                     VM_LEDGER_FLAG_NO_FOOTPRINT);
-    mach_port_deallocate(task, entry);
-    if (kr != KERN_SUCCESS) {
-        jit_log("[no-footprint] %s: ownership failed kr=%d (%s) — pool stays jetsam-counted",
-                label, kr, mach_error_string(kr));
-        return false;
-    }
-
-    vmi_cnt = TASK_VM_INFO_COUNT;
-    if (task_info(task, TASK_VM_INFO, (task_info_t)&vmi, &vmi_cnt) == KERN_SUCCESS) {
-        fp_after = vmi.phys_footprint;
-    }
-    jit_log("[no-footprint] %s: ownership OK for %zu MB | phys_footprint %llu MB -> %llu MB (delta %lld MB)",
-            label, size >> 20,
-            (unsigned long long)(fp_before >> 20), (unsigned long long)(fp_after >> 20),
-            ((long long)fp_after - (long long)fp_before) >> 20);
-    return true;
+    jit_log("[no-footprint] %s: ALL %zu variants refused — pool stays jetsam-counted rev=ml458",
+            label, sizeof(variants) / sizeof(variants[0]));
+    return false;
 }
 
 void jit_region_destroy(JITRegion *region) {

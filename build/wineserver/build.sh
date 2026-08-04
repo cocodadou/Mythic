@@ -80,6 +80,12 @@ PATCHED_FILES=(
     # task#32 Steam: stop_thread Mach-based context capture (iOS signal
     # suspend is dead) lives in the submodule's thread.c
     "thread:$WINE_SRC/server/thread.c:thread.o"
+    # ml474 (#79): sock.c now builds from the submodule. Before this entry
+    # the archive carried a hand-inserted Jul-10 sock.o (probed, source
+    # lost) that every rebuild silently preserved — the #79 TCP-table
+    # forensics were reading three-week-old mystery code. The submodule
+    # copy adds the [srv-conn]/[tcp-state]/[tcp-enum] probes.
+    "sock:$WINE_SRC/server/sock.c:sock.o"
 )
 
 echo "=== Building kill wrapper (without kill macro) ==="
@@ -144,6 +150,7 @@ REPLACEMENTS=(
     "mapping.o:mapping.o"
     "winstation.o:winstation.o"
     "thread.o:thread.o"
+    "sock.o:sock.o"
 )
 
 for entry in "${REPLACEMENTS[@]}"; do

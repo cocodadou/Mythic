@@ -1083,6 +1083,31 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                  * overflow persists, V8 codegen is exonerated too. Steam passes
                  * no --js-flags of its own (webhelper.txt cmdline verified), so
                  * appending the switch is collision-free. */
+                /* ml437 (#74): --js-flags=--jitless DROPPED. It was an #70-era
+                 * experiment variable (ml427/ml429 exonerated it; "drop
+                 * whenever"), and ml436 showed the cost: the steamui shared-JS
+                 * -context boot sat pre-GetDesiredSteamUIWindows for 15+ min on
+                 * an otherwise healthy run — interpreted V8 under emulation is
+                 * the prime suspect. Full V8 JIT emits runtime x86 (heavier FEX
+                 * compile + tracker traffic, the normal game path) but runs JS
+                 * 5-20x faster. Deploy proof = [proc-gate] cmdline-tail echo no
+                 * longer showing the flag. */
+                /* ml476: --js-flags=--jitless RESTORED — jitless-off is now
+                 * HONESTLY CONVICTED by the criterion ml456 set ("if the JS
+                 * boot stalls again on a park-free run").  Both jitless-off
+                 * runs parked CrBrowserMain in NtWaitForAlertByThreadId
+                 * shortly after BrowserReady and stopped writing cef_log
+                 * (ml474b +104s, ml475 +4s), while the process stayed alive.
+                 * ml475 was park-free in every sense we can currently
+                 * measure — zero [bp-lock] timeouts (#80), zero threads
+                 * frozen in the JIT pool, and the #81 SEH storm eliminated
+                 * (786k faults -> 0) — so the storm was NOT the freeze cause
+                 * and V8 JIT itself is the remaining differentiator: every
+                 * jitless-ON run kept CEF logging for many minutes and two of
+                 * them dialed.  Restoring it also restores the known-good
+                 * pool tail budget (the ml455 exhaustion shape).  The #81 fix
+                 * stays regardless — it is a real bug worth ~786k kernel
+                 * round-trips per run. */
                 static const char sp[] = " --single-process --enable-logging=file --v=1 --log-severity=verbose"
                                          " --no-proxy-server --winhttp-proxy-resolver --js-flags=--jitless";
                 static const char dfs[] = "--disable-features=";
@@ -1137,7 +1162,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                     params->CommandLine.Length = o * sizeof(WCHAR);
                     params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
                     dprintf(2, "[proc-gate] steamwebhelper: injected --single-process + CEF verbosity"
-                               " + no-proxy; BRP+segmentation-disable %s (ml426)\n",
+                               " + no-proxy + jitless RESTORED (rev=ml476); BRP+segmentation-disable %s (ml426)\n",
                             bl ? "SPLICED into Steam's existing --disable-features list"
                                : "NOT applied (no --disable-features found -- refusing to add a "
                                  "second one, it would override Steam's list)");

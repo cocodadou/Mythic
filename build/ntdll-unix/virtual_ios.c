@@ -666,6 +666,17 @@ static void *ios_pool_warmer_thread( void *arg )
             }
             if (cycle == 1 || (cycle % 15) == 0)
             {
+                /* ml469 (wall #79): one-shot proof of whether TCP loopback
+                 * works at all under this port — the webhelper's transport
+                 * ws://localhost dial loop never completes and steam.exe's own
+                 * connectivity test says NoLAN, but nothing on record shows a
+                 * loopback connect succeeding here.  Raw BSD sockets, below
+                 * wine, so a failure indicts the platform layer directly. */
+                if (cycle == 1)
+                {
+                    extern void ios_loopback_selftest(void);
+                    ios_loopback_selftest();
+                }
                 ios_slot_probe( "periodic" );
                 /* ml121 probe-design fix: the inventory was wired ONLY to the
                  * jumbo-failure sites, and ml121 died before any jumbo call, so
@@ -1174,6 +1185,62 @@ static void ios_bigres_commit( void *addr, size_t size )
         }
 }
 
+/* ml435 (#73): FEX-band span lifecycle census. ml434 filled the band solid
+ * (465 views, 86 failed 64MB scans -> code-buffer mprotect failures -> Crashpad)
+ * with only ~52 of 109 created threads still alive — the discriminator between
+ * "rpmalloc heaps recycle but demand outgrew 16GB" and "exited threads' spans
+ * leak" is the ALLOC vs FREE count for >=16MB band regions. Pairs with the
+ * [thr-term] probes in xtajit64 (same rev). */
+static unsigned ios_span_alloc_n, ios_span_free_n;
+static void ios_span_census( void *base, size_t size, int is_free )
+{
+    uintptr_t a = (uintptr_t)base;
+    unsigned n;
+    if (a < 0x7c00000000ULL || a >= 0x8000000000ULL || size < 0x1000000) return;
+    n = is_free ? ++ios_span_free_n : ++ios_span_alloc_n;
+    if (n <= 40 || !(n & 15))
+        dprintf(2, "[span-census] %s #%u %p+0x%lx tid=%04x live=%d rev=ml435\n",
+                is_free ? "FREE" : "ALLOC", n, base, (unsigned long)size,
+                NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0,
+                (int)ios_span_alloc_n - (int)ios_span_free_n);
+}
+
+/* iOS-Mythic ml462 (#77): reserve->release CYCLE tracker. The ml461 run died
+ * of a guest placement livelock: V8's CodeRange (512MB, must sit within jump
+ * distance of libcef's embedded builtins) reserved, got granted, REJECTED the
+ * location, released, and retried forever — ping-ponging on the same two
+ * kernel-pick addresses while the armed steer valve dutifully spilled the
+ * churn into the FEX band until the process starved (2,243 rpmalloc spans,
+ * 15.5GB reserved). A same-(tid,size) big reserve that has been GRANTED and
+ * immediately RELEASED dozens of times will never converge — after the cap,
+ * deny it outright so the guest takes its own named failure path instead of
+ * spinning. Keyed on (tid, size to 16MB granularity); 8 slots, evict-on-
+ * collision, approximate by design. */
+static struct { unsigned tid; uint64_t size16m; unsigned cycles; } ios_rescycle[8];
+static void ios_reserve_cycle_note( unsigned tid, uint64_t size )
+{
+    uint64_t s16 = size >> 24;
+    unsigned i, slot = (tid ^ (unsigned)s16) & 7;
+    for (i = 0; i < 8; i++)
+        if (ios_rescycle[i].tid == tid && ios_rescycle[i].size16m == s16)
+        {
+            ios_rescycle[i].cycles++;
+            return;
+        }
+    ios_rescycle[slot].tid = tid;
+    ios_rescycle[slot].size16m = s16;
+    ios_rescycle[slot].cycles = 1;
+}
+static unsigned ios_reserve_cycle_count( unsigned tid, uint64_t size )
+{
+    uint64_t s16 = size >> 24;
+    unsigned i;
+    for (i = 0; i < 8; i++)
+        if (ios_rescycle[i].tid == tid && ios_rescycle[i].size16m == s16)
+            return ios_rescycle[i].cycles;
+    return 0;
+}
+
 /* ml433 (#72): drop released ranges so [bigres-use] stops double-counting the
  * guest's reserve/free alignment retries — ml432 reported 163,840MB "reserved"
  * when all but ~72GB had already been freed again (the same base regranted up
@@ -1187,6 +1254,8 @@ static void ios_bigres_release( void *base )
         if (ios_bigres_tab[i].base != a) continue;
         dprintf(2, "[bigres-free] 0x%llx +%lluMB released rev=ml433\n",
                 (unsigned long long)a, (unsigned long long)(ios_bigres_tab[i].size >> 20));
+        ios_reserve_cycle_note( NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0,
+                                ios_bigres_tab[i].size );
         ios_bigres_tab[i] = ios_bigres_tab[--ios_bigres_cnt];
         return;
     }
@@ -1904,6 +1973,22 @@ static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
  * un-refuse. */
 static volatile size_t ios_jit_tail_reserved = 0;
 
+/* ml438 (#74): tail EC-buffer FREE-LIST. tail_resv was monotonic — dead
+ * threads' code buffers never returned their tail space, so long runs
+ * exhausted the tail (ml436: 10 refusals at head 708MB + tail 188MB; ml437:
+ * refusing even 1MB) and post-StikDebug-detach there is NO fallback (band
+ * buffers can't be made executable detached). The pool is fully executable
+ * from BOOT, so recycling tail carves needs no debugger: record every carve,
+ * mark it free when FEXCore releases the buffer (NtFreeVirtualMemory of a
+ * pool-tail rx address — no wine view exists for these), and serve future
+ * asks first-fit from the free entries. No splitting: sizes are pow2-ish
+ * (1..32MB after the ml437 MAX_CODE_SIZE cap), so first-fit-larger waste is
+ * bounded and reuse is usually exact. */
+#define IOS_TAIL_CARVE_MAX 256
+static struct { size_t off; size_t size; int free; } ios_tail_carves[IOS_TAIL_CARVE_MAX];
+static unsigned ios_tail_carve_n;
+static pthread_mutex_t ios_tail_carve_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* Exported JIT pool addresses for use by SIGBUS handler in signal_arm64_ios.c */
 /* ml251: does anything MUNMAP/MMAP inside the JIT pool's VA?
  *
@@ -2329,7 +2414,7 @@ USHORT ios_cur_image_info_machine(void)
  * module resolves to the shared parent copy via the fallback. */
 void *ios_jit_translate_addr_for_owner(void *addr, void *owner_peb)
 {
-    int i, fallback = -1;
+    int i, fallback = -1, any_live = -1;
     uintptr_t a = (uintptr_t)addr;
 
     for (i = 0; i < ios_jit_mapping_count; i++)
@@ -2340,11 +2425,33 @@ void *ios_jit_translate_addr_for_owner(void *addr, void *owner_peb)
             if (ios_jit_mappings[i].owner_peb == owner_peb)
                 return (void *)((uintptr_t)ios_jit_mappings[i].jit_base + (a - base));
             if (!ios_jit_mappings[i].owner_peb && fallback < 0) fallback = i;
+            if (any_live < 0) any_live = i;
         }
     }
     if (fallback >= 0)
         return (void *)((uintptr_t)ios_jit_mappings[fallback].jit_base
                         + (a - (uintptr_t)ios_jit_mappings[fallback].pe_base));
+    /* ml454 (#74): PE image ranges are globally unique in the single shared
+     * address space — an entry CONTAINING the address IS the right copy even
+     * when the caller's owner_peb doesn't match (observed: the renderer
+     * thread's owner resolution missed for webhelper's xtajit64 copy and a
+     * live in-range entry was refused → 65k-fault pass-through storm at the
+     * GuestToHostMap dtor → the #74 lock re-entry chain).  The cross-copy
+     * disease this owner check guards against needs a SAME-VA ambiguity,
+     * which cannot exist here. */
+    if (any_live >= 0)
+    {
+        static int xany_n;
+        if (xany_n < 20)
+        {
+            xany_n++;
+            dprintf(2, "[xlate-any] addr=%p owner=%p matched live entry pe=%p owner=%p (exact-owner miss) rev=ml454\n",
+                    addr, owner_peb, ios_jit_mappings[any_live].pe_base,
+                    ios_jit_mappings[any_live].owner_peb);
+        }
+        return (void *)((uintptr_t)ios_jit_mappings[any_live].jit_base
+                        + (a - (uintptr_t)ios_jit_mappings[any_live].pe_base));
+    }
     return addr;  /* Not in any mapping */
 }
 
@@ -4467,6 +4574,11 @@ extern const void *bcrypt_unix_call_funcs[];
 extern const void *secur32_unix_call_funcs[];
 extern const void *crypt32_unix_call_funcs[];
 
+/* iOS-Mythic 2026-08-03 (#79 transport): in-process NSI TCP connection
+ * tables — nsiproxy.sys is not shipped, PE nsi.dll falls back to this
+ * when \\.\Nsi can't be opened. See nsi_unixlib_ios.c */
+extern const void *nsi_unix_call_funcs[];
+
 /* win32u's unix init, statically linked via libwin32u_unix.a. Renamed
  * from __wine_unix_lib_init in build/win32u-unix/build.sh so future
  * statically-linked unix libs can keep their own init without colliding.
@@ -4549,6 +4661,11 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             *funcs = (const void *)crypt32_unix_call_funcs;
             dprintf(2, "[unixlib] module %p (%s) -> crypt32_unix_call_funcs (%p)\n",
                 module, match, (void *)crypt32_unix_call_funcs);
+            status = STATUS_SUCCESS;
+        } else if (match && strstr(match, "nsi.dll")) {
+            *funcs = (const void *)nsi_unix_call_funcs;
+            dprintf(2, "[unixlib] module %p (%s) -> nsi_unix_call_funcs (%p) rev=ml472\n",
+                module, match, (void *)nsi_unix_call_funcs);
             status = STATUS_SUCCESS;
         } else if (match && strstr(match, "win32u")) {
             /* Register win32u's NtUser / NtGdi syscall table in slot 1.
@@ -6837,6 +6954,20 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size);
                 return 0;
             }
+
+            /* ml457 REVERTED (ml458) — DO NOT RE-ATTEMPT skipping pool copies
+             * for pure-x64 images.  The premise ("x64 runs only through FEX, so
+             * its pool copy is never entered") is FALSE: x64 guest RIPs ARE
+             * pool-copy aliases.  FEX decodes and dispatches x64 code at POOL
+             * addresses — see [pool-rip-fix] (FEXCore Core.cpp), [exc-pool-rip]
+             * (ARM64EC Module.cpp), and task #52's CompileBlock reverse-translate.
+             * Removing the copy removes the execution substrate: ml457 (db 5840)
+             * skipped steamexe.exe 38× and steam.exe died in seconds calling a
+             * garbage target (pc=0, guest RIP=0x69) out of vstdlib's .fptable
+             * indirection.  The 369MB of x64 copies is REAL cost, not waste.
+             * Budget must come from elsewhere (dedup of duplicate EC copies,
+             * CodeBuffer generation cap, or making the pool no-footprint so it
+             * can grow past the jetsam-bound 896MB). */
 
             /* Align to 16KB page boundary.
              * task #34 .text sharing: fold the x18 trampoline region into
@@ -12329,13 +12460,91 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
              * a steer that cannot be served is still never worse than not
              * steering. The 1GB ceiling stays: >=1GB reserves are PartitionAlloc
              * pool business and go through the jumbo path above. */
+            /* iOS-Mythic ml462 (#77): V8 CodeRange placement service + livelock
+             * breaker. Signature: kernel-pick, reserve-only, PAGE_NOACCESS,
+             * 512MB(+slop) — V8's kMaximalCodeRangeSize, wanting to land within
+             * jump distance of libcef's embedded builtins in the module band
+             * (its own preferred hint 0x71e0000000 collides with loaded DLLs
+             * and everything the kernel picks elsewhere gets rejected+released;
+             * ml461 looped this forever). Serve it from [0x7100000000,
+             * 0x71c0000000) — free space directly below the module band, ~1GB
+             * from the builtins. V8 redoes its own alignment two-step inside
+             * the zone (the aligned re-reserve arrives hinted and the normal
+             * path grants it). If the guest has already cycled 32 grants of
+             * this shape, placement cannot satisfy it — deny outright so V8
+             * fails NAMED in cef_log instead of eating the FEX band. */
             if (!*ret && !limit && (type & MEM_RESERVE) && !(type & MEM_COMMIT)
+                && protect == PAGE_NOACCESS
+                && *size_ptr >= 0x20000000 && *size_ptr <= 0x20100000)
+            {
+                unsigned ctid = NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
+                unsigned cyc = ios_reserve_cycle_count( ctid, *size_ptr );
+                static unsigned cr_logs;
+                if (cyc >= 32)
+                {
+                    if (cr_logs < 16)
+                        dprintf(2, "[coderange] DENY tid=%04x size=0x%lx cycles=%u — placement livelock, failing honestly rev=ml462\n",
+                                ctid, (unsigned long)*size_ptr, cyc);
+                    cr_logs++;
+                    return STATUS_NO_MEMORY;
+                }
+                {
+                    SIZE_T cwant = *size_ptr;
+                    void *csaved = *ret;
+                    /* ml463: floor raised 0x7100000000 -> 0x7180000000. The
+                     * ml462 run granted the zone BOTTOM (0x7100000000, ~3.5GB
+                     * from the builtins) and V8 cycled 4 more grant/release
+                     * rounds before settling — consistent with a ±2GB reach
+                     * check (acceptable floor ~0x7162000000). Start inside the
+                     * window so the first grant sticks. */
+                    NTSTATUS cst = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                                            0x7180000000ULL, 0x71c0000000ULL, 0, 0 );
+                    if (cr_logs < 16)
+                        dprintf(2, "[coderange] #%u tid=%04x size=0x%lx cycles=%u -> %s %p rev=ml462\n",
+                                cr_logs, ctid, (unsigned long)cwant, cyc,
+                                cst ? "zone FULL, falling through" : "near-builtins zone", *ret);
+                    cr_logs++;
+                    if (!cst) { st = cst; ios_steered = 1; }
+                    else { *ret = csaved; *size_ptr = cwant; }
+                }
+            }
+
+            if (!ios_steered
+                && !*ret && !limit && (type & MEM_RESERVE) && !(type & MEM_COMMIT)
                 && *size_ptr >= 0x2000000 && *size_ptr < 0x40000000
                 && (ios_bigres_reserved_total > (8ull << 30) || ios_va_pressure))
             {
                 SIZE_T want = *size_ptr;
                 void *saved = *ret;
                 static unsigned steer_n;
+                /* ml462 (#77): per-tid intake cap. The valve was sized for the
+                 * ~25-55 legitimate leaked-per-thread reserves it was built for
+                 * (ml171); ml461's livelock fed it an INFINITE stream from two
+                 * tids and it spilled 15.5GB into the FEX band before the
+                 * process starved. No sane consumer needs more than 24 steered
+                 * arenas; past that, stop feeding it — the ask falls through to
+                 * the normal path and fails honestly. */
+                static struct { unsigned tid; unsigned n; } steer_tid[16];
+                unsigned sti, sslot = 0xffff;
+                unsigned stid = NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
+                for (sti = 0; sti < 16; sti++)
+                {
+                    if (steer_tid[sti].tid == stid) { sslot = sti; break; }
+                    if (sslot == 0xffff && !steer_tid[sti].tid) sslot = sti;
+                }
+                if (sslot == 0xffff) sslot = stid & 15;
+                if (steer_tid[sslot].tid != stid) { steer_tid[sslot].tid = stid; steer_tid[sslot].n = 0; }
+                if (steer_tid[sslot].n >= 24)
+                {
+                    if (steer_tid[sslot].n == 24)
+                    {
+                        steer_tid[sslot].n++;
+                        dprintf(2, "[steer] tid=%04x CAPPED at 24 steered arenas — refusing further FEX-band spill rev=ml462\n", stid);
+                    }
+                }
+                else
+                {
+                steer_tid[sslot].n++;
                 /* ml169: `limit` is 0 here ("unconstrained"), so passing it as limit_high
                  * described the EMPTY range [ios_spill_cap, 0) and every steer failed with
                  * *ret = 0x0. The upper bound has to be a real address: use the host VA
@@ -12397,6 +12606,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                 }
                 if (!sst) { st = sst; ios_steered = 1; }
                 else { *ret = saved; *size_ptr = want; }   /* fall back to normal */
+                }   /* ml462 per-tid cap else-block */
             }
             if (!ios_steered)
                 st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
@@ -12631,6 +12841,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
         if (is_jumbo) ios_jumbo_census( jumbo_hint, jumbo_size, st ? NULL : *ret, (unsigned)st );
         if (!st && *size_ptr >= 0x10000000 && *size_ptr < 0x40000000 && (type & MEM_RESERVE))
             ios_bigres_note( *ret, *size_ptr );
+        if (!st) ios_span_census( *ret, *size_ptr, 0 );   /* ml435 (#73) */
 
         /* iOS-Mythic ml310 (task #54): SYSCALL-BOUNDARY census of arena-band allocations.
          *
@@ -12897,6 +13108,84 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         ios_jit_pool_size_global)
     {
         size_t alloc_size = (*size_ptr + 0x3FFF) & ~0x3FFFUL;
+        /* ml459 (#75): cap a single EC code buffer at 16MB. FEX asks for 32MB
+         * once its buffers get hot, but an old generation stays pinned by any
+         * thread still referencing it (see [pool-tail] PIN) — and a 32MB
+         * generation pinned while 10% full wastes 29MB of a pool the head is
+         * fighting us for (ml458: tail 214MB, head 682MB, died 1MB short).
+         * Refusing the oversized ask is SAFE and already-exercised: FEX's
+         * CodeBuffer ctor halves down the ladder on failure, and this run's own
+         * log shows "exec alloc degraded 0x2000000 -> 0x400000" followed by
+         * normal execution. Smaller generations waste less per pin; the
+         * [pool-tail] census says whether pinning or churn dominates. */
+        /* iOS-Mythic ml480 (#84): the flat 16MB refusal above made EVERY hot
+         * thread rotate its code buffer constantly. ml479's run: 79 tail
+         * events, 267k real compiles, and a compile-miss rate PINNED at ~19-20%
+         * for the whole run (a warmed-up workload should approach 0). Each
+         * rotation discards that thread's compiled code, so the SteamUI frame
+         * thread spends its frames recompiling — Steam itself reported "frame
+         * stalled for: 32818 ms", which is why its accept() loop only drains
+         * the listen backlog every 2-3 minutes and CEF's ~12s websocket
+         * handshake ALWAYS times out (the login window can never come up).
+         *
+         * Budget-aware cap instead of a flat one: grant 32MB while the tail is
+         * under the watermark (measured peak tail_resv was 112MB of the 256MB
+         * tail; head peaked 682MB of its 896MB budget), and fall back to the
+         * proven 16MB refusal once the tail is loaded. Hot threads that rotate
+         * early get big buffers; late/idle threads still get real ones, so the
+         * ml436 exhaustion (10 refusals, 123 degraded threads) can't return. */
+        {
+            enum { TAIL_BIG = 0x2000000, TAIL_SMALL = 0x1000000,
+                   TAIL_BIG_WATERMARK = 160u * 1024 * 1024 };
+            size_t cap = (ios_jit_tail_reserved < TAIL_BIG_WATERMARK) ? TAIL_BIG : TAIL_SMALL;
+
+            if (alloc_size > cap) {
+                static int cap_log_n;
+                if (cap_log_n < 16) {
+                    cap_log_n++;
+                    dprintf(2, "[jit-pool] tail CAP: refusing 0x%lx (cap 0x%lx, tail_resv=0x%lx) so FEX halves down rev=ml480\n",
+                            (unsigned long)alloc_size, (unsigned long)cap,
+                            (unsigned long)ios_jit_tail_reserved);
+                }
+                return STATUS_NO_MEMORY;
+            }
+            if (alloc_size > TAIL_SMALL) {
+                static int big_log_n;
+                if (big_log_n < 16) {
+                    big_log_n++;
+                    dprintf(2, "[jit-pool] tail BIG: granting 0x%lx (tail_resv=0x%lx) rev=ml480\n",
+                            (unsigned long)alloc_size, (unsigned long)ios_jit_tail_reserved);
+                }
+            }
+        }
+        /* ml438 (#74): serve from the free-list first — see ios_tail_carves. */
+        {
+            unsigned i, best = ~0u;
+            pthread_mutex_lock( &ios_tail_carve_lock );
+            for (i = 0; i < ios_tail_carve_n; i++)
+                if (ios_tail_carves[i].free && ios_tail_carves[i].size >= alloc_size &&
+                    (best == ~0u || ios_tail_carves[i].size < ios_tail_carves[best].size))
+                    best = i;
+            if (best != ~0u)
+            {
+                void *jit_rx = (char *)ios_jit_rx_base_global + ios_tail_carves[best].off;
+                void *jit_rw = (char *)ios_jit_rw_base_global + ios_tail_carves[best].off;
+                size_t got = ios_tail_carves[best].size;
+                ios_tail_carves[best].free = 0;
+                pthread_mutex_unlock( &ios_tail_carve_lock );
+                {
+                    volatile uint32_t *rw_words = (volatile uint32_t *)jit_rw;
+                    size_t nwords = got / sizeof(uint32_t);
+                    for (size_t i2 = 0; i2 < nwords; i2++) rw_words[i2] = 0xd503201fu;  /* NOP-prefill, same as fresh carves */
+                }
+                *ret = jit_rx;
+                *size_ptr = got;
+                dprintf(2, "[jit-pool] tail REUSE rx=%p size=0x%lx (asked 0x%lx) free_left=%u rev=ml438\n",
+                        jit_rx, (unsigned long)got, (unsigned long)alloc_size, ios_tail_carve_n);
+                return STATUS_SUCCESS;
+            }
+            pthread_mutex_unlock( &ios_tail_carve_lock );
+        }
         /* Reserve from the END of the JIT pool to avoid colliding with
          * mprotect_exec's PE-image copies which take from the start.
          * ios_jit_tail_reserved is the shared file-scope counter so the
@@ -12919,6 +13208,33 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             __sync_fetch_and_sub(&ios_jit_tail_reserved, alloc_size);
             ERR("NtAllocateVirtualMemoryEx iOS: JIT-pool tail exhausted for FEX EC_CODE %zu bytes\n",
                 (size_t)*size_ptr);
+            /* ml459 (#75): dump the carve table on the FIRST refusal — the
+             * question the ml458 log could not answer is whether the 214MB
+             * tail is LIVE (generations pinned by threads) or merely churned
+             * and never returned. free=0 rows are the pinned set; cross-check
+             * against [pool-tail] PIN lines to name their owners. */
+            {
+                static int census_done;
+                if (!census_done)
+                {
+                    unsigned ci; size_t live = 0, freed = 0;
+                    census_done = 1;
+                    pthread_mutex_lock( &ios_tail_carve_lock );
+                    for (ci = 0; ci < ios_tail_carve_n; ci++)
+                    {
+                        dprintf(2, "[pool-tail] carve[%u] off=0x%lx size=0x%lx %s rev=ml459\n",
+                                ci, (unsigned long)ios_tail_carves[ci].off,
+                                (unsigned long)ios_tail_carves[ci].size,
+                                ios_tail_carves[ci].free ? "FREE" : "LIVE");
+                        if (ios_tail_carves[ci].free) freed += ios_tail_carves[ci].size;
+                        else live += ios_tail_carves[ci].size;
+                    }
+                    pthread_mutex_unlock( &ios_tail_carve_lock );
+                    dprintf(2, "[pool-tail] TOTALS carves=%u live=0x%lx (%lu MB) free=0x%lx (%lu MB) rev=ml459\n",
+                            ios_tail_carve_n, (unsigned long)live, (unsigned long)(live >> 20),
+                            (unsigned long)freed, (unsigned long)(freed >> 20));
+                }
+            }
             dprintf(2, "[jit-pool] TAIL REFUSED (FEX EC_CODE): want=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx — REFUSING honestly rev=ml421 (was: fall to normal alloc = guest-band non-exec buffer = ClearCache wild write)\n",
                     (unsigned long)alloc_size, (unsigned long)reserve_offset,
                     (unsigned long)jit_pool_offset, (unsigned long)ios_jit_pool_size_global);
@@ -12961,6 +13277,16 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
              * arm64x_check_call, so EC marking is unneeded. */
             ERR("NtAllocateVirtualMemoryEx iOS: redirected EC_CODE %zu bytes to JIT pool tail rx=%p rw=%p NOP-prefilled\n",
                 alloc_size, jit_rx, jit_rw);
+            /* ml438 (#74): record the carve so a later free can recycle it. */
+            pthread_mutex_lock( &ios_tail_carve_lock );
+            if (ios_tail_carve_n < IOS_TAIL_CARVE_MAX)
+            {
+                ios_tail_carves[ios_tail_carve_n].off = pool_tail_off;
+                ios_tail_carves[ios_tail_carve_n].size = alloc_size;
+                ios_tail_carves[ios_tail_carve_n].free = 0;
+                ios_tail_carve_n++;
+            }
+            pthread_mutex_unlock( &ios_tail_carve_lock );
             dprintf(2, "[jit-pool] tail EC_CODE rx=%p size=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx\n",
                     jit_rx, (unsigned long)alloc_size,
                     (unsigned long)(reserve_offset + alloc_size),
@@ -13164,6 +13490,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         if (is_jumbo) ios_jumbo_census( jumbo_hint, jumbo_size, st ? NULL : *ret, (unsigned)st );
         if (!st && *size_ptr >= 0x10000000 && *size_ptr < 0x40000000 && (type & MEM_RESERVE))
             ios_bigres_note( *ret, *size_ptr );
+        if (!st) ios_span_census( *ret, *size_ptr, 0 );   /* ml435 (#73) */
 
         /* iOS-Mythic ml310 (task #54): SYSCALL-BOUNDARY census of arena-band allocations.
          *
@@ -13310,6 +13637,41 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
 
     /* ml433 (#72): keep the jumbo ledger honest — see ios_bigres_release. */
     if (type & MEM_RELEASE) ios_bigres_release( base );
+    /* ml435 (#73): band span lifecycle census — resolve MEM_RELEASE size=0 from the view. */
+    if ((type & MEM_RELEASE) && (uintptr_t)base >= 0x7c00000000ULL)
+    {
+        struct file_view *sfv = find_view( base, 0 );
+        ios_span_census( base, sfv ? sfv->size : size, 1 );
+    }
+    /* ml438 (#74): a MEM_RELEASE of a live tail EC-buffer carve has no wine
+     * view — before this rev it error'd (FEXCore ignored it) and the tail
+     * space leaked forever. Mark the carve free for reuse and succeed. */
+    if ((type & MEM_RELEASE) && ios_jit_rx_base_global && ios_jit_pool_size_global &&
+        (char *)base >= (char *)ios_jit_rx_base_global &&
+        (char *)base <  (char *)ios_jit_rx_base_global + ios_jit_pool_size_global)
+    {
+        unsigned i;
+        size_t off = (size_t)((char *)base - (char *)ios_jit_rx_base_global);
+        size_t carve_size = 0;
+        pthread_mutex_lock( &ios_tail_carve_lock );
+        for (i = 0; i < ios_tail_carve_n; i++)
+        {
+            if (ios_tail_carves[i].off != off || ios_tail_carves[i].free) continue;
+            ios_tail_carves[i].free = 1;
+            carve_size = ios_tail_carves[i].size;
+            break;
+        }
+        pthread_mutex_unlock( &ios_tail_carve_lock );
+        if (carve_size)
+        {
+            dprintf(2, "[jit-pool] tail FREE rx=%p size=0x%lx -> free-list rev=ml438\n",
+                    (void *)base, (unsigned long)carve_size);
+            *addr_ptr = base;
+            *size_ptr = carve_size;
+            return STATUS_SUCCESS;
+        }
+        /* pool address but not a live tail carve — fall through unchanged */
+    }
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 

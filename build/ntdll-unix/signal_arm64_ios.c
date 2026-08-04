@@ -7776,6 +7776,23 @@ static void abrt_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 }
 
 
+#ifdef WINE_IOS
+/* iOS-Mythic ml483 (#87): the thread-control handlers (SIGQUIT/USR1/USR2) all
+ * reach ntdll_get_thread_data() — get_syscall_frame() reads TEB+0x378 and
+ * is_inside_syscall() reads TEB+kernel_stack — on their FIRST statement, before
+ * any check. Threads created directly by CEF/FEX have no TEB (NtCurrentTeb()
+ * unix-side is the pthread key `ios_teb_tls_key`), so a signal landing on one
+ * dereferences NULL. ml482's run died exactly there: SEGV #1 pc=usr2_handler+0x20
+ * addr=0x378, insn `ldr x21,[x0,#0x378]` with x0=0 straight after the
+ * NtCurrentTeb() call. These signals mean "suspend / set your context / quit" —
+ * all no-ops for a thread wine does not manage — so bail out instead.
+ * Async-signal-safe: pthread_getspecific only, no allocation. */
+static int ios_thread_ctl_has_teb( void )
+{
+    return NtCurrentTeb() != NULL;
+}
+#endif
+
 /**********************************************************************
  *		quit_handler
  *
@@ -7786,6 +7803,13 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     ucontext_t *context = sigcontext;
 #ifdef WINE_IOS
     ios_track_signal( signal, context );
+    if (!ios_thread_ctl_has_teb())
+    {
+        static int noteb_quit;
+        if (noteb_quit < 4) { noteb_quit++;
+            dprintf( 2, "[sig-noteb] SIGQUIT on a TEB-less thread — ignoring rev=ml483\n" ); }
+        return;
+    }
 #endif
     if (!is_inside_syscall( SP_sig(context) )) user_mode_abort_thread( 0, get_syscall_frame() );
     abort_thread(0);
@@ -7803,6 +7827,13 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     CONTEXT context;
 #ifdef WINE_IOS
     ios_track_signal( signal, ucontext );
+    if (!ios_thread_ctl_has_teb())      /* ml483 (#87) — see ios_thread_ctl_has_teb */
+    {
+        static int noteb_usr1;
+        if (noteb_usr1 < 4) { noteb_usr1++;
+            dprintf( 2, "[sig-noteb] SIGUSR1 (suspend) on a TEB-less thread — ignoring rev=ml483\n" ); }
+        return;
+    }
 #endif
     if (is_inside_syscall( SP_sig(ucontext) ))
     {
@@ -7831,11 +7862,25 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
  */
 static void usr2_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
+#ifdef WINE_IOS
+    struct syscall_frame *frame;     /* ml483 (#87): fetched only after the TEB
+                                      * check below — reading TEB+0x378 here is
+                                      * what killed the ml482 run. */
+#else
     struct syscall_frame *frame = get_syscall_frame();
+#endif
     ucontext_t *context = sigcontext;
     DWORD i;
 #ifdef WINE_IOS
     ios_track_signal( signal, context );
+    if (!ios_thread_ctl_has_teb())
+    {
+        static int noteb_usr2;
+        if (noteb_usr2 < 4) { noteb_usr2++;
+            dprintf( 2, "[sig-noteb] SIGUSR2 (set-context) on a TEB-less thread — ignoring rev=ml483\n" ); }
+        return;
+    }
+    frame = get_syscall_frame();
 #endif
 
     if (!is_inside_syscall( SP_sig(context) ))

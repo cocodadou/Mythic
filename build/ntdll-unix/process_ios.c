@@ -1118,6 +1118,62 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                  * pool tail budget (the ml455 exhaustion shape).  The #81 fix
                  * stays regardless — it is a real bug worth ~786k kernel
                  * round-trips per run. */
+                /* ml509 EXPERIMENT — --num-raster-threads=1 (DIAGNOSTIC, one
+                 * variable, revert after verdict). The login surface shows
+                 * per-draw-op destination errors: a panel written at a
+                 * constant wrong offset (~-550,-97) with its true location
+                 * left black, the QR halo displaced independently of the QR
+                 * it surrounds, duplicated tile content. Chromium plainly is
+                 * NOT COMPUTING what it computes on real Windows, and the
+                 * prime suspect class is x86-TSO memory ordering under FEX:
+                 * cc's raster->compositor handoff assumes TSO, this port's
+                 * FEX history is a string of atomic/ordering bugs (#37 CASPAL,
+                 * #49 RX-alias atomics, #71 misaligned CS), and a stale read
+                 * of a layer origin produces exactly a coherent constant
+                 * offset. Single-threaded raster removes the cross-thread
+                 * handoff: corruption gone => concurrency/ordering class
+                 * confirmed, hunt moves to FEX TSO; corruption unchanged =>
+                 * deterministic miscomputation, --disable-partial-raster is
+                 * the next single-variable test. Steam passes no
+                 * --num-raster-threads of its own; append is collision-free.
+                 * Deploy proof = the [proc-gate] cmdline-tail echo below. */
+                /* ml510 EXPERIMENT — --num-raster-threads=1 REVERTED (ml509
+                 * verdict: deploy proven by the cmdline echo, corruption
+                 * UNCHANGED — worker-vs-worker raster races exonerated; note
+                 * the compositor thread still consumed raster output
+                 * cross-thread, so ordering was only narrowed, not cleared).
+                 * ml509 also closed the pixel-path question for good:
+                 * [put-image] caught 11 full 700x440 paints, every one
+                 * SRC{0,0,700,440}->DST{0,0,700,440} — GDI transport is sane
+                 * and the corruption is already INSIDE the bitmap Chromium
+                 * hands us. --disable-threaded-compositing is the strongest
+                 * remaining concurrency discriminator: SingleThreadProxy
+                 * collapses cc onto one thread. Corruption gone => TSO
+                 * ordering convicted, fix moves into FEX. Corruption stays =>
+                 * cross-thread ordering essentially out; deterministic
+                 * Skia/cc miscomputation under FEX becomes the hunt. */
+                /* ml511: --disable-threaded-compositing VOID and reverted —
+                 * it did not test ordering, it broke frame production
+                 * outright (ONE 700x440 paint all run vs 11, login window
+                 * fully black, 3 presents). SingleThreadProxy's composite
+                 * scheduling never fires in this environment; CEF windowed
+                 * mode effectively requires threaded compositing. No verdict.
+                 * ml511 EXPERIMENT = --disable-partial-raster: tiles are
+                 * always fully re-rastered instead of reusing previous
+                 * content + rastering the changed part. Targets the
+                 * stale/duplicated-tile signature directly. Corruption gone
+                 * => tile-reuse readback is where stale data enters (memory
+                 * ordering on the reuse path). Unchanged => reuse exonerated,
+                 * offline FEX TSO audit carries the hunt. */
+                /* ml512: --disable-partial-raster REVERTED (ml511 verdict:
+                 * deploy proven, corruption unchanged — tile reuse
+                 * exonerated). All cheap Chromium-switch discriminators are
+                 * now SPENT, each deploy-proven and inert: raster-threads=1
+                 * (ml509), threaded-compositing (ml510 VOID — breaks frame
+                 * production), partial-raster (ml511). The hunt moved into
+                 * FEX: ml512 flips VectorTSOEnabled + MemcpySetTSOEnabled
+                 * defaults in the fork (unordered vector/memcpy accesses are
+                 * the audited accuracy gap; x86 orders them, FEX did not). */
                 static const char sp[] = " --single-process --enable-logging=file --v=1 --log-severity=verbose"
                                          " --no-proxy-server --winhttp-proxy-resolver --js-flags=--jitless";
                 static const char dfs[] = "--disable-features=";
@@ -1172,7 +1228,8 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                     params->CommandLine.Length = o * sizeof(WCHAR);
                     params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
                     dprintf(2, "[proc-gate] steamwebhelper: injected --single-process + CEF verbosity"
-                               " + no-proxy + jitless RESTORED (rev=ml476); BRP+segmentation-disable %s (ml426)\n",
+                               " + no-proxy + jitless (switch experiments concluded ml509-ml511);"
+                               " BRP+segmentation-disable %s (ml426)\n",
                             bl ? "SPLICED into Steam's existing --disable-features list"
                                : "NOT applied (no --disable-features found -- refusing to add a "
                                  "second one, it would override Steam's list)");

@@ -988,6 +988,24 @@ struct ContentView: View {
                     // the 2s-throttled first/latest dump can never show —
                     // adjacent frames are the only way to measure what moves.
                     setenv("MYTHIC_SURF_SEQ", "10", 1)
+                    // ml515: SRCWATCH RE-ENABLED, now hooked in the MACH
+                    // exception handler (where guest faults are actually
+                    // delivered) instead of segv_handler. It consumes its own
+                    // faults BEFORE every other classification and marks them
+                    // handled via the canonical thread_set_state path, so a
+                    // protection fault can no longer reach the guest as an AV.
+                    // ml514 hooked the wrong path: 0 faults, black window 2/2.
+                    setenv("MYTHIC_SRCWATCH", "1", 1)
+                    // ml514 note (kept for the record): The ml514 watch
+                    // armed correctly (76 pages protected) but logged ZERO
+                    // faults and produced an all-black window on two runs: the
+                    // hook went in the BSD segv_handler, while guest faults in
+                    // this port are handled IN-MACH by the exception server, so
+                    // the protection fault was delivered to the guest as an AV
+                    // and killed Chromium's paint. A probe must never break the
+                    // path it measures. To revive it, hook the Mach exception
+                    // server (where ios_emulate_unaligned_guest_access already
+                    // runs), not segv_handler, and re-enable this env var.
                     // ml502 sentinel: DELIBERATELY NOT ENABLED. It stamps
                     // magenta into currently-black pixels, and on windows
                     // Chromium does not fully rewrite it SURVIVES and reaches

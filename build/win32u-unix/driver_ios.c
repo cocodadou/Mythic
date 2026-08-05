@@ -328,14 +328,56 @@ static int winios_desktop_mode(void)
     return mode;
 }
 
+/* ml505 probe. This hook was a pure stub: wine hands the driver the
+ * surface's VISIBLE REGION here — the rects left after sibling and child
+ * occlusion — and we discarded all of it.
+ *
+ * That matters now. The Steam login window has THREE full-size children
+ * (0x1011c/0x10122/0x10136), all WS_CLIPSIBLINGS, all at the parent's exact
+ * rect, and none of them presents: they all paint into the parent's ONE
+ * surface. If sibling clipping is not being applied, each paints the whole
+ * rect in turn and the surface flips between whatever each draws — which is
+ * exactly the two-state alternation measured in ml503/ml504.
+ *
+ * So log what wine actually computes. count==0 with no rects means "fully
+ * visible, no clipping"; a real region means clipping IS being computed and
+ * the fault lies elsewhere. Either answer narrows it. */
 static void winios_surface_set_clip( struct window_surface *surface, const RECT *rects, UINT count )
 {
+    static unsigned clip_calls;
+    unsigned n = ++clip_calls;
+    if (n <= 64 || (n % 256) == 0)
+    {
+        dprintf( 2, "[surf-clip] #%u surface=%p hwnd=%p count=%u%s rev=ml505\n",
+                 n, surface, surface ? surface->hwnd : NULL, count,
+                 count ? "" : "  (NO CLIP = fully visible)" );
+        for (UINT i = 0; i < count && i < 6; i++)
+            dprintf( 2, "[surf-clip]    rect[%u] = {%d,%d,%d,%d}\n", i,
+                     (int)rects[i].left, (int)rects[i].top,
+                     (int)rects[i].right, (int)rects[i].bottom );
+    }
 }
 
 static BOOL winios_surface_flush( struct window_surface *surface, const RECT *rect, const RECT *dirty,
                                   const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
                                   const BITMAPINFO *shape_info, const void *shape_bits )
 {
+    /* ml505: attribute the paint. All three children share this ONE surface,
+     * so if they paint on different threads the mach thread id separates
+     * them — and a single thread painting alternating content rules the
+     * sibling theory out just as firmly. */
+    {
+        static unsigned fl_n;
+        unsigned n = ++fl_n;
+        if (n <= 200 || (n % 200) == 0)
+            dprintf( 2, "[surf-flush] #%u surface=%p hwnd=%p mach_tid=%u "
+                     "rect={%d,%d,%d,%d} dirty={%d,%d,%d,%d} rev=ml505\n",
+                     n, surface, surface ? surface->hwnd : NULL,
+                     (unsigned)pthread_mach_thread_np( pthread_self() ),
+                     (int)rect->left, (int)rect->top, (int)rect->right, (int)rect->bottom,
+                     (int)dirty->left, (int)dirty->top, (int)dirty->right, (int)dirty->bottom );
+    }
+
     if (winios_surface_present && color_bits)
     {
         int surf_w = color_info->bmiHeader.biWidth;
@@ -386,11 +428,19 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
     if (previous) window_surface_release( previous );
 
     {
+        /* ml505: was capped at 16 GLOBALLY, so a window created late (the
+         * login popup) never appeared here at all. Which hwnds get their own
+         * surface — and which do not — is exactly the question: children that
+         * never get one are painting into their parent's. */
         static unsigned cnt;
-        if (cnt++ < 16)
-            dprintf( 2, "[winios] CreateWindowSurface hwnd=%p rect={%d,%d,%d,%d} layered=%d -> %p\n",
-                     hwnd, (int)surface_rect->left, (int)surface_rect->top,
-                     (int)surface_rect->right, (int)surface_rect->bottom, layered, *window_surface );
+        unsigned n = ++cnt;
+        if (n <= 96 || (n % 64) == 0)
+            dprintf( 2, "[surf-create] #%u hwnd=%p rect={%d,%d,%d,%d} layered=%d "
+                     "prev=%p -> %p%s rev=ml505\n",
+                     n, hwnd, (int)surface_rect->left, (int)surface_rect->top,
+                     (int)surface_rect->right, (int)surface_rect->bottom, layered,
+                     previous, *window_surface,
+                     previous ? "  (RECREATED — old content dropped)" : "  (first)" );
     }
     return TRUE;
 }
@@ -411,6 +461,25 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
         winios_window_frame( hwnd, v->left, v->top, v->right - v->left, v->bottom - v->top, visible,
                              c->left, c->top, c->right - c->left, c->bottom - c->top );
     }
+    /* ml505: z-order and geometry churn. If the three same-rect siblings are
+     * being reordered, the topmost changes and the surface shows whichever
+     * painted last — an alternation with no Chromium involvement at all.
+     * insert_after names the z-order move; surface tells us which windows
+     * share one. Skip empty rects (the 1x1 IME/message windows) so the
+     * signal is not buried. */
+    if (!IsRectEmpty( &new_rects->visible ))
+    {
+        static unsigned pos_n;
+        unsigned n = ++pos_n;
+        if (n <= 200 || (n % 128) == 0)
+        {
+            const RECT *v = &new_rects->visible;
+            dprintf( 2, "[win-pos] #%u hwnd=%p after=%p flags=%08x vis={%d,%d,%d,%d} "
+                     "surface=%p rev=ml505\n", n, hwnd, insert_after, (unsigned)swp_flags,
+                     (int)v->left, (int)v->top, (int)v->right, (int)v->bottom, surface );
+        }
+    }
+
     if (winios_pWindowPosChanged)
         winios_pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, new_rects, surface );
 }

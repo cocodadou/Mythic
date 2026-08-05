@@ -258,6 +258,13 @@ int ios_teb_tls_key_created = 0;
  * and PE→JIT pool execution redirects.
  * Unhandled exceptions fall through to the POSIX SIGSEGV handler.
  */
+/* ml515: forward decl — the Mach handler uses this ~4600 lines before the
+ * definition, and with -Wno-implicit-function-declaration the call would
+ * otherwise create an implicit NON-static declaration and collide with the
+ * static definition. (Same trap as the ml488 file.c probe.) */
+struct __darwin_arm_thread_state64;
+static int ios_srcwatch_handle( const arm_thread_state64_t *st, uintptr_t addr );
+
 static mach_port_t ios_exc_port = MACH_PORT_NULL;
 static int ios_exc_handler_started = 0;
 static uintptr_t ios_exc_usd = 0;
@@ -1044,8 +1051,17 @@ static void *ios_mach_exception_thread( void *arg )
         {
             uintptr_t fault_addr = (uintptr_t)req->code[1];
 
+            /* 0. ml515: source-bitmap watch. MUST run before every other
+             * classification — these are deliberate protection faults we
+             * armed ourselves, and any later stage would mistake them for a
+             * guest AV (which is exactly what killed ml514's runs). On a hit
+             * we log the writer, unprotect that one page, and resume the
+             * thread with its state untouched. */
+            int srcwatch_hit = ios_srcwatch_handle( &state, fault_addr );
+            if (srcwatch_hit) handled = 1;
+
             /* 1. Redirect user_shared_data accesses (0x7FFE0000) */
-            if (fault_addr >= 0x7FFE0000 && fault_addr < 0x7FFF0000 && ios_exc_usd)
+            if (!srcwatch_hit && fault_addr >= 0x7FFE0000 && fault_addr < 0x7FFF0000 && ios_exc_usd)
             {
                 for (int reg = 0; reg <= 28; reg++)
                 {
@@ -1059,6 +1075,7 @@ static void *ios_mach_exception_thread( void *arg )
             /* 2. Redirect execution faults at original PE mappings to JIT pool.
              * The PE-side loader calls DLL entry points at original mapping
              * addresses which aren't executable on iOS. Translate to JIT. */
+            if (!srcwatch_hit)
             {
                 extern void *ios_jit_rx_base_global;
                 extern size_t ios_jit_pool_size_global;
@@ -5596,6 +5613,188 @@ static int ios_make_wine_logging_safe( void )
  *
  * pthread_getspecific and the raw TSD read are async-signal-safe; nothing here
  * allocates, so this predicate can run before any logging. */
+/***********************************************************************
+ *		ios_srcwatch — catch the guest code that writes Chromium's bitmap
+ *
+ * iOS-Mythic ml514. The render corruption is a per-draw-op DESTINATION
+ * error with a CONSTANT offset (~-550,-97): a panel written where it does
+ * not belong with its true location left black, the QR halo displaced
+ * independently of the QR it surrounds. Everything WE own is exonerated —
+ * compositor, flush, GDI transport ([put-image] shows clean 1:1 700x440),
+ * and the VGUI dialog renders perfectly through the SAME surface. And
+ * every memory-ordering hypothesis is spent (scalar TSO correct, vector /
+ * memcpy TSO no effect, all three Chromium concurrency switches inert).
+ * What is left is Chromium computing wrong values under FEX — and since
+ * upstream FEX runs Chromium correctly on Linux, the defect is in an
+ * iOS-specific deviation of ours.
+ *
+ * To work backwards from pixels to code we need to know WHICH GUEST CODE
+ * writes which region. mprotect the source bitmap read-only, then let the
+ * faults name the writers: on each fault log the guest RIP (CpuStateFrame
+ * at x28+0x18, same as the [guest-state] dump) plus the byte offset it
+ * touched, unprotect that ONE page, and continue. The buffer is ~1.5MB =
+ * ~96 pages, so a whole frame costs ~96 faults, not one per pixel.
+ *
+ * The offset is the payload: pages carrying the DISPLACED region will be
+ * written by a different RIP (or the same RIP with different inputs) than
+ * the pages that land correctly, and that RIP resolves to libcef+RVA via
+ * the [jit-pool] image map — which is where FEX's translation of that
+ * block can be dumped and audited.
+ *
+ * Safety: one-shot and env-gated. Arms once, self-disarms after
+ * IOS_SRCWATCH_MAX faults or on any failure, and every page is unprotected
+ * the first time it faults, so a page can never fault twice and no writer
+ * can be starved. If arming fails the feature silently stays off — a
+ * diagnostic must never break the path it measures.
+ */
+/* ml516: the cap counts DISTINCT pages, not faults. In ml516 two writers
+ * burned 361 of 480 faults on THREE pages — the per-page unprotect did not
+ * stick there (aliased mapping is the likely reason), so coverage starved
+ * at ~113 pages instead of a full frame. A seen-bitmap makes each page
+ * count once, and a repeat storm now self-limits instead of eating the
+ * budget. */
+#define IOS_SRCWATCH_MAX   400      /* total attributions */
+#define IOS_SRCWATCH_PAGES 512      /* covers 8MB at 16K pages */
+#define IOS_SRCWATCH_REPEAT_LIMIT 48
+/* ml517: attributions to capture PER PAGE before leaving it open. The
+ * ml517 run exposed a design flaw: libcef+0x41258f0 is a SOLID-COLOUR FILL
+ * (movl %edx,(%r10) x4 / addq $0x10 / dest += stride) — Chromium clearing
+ * the frame. It runs FIRST and touches EVERY page, so a one-shot
+ * seen-bitmap attributed all 76 pages to the clear and left the content
+ * painters — the writers that would name the displaced band — structurally
+ * invisible. Re-protecting a page after each attribution makes its NEXT
+ * writer fault too, at a cost of only ~N faults per page. */
+#define IOS_SRCWATCH_PER_PAGE 3
+
+static struct {
+    volatile uintptr_t base;      /* page-aligned watch start, 0 = disarmed */
+    volatile uintptr_t end;
+    volatile int       pages;     /* distinct pages attributed */
+    volatile int       repeats;   /* faults on already-unprotected pages */
+    volatile int       armed;
+    unsigned char      seen[IOS_SRCWATCH_PAGES];
+} ios_srcwatch;
+
+/* Called from win32u's dibdrv_PutImage with Chromium's SOURCE bitmap. */
+void ios_srcwatch_arm( const void *bits, unsigned long len )
+{
+    static int enabled = -1;
+    uintptr_t b, e;
+
+    if (enabled < 0) enabled = (getenv("MYTHIC_SRCWATCH") != NULL);
+    if (!enabled || ios_srcwatch.armed || !bits || len < 0x10000) return;
+
+    b = (uintptr_t)bits & ~(uintptr_t)0x3FFF;             /* 16K pages on iOS */
+    e = ((uintptr_t)bits + len + 0x3FFF) & ~(uintptr_t)0x3FFF;
+
+    if (mprotect( (void *)b, e - b, PROT_READ ) != 0)
+    {
+        ERR("[srcwatch] arm FAILED bits=%p len=%lu errno=%d — staying off rev=ml514\n",
+            bits, len, errno);
+        return;
+    }
+    ios_srcwatch.base = b;
+    ios_srcwatch.end = e;
+    ios_srcwatch.pages = 0;
+    ios_srcwatch.repeats = 0;
+    memset( (void *)ios_srcwatch.seen, 0, sizeof(ios_srcwatch.seen) );
+    ios_srcwatch.armed = 1;
+    ERR("[srcwatch] ARMED base=%p end=%p (%lu bytes, %lu pages) rev=ml514\n",
+        (void *)b, (void *)e, (unsigned long)(e - b), (unsigned long)((e - b) >> 14));
+}
+
+/* Returns 1 if the fault belonged to the watch and was consumed.
+ *
+ * ml515: called from the MACH exception handler, not segv_handler. ml514
+ * hooked the BSD path and caught ZERO faults while turning the window
+ * black on 2/2 runs — guest faults in this port are delivered in-Mach, so
+ * the protection fault went to the guest as an AV and killed the paint.
+ * Takes the Mach thread state directly for the same reason. */
+static int ios_srcwatch_handle( const arm_thread_state64_t *st, uintptr_t addr )
+{
+    uintptr_t page;
+    uint64_t x28, rip = 0;
+    mach_vm_size_t got = 0;
+    int n;
+
+    if (!ios_srcwatch.armed) return 0;
+    if (addr < ios_srcwatch.base || addr >= ios_srcwatch.end) return 0;
+
+    page = addr & ~(uintptr_t)0x3FFF;
+    {
+        unsigned long pidx = (page - ios_srcwatch.base) >> 14;
+
+        /* Already attributed? Then the unprotect did not stick for this page.
+         * Log the first few, then kill the whole protection rather than let a
+         * repeat storm starve the pages we have not attributed yet. */
+        if (pidx < IOS_SRCWATCH_PAGES && ios_srcwatch.seen[pidx] >= IOS_SRCWATCH_PER_PAGE)
+        {
+            /* Budget for this page spent — leave it open so it stops costing
+             * faults, and count it only as a repeat for storm detection. */
+            int r = ++ios_srcwatch.repeats;
+            if (r >= IOS_SRCWATCH_REPEAT_LIMIT)
+            {
+                dprintf(STDERR_FILENO, "[srcwatch] repeat storm (%d) — unprotecting ALL and "
+                        "disarming; %d attributions rev=ml517\n", r, ios_srcwatch.pages);
+                mprotect( (void *)ios_srcwatch.base, ios_srcwatch.end - ios_srcwatch.base,
+                          PROT_READ | PROT_WRITE );
+                ios_srcwatch.armed = 0;
+            }
+            else
+                mprotect( (void *)page, 0x4000, PROT_READ | PROT_WRITE );
+            return 1;
+        }
+        if (pidx < IOS_SRCWATCH_PAGES) ios_srcwatch.seen[pidx]++;
+    }
+
+    /* Guest RIP lives at CpuStateFrame+0x18 off x28 — same source the
+     * [guest-state] dump uses. Read it defensively: a NULL or unreadable
+     * x28 means a HOST thread wrote this page, which is itself a finding. */
+    x28 = st->__x[28];
+    if (x28) mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(x28 + 0x18),
+                                     sizeof(rip), (mach_vm_address_t)&rip, &got );
+
+    n = ++ios_srcwatch.pages;
+    dprintf(STDERR_FILENO,
+        "[srcwatch] #%d off=+0x%lx page=+0x%lx guest_rip=%p host_pc=%p x28=%p%s rev=ml515\n",
+        n, (unsigned long)(addr - ios_srcwatch.base),
+        (unsigned long)(page - ios_srcwatch.base),
+        (void *)(uintptr_t)rip,
+        (void *)(uintptr_t)__darwin_arm_thread_state64_get_pc(*st),
+        (void *)(uintptr_t)x28,
+        (got == sizeof(rip)) ? "" : "  (rip UNREADABLE => host writer)");
+
+    /* ml517: unprotect just long enough for THIS write to land, then the
+     * page is re-armed on the next fault path below if its per-page budget
+     * remains — that is what exposes the content painters behind the clear. */
+    if (mprotect( (void *)page, 0x4000, PROT_READ | PROT_WRITE ) != 0)
+    {
+        dprintf(STDERR_FILENO, "[srcwatch] unprotect FAILED at %p errno=%d — DISARMING rev=ml515\n",
+            (void *)page, errno);
+        mprotect( (void *)ios_srcwatch.base, ios_srcwatch.end - ios_srcwatch.base,
+                  PROT_READ | PROT_WRITE );
+        ios_srcwatch.armed = 0;
+        return 1;
+    }
+
+    {
+        unsigned long pidx2 = (page - ios_srcwatch.base) >> 14;
+        if (ios_srcwatch.armed && pidx2 < IOS_SRCWATCH_PAGES
+            && ios_srcwatch.seen[pidx2] < IOS_SRCWATCH_PER_PAGE)
+            mprotect( (void *)page, 0x4000, PROT_READ );   /* catch the next writer */
+    }
+
+    if (n >= IOS_SRCWATCH_MAX)
+    {
+        dprintf(STDERR_FILENO, "[srcwatch] cap %d DISTINCT pages reached — disarming "
+                "(%d repeats) rev=ml516\n", IOS_SRCWATCH_MAX, ios_srcwatch.repeats);
+        mprotect( (void *)ios_srcwatch.base, ios_srcwatch.end - ios_srcwatch.base,
+                  PROT_READ | PROT_WRITE );
+        ios_srcwatch.armed = 0;
+    }
+    return 1;
+}
+
 static int ios_fault_is_foreign( const void *pc, const void *addr )
 {
     extern pthread_key_t ios_teb_tls_key;

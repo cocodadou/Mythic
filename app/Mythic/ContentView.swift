@@ -1406,6 +1406,44 @@ struct ContentView: View {
                 logStore.log("JIT pool allocation failed, continuing without it", level: .error)
             }
 
+            // Step 1b (ml524, #67): DETACH THE DEBUGGER NOW, while the VM map is small.
+            //
+            // Every ~54s whole-app stall coincides with StikDebug DEPARTING — clean
+            // exit(0) and jetsam-kill alike (12:07:43 exit(0) -> GAP 54.0s at 12:07:49;
+            // 12:13:58 cpulimit kill -> GAP 53.8s starting 64ms BEFORE the kill log).
+            // Departure is the trigger; the manner of death is irrelevant. StikDebug
+            // burns its 48s-CPU-per-60s budget in ~52s every single run, so an
+            // UNCONTROLLED departure mid-game is guaranteed. Detaching here pays the
+            // cost ONCE, at a moment we choose, before anything is on screen.
+            //
+            // Why it may also be CHEAPER here: on attach the kernel unnests the DYLD
+            // shared region in OUR map ("increases system memory footprint until the
+            // target exits"), so teardown plausibly scales with VM-map complexity —
+            // and right now the map is a fraction of what it becomes under Steam
+            // (91 threads / 2512MB). The [early-detach] timing below tests exactly that.
+            //
+            // Safe NOW and not before: ml522/ml523 made US the task-level Mach handler
+            // for bad-access + bad-instruction + breakpoint, so the fault backstop that
+            // used to require a live debugger (mythic-jit.js: "NEVER detach here ... every
+            // later escalated fault parks its thread forever", the ml345 wedge) is ours.
+            // And all executable memory already comes from the pool granted above —
+            // virtual_ios.c copies every PE .text into it rather than mprotecting,
+            // because iOS/TXM blocks mprotect(PROT_EXEC) outright.
+            //
+            // ORDERING MATTERS: our task-port claim installs at wine's first thread
+            // setup, which is AFTER this point, so this BRK still reaches StikDebug.
+            // Flip to false to A/B against the old attached-for-the-whole-run behaviour.
+            let earlyDetach = true
+            if earlyDetach, pool != nil {
+                let dt0 = CFAbsoluteTimeGetCurrent()
+                StikJITHelper.detachDebugger()
+                let dms = (CFAbsoluteTimeGetCurrent() - dt0) * 1000.0
+                logStore.log(String(format: "[early-detach] rev=ml524 took %.0f ms", dms),
+                             level: dms > 5000 ? .error : .success)
+            } else if !earlyDetach {
+                logStore.log("[early-detach] rev=ml524 DISABLED — debugger stays attached all run")
+            }
+
             // Step 2: Start wineserver
             self.startWineserver()
 

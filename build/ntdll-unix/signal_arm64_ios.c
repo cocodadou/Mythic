@@ -1032,6 +1032,47 @@ static void *ios_mach_exception_thread( void *arg )
             }
         }
 
+        /* ml523 (#67): count EXC_BREAKPOINT arrivals and name the BRK immediate.
+         *
+         * These used to go to StikDebug's task port. FEX's JIT emits
+         * `brk #0xCAFE` (0xd4395fc0) inline for Arm64JITCore::EmitSuspendInterruptCheck,
+         * so every thread-pause check is a trap the debugger had to service —
+         * and a debugger pegged at 97% in its own busy-wait takes ~54s to reply
+         * while the WHOLE TASK is stopped waiting. That is #67.
+         *
+         * We now own the mask and decline (handled stays 0 => KERN_FAILURE),
+         * which escalates to the host default => BSD SIGTRAP => trap_handler,
+         * where the 0xf00d and generic-trap cases already live. That is the
+         * same end state mythic-jit.js produced with forwardSignal(), minus the
+         * round-trip to a starved debugger.
+         *
+         * Bounded so a suspend-check storm cannot flood the log, but the FIRST
+         * ones always print — they are what must line up against a [freeze] GAP. */
+        if (req->exception == EXC_BREAKPOINT)
+        {
+            static volatile int bp_count;
+            int n = __sync_add_and_fetch( &bp_count, 1 );
+            if (n <= 12 || (n % 500) == 0)
+            {
+                arm_thread_state64_t bs;
+                mach_msg_type_number_t bc = ARM_THREAD_STATE64_COUNT;
+                uint64_t bpc = 0; uint32_t binsn = 0;
+                if (thread_get_state( thread, ARM_THREAD_STATE64,
+                                      (thread_state_t)&bs, &bc ) == KERN_SUCCESS)
+                {
+                    vm_size_t bsz = sizeof(binsn);
+                    bpc = arm_thread_state64_get_pc( bs );
+                    vm_read_overwrite( mach_task_self(), bpc, sizeof(binsn),
+                                       (vm_address_t)&binsn, &bsz );
+                }
+                dprintf(STDERR_FILENO,
+                        "[task-exc] BREAKPOINT #%d pc=0x%llx insn=0x%08x imm=0x%x %s rev=ml523\n",
+                        n, (unsigned long long)bpc, binsn, (binsn >> 5) & 0xffff,
+                        binsn == 0xd4395fc0 ? "FEX-SuspendCheck(0xCAFE)"
+                        : binsn == 0xd43e01a0 ? "StikDebug-protocol(0xf00d)" : "other");
+            }
+        }
+
         /* Look up per-thread TEB and trampoline for the faulting thread */
         uintptr_t thread_teb = 0;
         void *thread_trampoline = NULL;
@@ -3807,6 +3848,100 @@ skip_reclaim_band: ;
     return NULL;
 }
 
+/* ml522 (#67): claim the TASK-level exception port for the fault masks we
+ * already own per-thread.
+ *
+ * Until now the only registration we ever did was thread_set_exception_ports(),
+ * so the TASK-level port belonged entirely to StikDebug. That is fine while the
+ * debugger lives and fatal once it does not: when StikDebug goes away — jetsam
+ * for its 48s-CPU-per-60s limit, or the user swiping it out of the app switcher
+ * — the task port is left REGISTERED BUT UNSERVICED, and the first exception
+ * that escalates past a thread port blocks the WHOLE TASK until the kernel
+ * gives up on the dead name.
+ *
+ * That is #67. Measured at 53.9s / 53.7s / 54.2s across three unrelated runs
+ * (Steam and Thumper, jetsam-kill and swipe-kill alike), and in the swipe run
+ * bracketed by a single fault: [mach_exc] UNALIGNED-BACKPATCH #1 -> 53.9s of
+ * whole-task silence -> #2. The cost is paid exactly ONCE — backpatches
+ * #4..#200 afterwards were free — which is the signature of a one-shot dead
+ * port teardown rather than per-fault work.
+ *
+ * Owning the task port ourselves removes the dead-name dependency outright,
+ * and is also the precondition that makes a deliberate early detach safe.
+ *
+ * NOT claimed here: EXC_MASK_BREAKPOINT. BRK #0xf00d is the StikDebug JIT
+ * protocol and must keep reaching the debugger while it is alive; after detach
+ * a stray protocol BRK falls through to the BSD SIGTRAP path, which already
+ * recognises it. Same reasoning as the per-thread mask (see ml353 note below).
+ *
+ * A fault we DECLINE at thread level now escalates to this same port and is
+ * declined again, after which the kernel falls through to the host default and
+ * delivers a BSD signal so wine's sigaction handlers run — the same end state
+ * mythic-jit.js was hand-rolling with forwardSignal(). */
+static void ios_install_task_exception_port(void)
+{
+    static int done = 0;
+    exception_mask_t      old_masks[EXC_TYPES_COUNT];
+    mach_port_t           old_ports[EXC_TYPES_COUNT];
+    exception_behavior_t  old_behav[EXC_TYPES_COUNT];
+    thread_state_flavor_t old_flav[EXC_TYPES_COUNT];
+    mach_msg_type_number_t old_count = EXC_TYPES_COUNT, i;
+    const char *gate;
+    kern_return_t kr;
+
+    if (done || ios_exc_port == MACH_PORT_NULL) return;
+    done = 1;
+
+    /* Opt-out only: this strictly removes a dependency on a port we do not own,
+     * so it defaults ON. MYTHIC_TASK_EXC=0 restores the pre-ml522 behaviour for
+     * a same-build A/B against the ~54s stall. */
+    if ((gate = getenv( "MYTHIC_TASK_EXC" )) && gate[0] == '0')
+    {
+        ERR("[task-exc] DISABLED by MYTHIC_TASK_EXC=0 — task port stays with the debugger, "
+            "#67's ~54s dead-port stall is expected rev=ml522\n");
+        return;
+    }
+
+    /* ml523: EXC_MASK_BREAKPOINT is now claimed too. ml522 left it with the
+     * debugger to keep BRK #0xf00d working, but the device log proved that was
+     * the whole bug: both ~54s stalls in the 11:56/12:01 runs happened ~21s
+     * after a FRESH StikDebug attach, i.e. with the debugger fully ALIVE. The
+     * task is stopped waiting for a debugger that is starved by its own
+     * busy-wait. FEX emits `brk #0xCAFE` inline for every suspend-interrupt
+     * check, so trap traffic is continuous and unavoidable.
+     * jit26_prepare_region already ran (Swift side, pre-wine) so the pool is
+     * unaffected; jit26_detach()'s BRK now lands in trap_handler's 0xf00d case
+     * instead of the debugger, which is harmless. */
+    kr = task_swap_exception_ports( mach_task_self(),
+                                    EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION |
+                                    EXC_MASK_BREAKPOINT,
+                                    ios_exc_port,
+                                    (exception_behavior_t)(EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES),
+                                    ARM_THREAD_STATE64,
+                                    old_masks, &old_count, old_ports, old_behav, old_flav );
+    if (kr != KERN_SUCCESS)
+    {
+        ERR("[task-exc] task_swap_exception_ports FAILED kr=%d — the ~54s dead-port stall "
+            "is STILL POSSIBLE rev=ml522\n", kr);
+        return;
+    }
+
+    /* Log what we displaced. A non-null previous port is the debugger's, and is
+     * precisely the name that would have gone dead underneath us. Release the
+     * send rights the swap handed us — we never send to them. */
+    ERR("[task-exc] INSTALLED ours=0x%x mask=ba+bi+brk displaced=%u rev=ml523\n",
+        ios_exc_port, (unsigned)old_count);
+    for (i = 0; i < old_count; i++)
+    {
+        ERR("[task-exc]   prev[%u] mask=0x%x port=0x%x behavior=0x%x flavor=%d%s\n",
+            (unsigned)i, (unsigned)old_masks[i], (unsigned)old_ports[i],
+            (unsigned)old_behav[i], (int)old_flav[i],
+            old_ports[i] == MACH_PORT_NULL ? " (none — no debugger held it)" : " (debugger)");
+        if (old_ports[i] != MACH_PORT_NULL)
+            mach_port_deallocate( mach_task_self(), old_ports[i] );
+    }
+}
+
 /* Register a Wine "process" thread with the shared Mach exception handler.
  * First call creates the shared port and handler thread.
  * Every call registers the thread and sets its exception ports. */
@@ -3838,6 +3973,12 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
             pthread_create( &healer, NULL, ios_stale_va_scanner, NULL );
             pthread_detach( healer );
         }
+
+        /* ml522 (#67): take the task-level port for our masks now that the
+         * receive port and handler thread exist. Done here rather than at
+         * detach time so there is never a window in which a fault can reach
+         * a port whose owner has already died. */
+        ios_install_task_exception_port();
 
         ios_exc_handler_started = 1;
     }

@@ -8109,11 +8109,54 @@ static void *find_reserved_free_area_outside_preloader( void *start, void *end, 
  * Try to map some space inside a reserved area.
  * virtual_mutex must be held by caller.
  */
+static void *map_reserved_area_inner( void *limit_low, void *limit_high, size_t size, int top_down,
+                                      int unix_prot, size_t align_mask );
+
+/* iOS-Mythic ml520 timing wrapper — see map_reserved_area_inner. */
 static void *map_reserved_area( void *limit_low, void *limit_high, size_t size, int top_down,
                                 int unix_prot, size_t align_mask )
 {
+    struct timespec t0, t1;
+    void *r;
+    double ms;
+    static unsigned long slow_n;
+
+    clock_gettime( CLOCK_MONOTONIC, &t0 );
+    r = map_reserved_area_inner( limit_low, limit_high, size, top_down, unix_prot, align_mask );
+    clock_gettime( CLOCK_MONOTONIC, &t1 );
+    ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    if (ms > 250.0)
+    {
+        unsigned long n = ++slow_n;
+        if (n <= 64 || (n % 256) == 0)
+            ERR( "[va-slow] #%lu map_reserved_area took %.0f ms  size=0x%llx align=0x%llx "
+                 "top_down=%d -> %p rev=ml520\n", n, ms, (unsigned long long)size,
+                 (unsigned long long)align_mask, top_down, r );
+    }
+    return r;
+}
+
+static void *map_reserved_area_inner( void *limit_low, void *limit_high, size_t size, int top_down,
+                                      int unix_prot, size_t align_mask )
+{
     void *ptr = NULL;
     struct reserved_area *area;
+    /* iOS-Mythic ml520: time the aligned VA reservation.
+     *
+     * ml519's freeze detector measured a 53.9s whole-app stall (t+32.7 →
+     * t+86.6, 90 threads) and the FIRST thing to resume was a NEW FEX
+     * thread initialising ([TI-IC] decoder/passmanager). Each FEX thread
+     * reserves 2x128MB rpmalloc spans, and this function scans for aligned
+     * free space with virtual_mutex held, issuing kernel mapping calls as
+     * it goes — each of which takes the task's vm_map lock. A long scan
+     * therefore stalls EVERY thread that page-faults, which is
+     * indistinguishable from "the task was suspended" to any in-process
+     * observer (exactly what #67's accuser concluded).
+     *
+     * If one call here accounts for the tens of seconds, the freeze is
+     * OURS and this names it. If every call is fast, the VM path is
+     * exonerated and the debugger theory stands. Timing only — no
+     * behaviour change. */
 
     if (top_down)
     {

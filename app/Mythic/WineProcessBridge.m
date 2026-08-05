@@ -241,6 +241,9 @@ static void *wine_process_thread(void *arg) {
             NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
             NSString *logPath = [docs stringByAppendingPathComponent:@"mythic-log.txt"];
             wine_log_set_file(logPath.UTF8String);
+            /* ml519: start the freeze detector as soon as logging works, so
+             * every launch (Thumper as well as Steam) yields a measurement. */
+            { extern void winios_freeze_watch_start(void); winios_freeze_watch_start(); }
             LOG("Wine log file: %{public}s", logPath.UTF8String);
             /* Expose the app Documents dir to Wine code (e.g. for fex-jit-dump.bin) */
             setenv("MYTHIC_DOCS_DIR", docs.UTF8String, 1);

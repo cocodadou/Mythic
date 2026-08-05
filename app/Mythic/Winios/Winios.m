@@ -25,6 +25,22 @@
 #import <os/log.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <sys/time.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+/* csops syscall — CS_DEBUGGED is the flag StikDebug JIT rides on. Declared by
+ * hand for the same reason JITAllocator.c does: <sys/codesign.h> is not in the
+ * iOS SDK's public headers. */
+#ifndef CS_DEBUGGED
+#define CS_DEBUGGED 0x10000000
+#endif
+#ifndef CS_OPS_STATUS
+#define CS_OPS_STATUS 0
+#endif
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 
 /* Wine-side typedefs we need without pulling in the whole win32u
  * headers (which collide with Apple framework types in Obj-C).
@@ -47,6 +63,256 @@ struct window_surface;
 #define TRUE 1
 #define FALSE 0
 #endif
+
+
+/* ============================================================ *
+ * freeze detector (ml519)
+ * ============================================================
+ *
+ * Every run suffers a long whole-app freeze — measured at 96.0s starting
+ * t+8.5s in ml515 — that ends with StikDebug detaching (after which no NEW
+ * exec mappings are possible). It is NOT a deadlock in our code: #67's
+ * in-process "accuser" sampler could not run during it either, which means
+ * the whole Mach TASK is suspended from outside. It happens in Thumper as
+ * well as Steam, so it is a property of the port, not of any title.
+ *
+ * Nothing inside the process can observe a suspension WHILE it happens.
+ * But it can be measured RETROSPECTIVELY: sleep a short fixed interval and
+ * compare against a clock that keeps counting while we are stopped.
+ * mach_absolute_time() does exactly that. gettimeofday() is logged beside
+ * it so a device sleep (both jump) is distinguishable from a task
+ * suspension (both jump, but the app was foreground) and from a clock
+ * glitch (only one jumps).
+ *
+ * The HEARTBEAT is not decoration. The srcwatch probe wasted two runs
+ * because "armed but zero firings" was read as a clean result when it
+ * actually meant the probe was dead. Here, silence is ambiguous the same
+ * way — no GAP lines could mean no freeze, or a detector that never
+ * started. The heartbeat removes that ambiguity: if heartbeats are present
+ * and GAPs are absent, the run genuinely did not freeze.
+ *
+ * Context is logged with each gap so freezes can be correlated ACROSS
+ * TITLES: thread count and resident size are the two things that differ
+ * most between Thumper (few threads) and Steam (100+), which is exactly
+ * the comparison that would show whether cost scales with thread count.
+ */
+static double winios_now_mono(void) {
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    return (double)mach_absolute_time() * tb.numer / tb.denom / 1e9;
+}
+
+static unsigned winios_thread_count(void) {
+    thread_act_array_t list; mach_msg_type_number_t n = 0;
+    if (task_threads(mach_task_self(), &list, &n) != KERN_SUCCESS) return 0;
+    for (mach_msg_type_number_t i = 0; i < n; i++) mach_port_deallocate(mach_task_self(), list[i]);
+    vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(*list));
+    return (unsigned)n;
+}
+
+static unsigned winios_resident_mb(void) {
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t cnt = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &cnt) != KERN_SUCCESS)
+        return 0;
+    return (unsigned)(info.resident_size >> 20);
+}
+
+
+/* ml522: is the debugger relationship still alive?
+ *
+ * ⚠️ REPLACES ml521's mmap(MAP_JIT)+mprotect(PROT_EXEC) probe, which was a
+ * DUD: it reported NO-RESERVE on every single line of every run — including
+ * long before any freeze — because MAP_JIT needs the dynamic-codesigning
+ * entitlement a free provisioning profile cannot carry. Our RX pages never
+ * came from MAP_JIT in the first place; they come from StikDebug's BRK
+ * #0xf00d protocol. The probe's healthy state did not exist, so it measured
+ * nothing and could not have answered the question it was written for.
+ *
+ * CS_DEBUGGED is the flag StikDebug JIT actually rides on, it is what the
+ * app's own green checkmark reads, and BOTH of its states are observable in
+ * a normal run (set while attached, clear after detach) — so this probe can
+ * be trusted when it says "no change", which is the whole point. */
+static int winios_cs_debugged(void) {
+    uint32_t flags = 0;
+    if (csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags)) != 0) return -1;
+    return (flags & CS_DEBUGGED) ? 1 : 0;
+}
+static const char *winios_dbg_str(int v) {
+    return v == 1 ? "DEBUGGED" : (v == 0 ? "detached" : "csops-fail");
+}
+/* ml525: shared detector state, so a SUPERVISOR can tell "no freeze" from
+ * "detector is dead" — and so a GAP can be attributed to app SUSPENSION rather
+ * than a real stall.
+ *
+ * Both problems bit us on the same ml524 Steam run: the worker printed one
+ * heartbeat at t+30s and never again while footprint/waiters/alert-ring each
+ * logged 14 more cycles, so "gaps=0" covered only the first ~60s of a
+ * login-window run; and a 29.0s GAP in the Thumper run had NO in-log correlate
+ * at all and the user saw no freeze — the signature of backgrounding, which
+ * stops the task for real while nothing in-process is left to log it.
+ * gettimeofday beside the monotonic delta only separates device SLEEP; it
+ * cannot see suspension, because both clocks advance normally through it. */
+static volatile uint64_t wfz_iter;        /* bumped every worker loop */
+static volatile unsigned wfz_gen;         /* worker generation (respawn count) */
+static volatile double   wfz_t0;          /* one origin across respawns */
+static volatile double   wfz_bg_enter;    /* mono time of DidEnterBackground */
+static volatile double   wfz_bg_exit;     /* mono time of WillEnterForeground */
+static volatile int      wfz_bg_now;
+
+/* UIKit posts these on the main run loop BEFORE suspension and again on
+ * resume, so they bracket a suspension window. If the main thread is genuinely
+ * wedged they never arrive — which is exactly the discriminator: a gap with a
+ * background transition inside it is the OS stopping us, a gap without one is
+ * a real freeze. */
+static void winios_bg_observe(void) {
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:nil
+                usingBlock:^(NSNotification *n) { (void)n;
+                    wfz_bg_enter = winios_now_mono(); wfz_bg_now = 1; }];
+    [nc addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:nil
+                usingBlock:^(NSNotification *n) { (void)n;
+                    wfz_bg_exit = winios_now_mono(); wfz_bg_now = 0; }];
+}
+
+static void *winios_freeze_watch(void *arg) {
+    const double SLEEP_S = 0.25;
+    const double GAP_S   = 2.0;    /* well above any scheduling delay */
+    const double BEAT_S  = 30.0;
+    unsigned my_gen = (unsigned)(uintptr_t)arg;
+    double t0 = wfz_t0, last = winios_now_mono(), last_beat = last;
+    unsigned gaps = 0, beats = 0;
+    int dbg = winios_cs_debugged();     /* ml522: track debugger attachment */
+
+    dprintf(STDERR_FILENO, "[freeze] detector started gen=%u (sleep=%.2fs gap>%.1fs) rev=ml525\n",
+            my_gen, SLEEP_S, GAP_S);
+
+    for (;;) {
+        /* A respawned worker supersedes us; exit rather than double-report. */
+        if (my_gen != wfz_gen) {
+            dprintf(STDERR_FILENO, "[freeze] detector gen=%u superseded by gen=%u — exiting rev=ml525\n",
+                    my_gen, wfz_gen);
+            return NULL;
+        }
+        wfz_iter++;
+        struct timeval w0, w1;
+        gettimeofday(&w0, NULL);
+        usleep((useconds_t)(SLEEP_S * 1e6));
+        double now = winios_now_mono();
+        gettimeofday(&w1, NULL);
+
+        double slept = now - last;
+        double wall  = (double)(w1.tv_sec - w0.tv_sec) + (double)(w1.tv_usec - w0.tv_usec) / 1e6;
+
+        {   /* ml522: report transitions immediately, with t+ so they can be
+             * placed exactly against the gap boundaries. Which SIDE of a gap
+             * the detach lands on is the causal question: at the START the
+             * stall is a consequence of losing the debugger, at the END the
+             * stall IS the kernel tearing the relationship down. */
+            int now_dbg = winios_cs_debugged();
+            if (now_dbg != dbg) {
+                dprintf(STDERR_FILENO, "[dbg-state] CS_DEBUGGED %s -> %s at t+%.1fs rev=ml522\n",
+                        winios_dbg_str(dbg), winios_dbg_str(now_dbg), now - t0);
+                dbg = now_dbg;
+            }
+        }
+
+        if (slept > GAP_S) {
+            /* ml525: did the OS stop us? A DidEnterBackground stamped at or just
+             * before the gap start, with no matching return to foreground before
+             * the gap end, means the task was SUSPENDED — not frozen. Slack on
+             * the leading edge because the notification is posted a moment before
+             * the kernel actually stops us. */
+            int bg = (wfz_bg_enter > 0.0 &&
+                      wfz_bg_enter >= last - 3.0 && wfz_bg_enter <= now);
+            gaps++;
+            dprintf(STDERR_FILENO,
+                    "[freeze] GAP #%u  %.1fs (wall %.1fs) — started t+%.1fs, ended t+%.1fs;"
+                    " threads=%u resident=%uMB dbg=%s gen=%u cause=%s rev=ml525\n",
+                    gaps, slept, wall, last - t0, now - t0,
+                    winios_thread_count(), winios_resident_mb(),
+                    winios_dbg_str(dbg), my_gen,
+                    bg ? "BACKGROUNDED(not-a-freeze)" : "unexplained-FREEZE");
+            if (bg)
+                dprintf(STDERR_FILENO, "[freeze]   bg-enter t+%.1fs bg-exit t+%.1fs bg_now=%d\n",
+                        wfz_bg_enter - t0, wfz_bg_exit - t0, wfz_bg_now);
+        }
+
+        if (now - last_beat >= BEAT_S) {
+            beats++;
+            /* Liveness. Absence of GAPs only means "no freeze" if these are
+             * present — otherwise it means the detector is not running. iter is
+             * printed so a WEDGED worker (iter frozen) is distinguishable from a
+             * merely quiet one. */
+            dprintf(STDERR_FILENO, "[freeze] alive t+%.0fs beats=%u gaps=%u iter=%llu gen=%u "
+                            "threads=%u resident=%uMB dbg=%s rev=ml525\n",
+                    now - t0, beats, gaps, (unsigned long long)wfz_iter, my_gen,
+                    winios_thread_count(), winios_resident_mb(),
+                    winios_dbg_str(dbg));
+            last_beat = now;
+        }
+        last = now;
+    }
+    return NULL;
+}
+
+/* ml525: supervisor. The worker's for(;;) has no normal exit, so if it stops
+ * ticking it was killed or wedged from outside — plausibly as a host thread
+ * with no TEB hitting the ios_fault_is_foreign / ios_decline_foreign_fault
+ * path (#85). Silence there is indistinguishable from "no freezes", which is
+ * precisely the ml524 Steam ambiguity.
+ *
+ * Self-calibrating: a task-wide suspension stops the SUPERVISOR too, so it only
+ * judges the worker when its own sleep took roughly the expected wall time.
+ * That way a genuine 54s freeze can never be misread as a dead worker. */
+static void *winios_freeze_super(void *arg) {
+    const double CHECK_S = 10.0;
+    (void)arg;
+    for (;;) {
+        double s0 = winios_now_mono();
+        uint64_t a = wfz_iter;
+        usleep((useconds_t)(CHECK_S * 1e6));
+        double s1 = winios_now_mono();
+        uint64_t b = wfz_iter;
+
+        if (b != a) continue;                       /* worker healthy */
+        if (s1 - s0 > CHECK_S * 2.0) continue;      /* WE were stopped too — not the worker */
+
+        wfz_gen++;
+        dprintf(STDERR_FILENO, "[freeze] ⚠️ DETECTOR DEAD — iter stuck at %llu across %.1fs; "
+                        "respawning as gen=%u. Every 'gaps=0' before this line covers "
+                        "only up to here. rev=ml525\n",
+                (unsigned long long)b, s1 - s0, wfz_gen);
+        {
+            pthread_t th;
+            if (pthread_create(&th, NULL, winios_freeze_watch,
+                               (void *)(uintptr_t)wfz_gen) == 0)
+                pthread_detach(th);
+            else {
+                dprintf(STDERR_FILENO, "[freeze] respawn FAILED — detector is gone rev=ml525\n");
+            }
+        }
+    }
+    return NULL;
+}
+
+void winios_freeze_watch_start(void) {
+    static int started;
+    pthread_t th, sup;
+    if (started) return;
+    started = 1;
+    wfz_t0 = winios_now_mono();
+    winios_bg_observe();
+    wfz_gen = 1;
+    if (pthread_create(&th, NULL, winios_freeze_watch, (void *)(uintptr_t)1) == 0)
+        pthread_detach(th);
+    else
+        dprintf(STDERR_FILENO, "[freeze] detector FAILED to start rev=ml525\n");
+    if (pthread_create(&sup, NULL, winios_freeze_super, NULL) == 0)
+        pthread_detach(sup);
+    else
+        dprintf(STDERR_FILENO, "[freeze] supervisor FAILED to start rev=ml525\n");
+}
 
 static os_log_t winios_log(void) {
     static os_log_t log;

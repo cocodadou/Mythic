@@ -22,3 +22,6 @@ uint64_t mythic_get_present_count(void);
 // Read per present; safe to flip live mid-game.
 void mythic_set_vsync_locked(int locked);
 int mythic_get_vsync_locked(void);
+
+/* ml526: startup phase timeline (Winios.m) */
+void winios_phase(const char *name);

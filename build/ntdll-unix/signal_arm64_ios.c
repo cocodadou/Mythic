@@ -408,6 +408,63 @@ struct ios_thread_entry {
 static struct ios_thread_entry ios_thread_registry[IOS_MAX_WINE_THREADS];
 static volatile int32_t ios_thread_count = 0;
 
+/* Exact-match registry probe — NO slot-0 fallback.
+ *
+ * ml540: ios_lookup_thread() returns 1 even when it fell back to slot 0, so no
+ * caller can use it to answer "is this a guest thread at all?". Fault handling
+ * needs exactly that: since #67 we hold the TASK-level exception port, so this
+ * handler now sees faults from EVERY thread in the process — including the
+ * SwiftUI UI thread, which has no TEB and must never be handed guest exception
+ * delivery. */
+/* ml559: read-only accessors so other TUs can walk the registry without the
+ * array itself leaving this file (ntdll-unix globals crossing TUs have broken
+ * pseudo-processes before — see the S1 CreateProcess rule). Lock-free, same
+ * snapshot discipline as ios_thread_is_registered. */
+int ios_thread_registry_count(void)
+{
+    int count = __sync_fetch_and_add(&ios_thread_count, 0);
+    return count > IOS_MAX_WINE_THREADS ? IOS_MAX_WINE_THREADS : count;
+}
+
+uintptr_t ios_thread_registry_teb(int i)
+{
+    if (i < 0 || i >= IOS_MAX_WINE_THREADS) return 0;
+    return ios_thread_registry[i].teb;
+}
+
+thread_t ios_thread_registry_mach(int i)
+{
+    if (i < 0 || i >= IOS_MAX_WINE_THREADS) return 0;
+    return ios_thread_registry[i].mach_thread;
+}
+
+static int ios_thread_is_registered(thread_t mach_thread)
+{
+    int count = __sync_fetch_and_add(&ios_thread_count, 0);
+    if (count > IOS_MAX_WINE_THREADS) count = IOS_MAX_WINE_THREADS;
+    for (int i = 0; i < count; i++)
+        if (ios_thread_registry[i].mach_thread == mach_thread) return 1;
+    return 0;
+}
+
+/* ml558: is this pointer a TEB we actually installed?
+ *
+ * TSD slot 275 is NOT ours (see pthread_exit_wrapper) -- on a native thread it
+ * holds whatever framework legitimately owns that key. Signal handlers that read
+ * slot 275 must validate the value before dereferencing it, and must do so
+ * WITHOUT locks or Mach traps. Scanning the registry for a matching TEB is both:
+ * lock-free (same pattern as ios_thread_is_registered) and it answers the exact
+ * question -- not "is this thread ours" but "is this VALUE one of ours". */
+static int ios_teb_is_registered(uintptr_t teb)
+{
+    int count = __sync_fetch_and_add(&ios_thread_count, 0);
+    if (!teb) return 0;
+    if (count > IOS_MAX_WINE_THREADS) count = IOS_MAX_WINE_THREADS;
+    for (int i = 0; i < count; i++)
+        if (ios_thread_registry[i].teb == teb) return 1;
+    return 0;
+}
+
 static int ios_lookup_thread(thread_t mach_thread, uintptr_t *teb_out, void **tramp_out)
 {
     int count = __sync_fetch_and_add(&ios_thread_count, 0);
@@ -1070,6 +1127,320 @@ static void *ios_mach_exception_thread( void *arg )
                         n, (unsigned long long)bpc, binsn, (binsn >> 5) & 0xffff,
                         binsn == 0xd4395fc0 ? "FEX-SuspendCheck(0xCAFE)"
                         : binsn == 0xd43e01a0 ? "StikDebug-protocol(0xf00d)" : "other");
+
+                /* ml559: NAME the trapping image.
+                 *
+                 * ml558 died on `BRK #1` (== __builtin_trap) at 0x191d52284 on a
+                 * thread that is not ours — i.e. inside a SYSTEM library — and the
+                 * whole task went with it, so no in-process probe could report why.
+                 * A bare hex pc left me guessing which library it was, and guessing
+                 * is exactly what has been wrong repeatedly here. dladdr costs
+                 * nothing and turns the address into an answer. LR names the caller,
+                 * which is the part that actually identifies the failing operation. */
+                if (bpc && ((binsn & 0xffe0001fu) == 0xd4200000u))
+                {
+                    Dl_info di_pc, di_lr;
+                    uint64_t blr = arm_thread_state64_get_lr( bs );
+                    int okp = dladdr( (void *)(uintptr_t)bpc, &di_pc );
+                    int okl = dladdr( (void *)(uintptr_t)blr, &di_lr );
+                    dprintf(STDERR_FILENO,
+                            "[task-exc]   TRAP-SYM pc=%s`%s+0x%llx  lr=0x%llx %s`%s+0x%llx rev=ml559\n",
+                            okp && di_pc.dli_fname ? di_pc.dli_fname : "?",
+                            okp && di_pc.dli_sname ? di_pc.dli_sname : "?",
+                            okp && di_pc.dli_saddr ? (unsigned long long)(bpc - (uintptr_t)di_pc.dli_saddr) : 0ull,
+                            (unsigned long long)blr,
+                            okl && di_lr.dli_fname ? di_lr.dli_fname : "?",
+                            okl && di_lr.dli_sname ? di_lr.dli_sname : "?",
+                            okl && di_lr.dli_saddr ? (unsigned long long)(blr - (uintptr_t)di_lr.dli_saddr) : 0ull);
+
+                    /* ml565: is this malloc trap OUT OF MEMORY, or real corruption?
+                     *
+                     * The trap is libsystem_malloc called from wineserver's
+                     * alloc_object. Across 11 runs it separates PERFECTLY by memory
+                     * footprint — traps at 3197-3339 MB, never at 3015-3114 MB — while
+                     * run LENGTH does not predict it (ml560b ran 95 cycles, 5x longer
+                     * than most, at the lowest footprint of all, and never trapped).
+                     * So the mechanism is likelier pressure than accumulated damage,
+                     * but that is unproven and these are the numbers that settle it.
+                     *
+                     * DO NOT call malloc here. The trapping thread is INSIDE malloc
+                     * holding its lock; allocating from this handler thread could block
+                     * on that lock and wedge the whole app — a probe that destroys what
+                     * it measures. mach_vm_allocate goes straight to the VM and touches
+                     * no malloc state. task_vm_info.limit_bytes_remaining is the kernel's
+                     * own answer for how much headroom the process has left. */
+                    if (okp && di_pc.dli_fname && strstr( di_pc.dli_fname, "libsystem_malloc" ))
+                    {
+                        task_vm_info_data_t vmi;
+                        mach_msg_type_number_t vcnt = TASK_VM_INFO_COUNT;
+                        mach_vm_address_t probe = 0;
+                        kern_return_t ak = mach_vm_allocate( mach_task_self(), &probe,
+                                                             1024 * 1024, VM_FLAGS_ANYWHERE );
+                        if (ak == KERN_SUCCESS) mach_vm_deallocate( mach_task_self(), probe, 1024 * 1024 );
+                        if (task_info( mach_task_self(), TASK_VM_INFO,
+                                       (task_info_t)&vmi, &vcnt ) == KERN_SUCCESS)
+                            dprintf(STDERR_FILENO,
+                                    "[malloc-trap] phys_footprint=%llu MB limit_remaining=%lld MB "
+                                    "compressed=%llu MB 1MB-vm_allocate=%s -- %s rev=ml573\n",
+                                    (unsigned long long)(vmi.phys_footprint >> 20),
+                                    (long long)((long long)vmi.limit_bytes_remaining >> 20),
+                                    (unsigned long long)(vmi.compressed >> 20),
+                                    ak == KERN_SUCCESS ? "OK" : "FAILED",
+                                    ak != KERN_SUCCESS
+                                      ? "<== allocation FAILED here too — consistent with exhaustion"
+                                      : "<== allocation SUCCEEDS here, so this trap is not simple "
+                                        "exhaustion (the libmalloc branch below is the actual proof)");
+                        else
+                            dprintf(STDERR_FILENO,
+                                    "[malloc-trap] task_info(TASK_VM_INFO) FAILED; "
+                                    "1MB-vm_allocate=%s rev=ml565\n",
+                                    ak == KERN_SUCCESS ? "OK" : "FAILED");
+
+                        /* ml567: WHAT did malloc choke on, and what is written there?
+                         *
+                         * ml565/566 proved this is real corruption, not OOM. Across 13
+                         * runs it separates perfectly by FOOTPRINT (traps 3197-3339 MB,
+                         * never 3015-3114 MB) while duration does not predict it at all
+                         * (23 cycles traps at 3268 MB; 24 cycles is clean at 3114 MB).
+                         * Not-exhaustion + footprint-predicts fits a WILD WRITE TO A
+                         * ROUGHLY FIXED ADDRESS: harmless while the malloc zone is small
+                         * enough not to cover it, fatal once the zone grows past it.
+                         *
+                         * libsystem_malloc traps with the offending block in hand, so its
+                         * registers carry that pointer. Dump them, and hexdump around any
+                         * that look like heap pointers. This project already has a known
+                         * corrupter that writes ASCII where it does not own (#78/#88/#89;
+                         * ml491 identified the payload as our own SwiftUI logStore text).
+                         * If that text shows up here, the two are the same bug — and if
+                         * the bytes are poison or guest data instead, that says so too. */
+                        {
+                            int r;
+                            char line[160];
+                            int n = snprintf( line, sizeof(line), "[malloc-trap] regs:" );
+                            for (r = 0; r <= 8 && n < (int)sizeof(line) - 24; r++)
+                                n += snprintf( line + n, sizeof(line) - n, " x%d=0x%llx",
+                                               r, (unsigned long long)bs.__x[r] );
+                            dprintf(STDERR_FILENO, "%s rev=ml567\n", line);
+
+                            /* ml573 (Sol's plan): the allocator's own view of the damage.
+                             *
+                             * At this trap libmalloc has the offending block in hand. The
+                             * literal it is about to print is "BUG IN CLIENT OF LIBMALLOC:
+                             * memory corruption of free block" — that branch, not our
+                             * vm_allocate probe, is what proves corruption. Decode what it
+                             * saw:
+                             *   x19 = object_ops*      (alloc_object's argument)
+                             *   x20 = requested size   (mem_alloc's argument)
+                             *   x0  = zone, x1 = xzone, x4 = bad block
+                             * A freed block's first word is the freelist pointer XORed with
+                             * a per-zone cookie, so `cookie ^ block` is what SHOULD be there.
+                             *   actual0 != expected0            -> first word overwritten
+                             *   actual0 == expected0, integrity -> second/PAC word overwritten
+                             * ml572 showed two bad blocks sharing the high half 59 4f d0 5e
+                             * with differing low bytes — exactly a cookie signature — so this
+                             * should decode cleanly. */
+                            {
+                                uint64_t zone = bs.__x[0], xzone = bs.__x[1], bad = bs.__x[4];
+                                uint64_t cookie = 0, class_size = 0, a0 = 0, a1 = 0;
+                                unsigned char integrity = 0;
+                                mach_vm_size_t g = 0;
+                                int have_cookie, have_a0;
+
+                                dprintf(STDERR_FILENO,
+                                        "[malloc-trap] x19(ops)=0x%llx x20(req_size)=%llu "
+                                        "fp=0x%llx sp=0x%llx lr=0x%llx rev=ml573\n",
+                                        (unsigned long long)bs.__x[19], (unsigned long long)bs.__x[20],
+                                        (unsigned long long)arm_thread_state64_get_fp( bs ),
+                                        (unsigned long long)arm_thread_state64_get_sp( bs ),
+                                        (unsigned long long)arm_thread_state64_get_lr( bs ));
+
+#define IOS_RD64(addr, out) (mach_vm_read_overwrite( mach_task_self(), \
+            (mach_vm_address_t)(addr), 8, (mach_vm_address_t)(uintptr_t)&(out), &g ) \
+            == KERN_SUCCESS && g == 8)
+                                have_cookie = IOS_RD64( zone + 0x150, cookie );
+                                (void)IOS_RD64( xzone + 0x30, class_size );
+                                have_a0 = IOS_RD64( bad, a0 );
+                                (void)IOS_RD64( bad + 8, a1 );
+                                (void)mach_vm_read_overwrite( mach_task_self(),
+                                        (mach_vm_address_t)(zone + 0x10b), 1,
+                                        (mach_vm_address_t)(uintptr_t)&integrity, &g );
+                                if (have_cookie && have_a0)
+                                {
+                                    uint64_t expected0 = cookie ^ bad;
+                                    dprintf(STDERR_FILENO,
+                                            "[malloc-trap] zone=0x%llx xzone=0x%llx bad_block=0x%llx "
+                                            "class_size=%llu integrity=0x%02x\n"
+                                            "[malloc-trap]   cookie=0x%llx expected0=0x%llx "
+                                            "actual0=0x%llx actual1=0x%llx -- %s rev=ml573\n",
+                                            (unsigned long long)zone, (unsigned long long)xzone,
+                                            (unsigned long long)bad, (unsigned long long)class_size,
+                                            integrity, (unsigned long long)cookie,
+                                            (unsigned long long)expected0, (unsigned long long)a0,
+                                            (unsigned long long)a1,
+                                            a0 != expected0
+                                              ? "<== FIRST freelist word overwritten after free"
+                                              : (integrity
+                                                   ? "<== first word intact; SECOND/PAC word is the "
+                                                     "damaged one"
+                                                   : "<== first word matches the cookie — the damage "
+                                                     "is elsewhere in the block"));
+                                }
+                                else
+                                    dprintf(STDERR_FILENO,
+                                            "[malloc-trap] could not read zone/block fields "
+                                            "(zone=0x%llx bad=0x%llx) rev=ml573\n",
+                                            (unsigned long long)zone, (unsigned long long)bad);
+
+                                /* Whole freed block, raw. Stale pointer-like fields can name
+                                 * its previous owner; a body of 0xaa would implicate a Wine
+                                 * DEBUG_OBJECTS object. 32 bytes was too little. */
+                                if (bad && class_size && class_size <= 0x400)
+                                {
+                                    unsigned char blk[0x400];
+                                    mach_vm_size_t bg = 0;
+                                    if (mach_vm_read_overwrite( mach_task_self(),
+                                            (mach_vm_address_t)bad, class_size,
+                                            (mach_vm_address_t)(uintptr_t)blk, &bg ) == KERN_SUCCESS)
+                                    {
+                                        unsigned o;
+                                        for (o = 0; o < bg; o += 32)
+                                        {
+                                            char hx[3 * 32 + 1]; unsigned k, lim = (bg - o) < 32 ? (unsigned)(bg - o) : 32;
+                                            for (k = 0; k < lim; k++) snprintf( hx + k * 3, 4, "%02x ", blk[o + k] );
+                                            hx[lim * 3] = 0;
+                                            dprintf(STDERR_FILENO, "[malloc-trap]   blk+%03x: %s rev=ml573\n", o, hx);
+                                        }
+                                    }
+                                }
+
+                                /* Frame-pointer chain, raw PCs only. Deliberately NOT
+                                 * backtrace()/malloc_size()/Swift logging — all of those are
+                                 * allocator-backed and libmalloc is mid-trap. */
+                                {
+                                    uint64_t fp = arm_thread_state64_get_fp( bs );
+                                    char fr[320]; int fn = snprintf( fr, sizeof(fr), "[malloc-trap] fpchain:" );
+                                    int d;
+                                    for (d = 0; d < 12 && fp && !(fp & 15) && fn < (int)sizeof(fr) - 20; d++)
+                                    {
+                                        uint64_t nextfp = 0, pc = 0;
+                                        if (!IOS_RD64( fp, nextfp ) || !IOS_RD64( fp + 8, pc )) break;
+                                        fn += snprintf( fr + fn, sizeof(fr) - fn, " 0x%llx", (unsigned long long)pc );
+                                        if (nextfp <= fp) break;
+                                        fp = nextfp;
+                                    }
+                                    dprintf(STDERR_FILENO, "%s rev=ml573\n", fr);
+                                }
+#undef IOS_RD64
+                            }
+
+                            for (r = 0; r <= 8; r++)
+                            {
+                                uint64_t v = bs.__x[r];
+                                unsigned char buf[32];
+                                mach_vm_size_t got = 0;
+                                int i, printable = 0;
+                                char hex[3 * sizeof(buf) + 1], asc[sizeof(buf) + 1];
+                                /* only plausible host-heap pointers, 16-byte aligned */
+                                if (v < 0x100000000ull || v >= 0x740000000000ull || (v & 15)) continue;
+                                if (mach_vm_read_overwrite( mach_task_self(),
+                                        (mach_vm_address_t)(v & ~15ull), sizeof(buf),
+                                        (mach_vm_address_t)(uintptr_t)buf, &got ) != KERN_SUCCESS
+                                    || got != sizeof(buf))
+                                    continue;
+                                for (i = 0; i < (int)sizeof(buf); i++)
+                                {
+                                    snprintf( hex + i * 3, 4, "%02x ", buf[i] );
+                                    asc[i] = (buf[i] >= 0x20 && buf[i] < 0x7f) ? buf[i] : '.';
+                                    if (asc[i] != '.') printable++;
+                                }
+                                asc[sizeof(buf)] = 0;
+                                dprintf(STDERR_FILENO,
+                                        "[malloc-trap]   x%d=0x%llx: %s |%s|%s rev=ml567\n",
+                                        r, (unsigned long long)v, hex, asc,
+                                        printable >= 24 ? "  <== ASCII TEXT — matches the "
+                                                          "#78/#88/#89 wild-write payload" : "");
+                            }
+                        }
+                    }
+                }
+
+                /* ml554: an "other" BRK is a GUEST int3 — and on this port that has
+                 * turned out to be PartitionAlloc's BackupRefPtr `refcount` CHECK
+                 * deliberately aborting (chrome_elf+0xD7D6E; the helper at +0xD7D30
+                 * sets Crashpad annotation "refcount" then crashes at line 452).
+                 *
+                 * The CHECK names the VICTIM, never the writer -- but it is handed the
+                 * OFFENDING VALUE in edx, and the helper's first act is
+                 * `movl %edx,%r8d`, so r8 still holds it at the int3. That value is the
+                 * fingerprint: ASCII means the #78/#88 text-corrupter family, a poison
+                 * pattern (0xEF/0xAB) means freed-memory reuse, a pointer-looking value
+                 * means something else entirely.
+                 *
+                 * Dump the guest register file plus an ASCII decode of r8 and of the
+                 * whole set. Cheap: only for non-FEX, non-StikDebug breakpoints, which
+                 * are rare by construction. */
+                if (binsn != 0xd4395fc0 && binsn != 0xd43e01a0)
+                {
+                    uint64_t x28v = bs.__x[28], grip = 0, gregs[16];
+                    mach_vm_size_t got = 0;
+                    int gi, ok = 0;
+                    if (x28v &&
+                        mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(x28v + 0x18),
+                                                sizeof(grip), (mach_vm_address_t)&grip, &got ) == KERN_SUCCESS
+                        && got == sizeof(grip) &&
+                        /* ml578: gregs live at x28+0x20, NOT x28+0. Our own ml272
+                         * note in this file already had it right ("rip=0x18
+                         * gregs=0x20 gregs[RSP]=0x40") — reading from +0 grabbed
+                         * the frame header and only part of the array, so every
+                         * [int3-guest] register we have read was garbage. */
+                        mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(x28v + 0x20),
+                                                sizeof(gregs), (mach_vm_address_t)gregs, &got ) == KERN_SUCCESS
+                        && got == sizeof(gregs))
+                        ok = 1;
+
+                    dprintf(STDERR_FILENO,
+                            "[int3-guest] guest_rip=0x%llx x28=0x%llx read=%d rev=ml554\n",
+                            (unsigned long long)grip, (unsigned long long)x28v, ok);
+                    if (ok)
+                    {
+                        /* ml578: the GUEST register file — 16 entries, FEX order.
+                         * Printed separately and explicitly labelled; the host ARM
+                         * dump below is a different thing and was previously being
+                         * mislabelled as guest state. Naively swapping bs.__x for
+                         * gregs would also have run off the end: 31 vs 16. */
+                        static const char *gn[16] = { "RAX","RCX","RDX","RBX","RSP","RBP","RSI","RDI",
+                                                      "R8","R9","R10","R11","R12","R13","R14","R15" };
+                        for (gi = 0; gi < 16; gi += 4)
+                            dprintf(STDERR_FILENO,
+                                    "[int3-guest]   GUEST %s=0x%016llx %s=0x%016llx "
+                                    "%s=0x%016llx %s=0x%016llx rev=ml578\n",
+                                    gn[gi],     (unsigned long long)gregs[gi],
+                                    gn[gi + 1], (unsigned long long)gregs[gi + 1],
+                                    gn[gi + 2], (unsigned long long)gregs[gi + 2],
+                                    gn[gi + 3], (unsigned long long)gregs[gi + 3]);
+                        /* Host x0..x30 too: FEX's SRA mapping is not assumed anywhere
+                         * here, so print both and identify the value offline. */
+                        for (gi = 0; gi < 31; gi += 4)
+                            dprintf(STDERR_FILENO,
+                                    "[int3-guest]   HOST x%-2d=0x%016llx x%-2d=0x%016llx "
+                                    "x%-2d=0x%016llx x%-2d=0x%016llx\n",
+                                    gi, (unsigned long long)bs.__x[gi],
+                                    gi + 1, (unsigned long long)(gi + 1 < 31 ? bs.__x[gi + 1] : 0),
+                                    gi + 2, (unsigned long long)(gi + 2 < 31 ? bs.__x[gi + 2] : 0),
+                                    gi + 3, (unsigned long long)(gi + 3 < 31 ? bs.__x[gi + 3] : 0));
+                        for (gi = 0; gi < 31; gi++)
+                        {
+                            unsigned long long v = bs.__x[gi];
+                            char a[9]; int k;
+                            for (k = 0; k < 8; k++)
+                            { unsigned char c = (unsigned char)(v >> (8 * k)); a[k] = (c >= 32 && c < 127) ? c : '.'; }
+                            a[8] = 0;
+                            if (a[0] != '.' && a[1] != '.' && a[2] != '.')
+                                dprintf(STDERR_FILENO,
+                                        "[int3-guest]   ASCII x%d = \"%s\"  <== text in a register\n", gi, a);
+                        }
+                    }
+                }
             }
         }
 
@@ -1091,6 +1462,40 @@ static void *ios_mach_exception_thread( void *arg )
         if (kr == KERN_SUCCESS)
         {
             uintptr_t fault_addr = (uintptr_t)req->code[1];
+
+            /* ml555: snapshot the protection AT HANDLER ENTRY, and keep the kernel's
+             * own verdict from code[0].
+             *
+             * ml554 reported the fatal clear-routine fault as landing on an address that
+             * was MAPPED and READ|WRITE -- which would mean a store to a perfectly
+             * writable page faulted. But that reading is unsafe: the region query in
+             * [fault_rip] happens ~1500 lines later, AFTER srcwatch and the page
+             * machinery have run and possibly re-protected the page. So the "hostprot=3"
+             * may simply be the state after we healed it, not the state that faulted.
+             *
+             * Capture it here, before anything can touch it, and report BOTH. If entry
+             * and log-time disagree, something healed the page mid-handler and the fault
+             * is a RACE; if they agree at RW, the store really did fault on writable
+             * memory and it is something else entirely.
+             *
+             * code[0] is the kernel's classification: KERN_INVALID_ADDRESS(1) = nothing
+             * mapped, KERN_PROTECTION_FAILURE(2) = mapped but access denied. That alone
+             * separates "wild pointer" from "protection" without any inference. */
+            int entry_prot = -1;
+            unsigned long long entry_rbase = 0, entry_rsize = 0;
+            const unsigned long long fault_kr = (unsigned long long)req->code[0];
+            {
+                mach_vm_address_t ea = (mach_vm_address_t)fault_addr;
+                mach_vm_size_t es = 0;
+                vm_region_basic_info_data_64_t ebi;
+                mach_msg_type_number_t ec2 = VM_REGION_BASIC_INFO_COUNT_64;
+                mach_port_t eo = MACH_PORT_NULL;
+                if (fault_addr &&
+                    mach_vm_region( mach_task_self(), &ea, &es, VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_t)&ebi, &ec2, &eo ) == KERN_SUCCESS)
+                { entry_prot = ebi.protection; entry_rbase = (unsigned long long)ea;
+                  entry_rsize = (unsigned long long)es; }
+            }
 
             /* 0. ml515: source-bitmap watch. MUST run before every other
              * classification — these are deliberate protection faults we
@@ -2263,7 +2668,18 @@ static void *ios_mach_exception_thread( void *arg )
                  * [jit-tripwire] in virtual_ios.c) — nothing in-handler can
                  * fix that; log the vm_region ground truth and fall through
                  * so the fault surfaces instead of spinning. */
-                if (!handled && fa == (uint64_t)fault_pc)
+                /* ml578: an EXC_BREAKPOINT must NEVER enter execute-recovery.
+                 * The EXC_BREAKPOINT branch far above has no `continue`, so a
+                 * guest int3 falls through to here — and a breakpoint's fault
+                 * address EQUALS its pc, making `fa == fault_pc` trivially true.
+                 * We then "recover" a page that was never faulting, resume, hit
+                 * the same int3 and repeat: ONE deliberate Chromium abort
+                 * (chrome_elf+0xD7D30, the BackupRefPtr refcount CHECK) became
+                 * NINE identical breakpoints in ml577. The store-emulation path
+                 * above is harmless only by luck — BRK (0xd4200020) matches no
+                 * store pattern so it merely logs — but this one acts.
+                 * Diagnosis by Sol. */
+                if (!handled && fa == (uint64_t)fault_pc && req->exception != EXC_BREAKPOINT)
                 {
                     extern void *ios_jit_rx_base_global;
                     extern size_t ios_jit_pool_size_global;
@@ -2654,11 +3070,44 @@ skip_reclaim_band: ;
 
                     if (cnt <= 50 || first_seen || (cnt % 500) == 0)
                     {
-                        dprintf(STDERR_FILENO,
-                            "[fault_rip] cnt=%d rip=0x%llx pc=0x%llx%s\n",
-                            cnt, (unsigned long long)state_rip_q,
-                            (unsigned long long)fault_pc_check,
-                            first_seen ? " [first]" : "");
+                        /* ml553: also report the FAULTING DATA ADDRESS and whether it is
+                         * mapped at all. The login-window crash reconstructs to
+                         * libcef+0x41258FB — the loop head of Chromium's frame clear
+                         * (`movl %edx,(%r10)`) — so the question is whether that store's
+                         * destination pointer is wild. This path DELIVERS the exception to
+                         * the guest, so it never produces a [mach_exc] UNHANDLED record and
+                         * the data address was the one thing never logged.
+                         *
+                         * Reads the region rather than trusting a flag: "unmapped" vs "mapped
+                         * but wrong protection" point at completely different bugs (a bad
+                         * pointer computation vs a protection race). */
+                        {
+                            mach_vm_address_t ra = (mach_vm_address_t)fault_addr;
+                            mach_vm_size_t rs = 0;
+                            vm_region_basic_info_data_64_t rbi;
+                            mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+                            mach_port_t ro = MACH_PORT_NULL;
+                            int hp = -1;
+                            unsigned long long rbase = 0, rsize = 0;
+                            if (fault_addr &&
+                                mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                                (vm_region_info_t)&rbi, &rc, &ro ) == KERN_SUCCESS)
+                            { hp = rbi.protection; rbase = (unsigned long long)ra; rsize = (unsigned long long)rs; }
+                            dprintf(STDERR_FILENO,
+                                "[fault_rip] cnt=%d rip=0x%llx pc=0x%llx addr=0x%llx "
+                                "kr=%llu(%s) entryprot=%d nowprot=%d region=0x%llx+0x%llx%s%s%s rev=ml555\n",
+                                cnt, (unsigned long long)state_rip_q,
+                                (unsigned long long)fault_pc_check,
+                                (unsigned long long)fault_addr,
+                                fault_kr,
+                                fault_kr == 1 ? "INVALID_ADDRESS" :
+                                fault_kr == 2 ? "PROTECTION_FAILURE" : "other",
+                                entry_prot, hp, rbase, rsize,
+                                entry_prot < 0 ? "  <== UNMAPPED AT ENTRY (wild pointer)" : "",
+                                (entry_prot >= 0 && hp >= 0 && entry_prot != hp)
+                                    ? "  <== PROT CHANGED MID-HANDLER (race)" : "",
+                                first_seen ? " [first]" : "");
+                        }
                     }
                     /* TEMP [rip-leak] task#34 ml64-class: guest RIP inside a
                      * JIT-POOL mapping means a pool-translated pointer leaked
@@ -4846,6 +5295,55 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
         }
         if (!teb)
         {
+            /* ml540: NATIVE (non-guest) THREAD -> DECLINE, before best-effort.
+             *
+             * ml539 was the first run of a guest exe that EXITS. After Wine's
+             * clean teardown the SwiftUI UI thread faulted inside ICU
+             * (ContentView.timeString -> udat_open -> SimpleDateFormat::
+             * initialize -> _platform_strcmp) on a pointer into the dead Wine
+             * thread's stack. Nothing to do with the guest — but the TASK-level
+             * port we claimed for #67 routes it here anyway, and the ml378 path
+             * below then pushed a guest exception frame onto a NATIVE stack.
+             * One native crash became a 50-deep fault loop (footprint climbed
+             * 1271->1800MB) that [fault-stuck] had to break with abort_thread.
+             *
+             * ml378's reason for never declining is also gone: it declined into
+             * an ATTACHED StikDebug, which could not turn the fault into a
+             * signal and re-stopped until the script killed the app at 8 stops.
+             * We now detach early (#67), so a decline is KERN_FAILURE -> the
+             * kernel's default handler -> an honest iOS crash report naming the
+             * real faulting frame, which is strictly better than a fabricated
+             * guest delivery that cannot work.
+             *
+             * All three conditions are required, so a genuine guest thread whose
+             * stack we merely failed to attribute still gets best-effort:
+             *   - not in the thread registry (exact match, no slot-0 fallback)
+             *   - x18 == 0 (carries no guest TEB)
+             *   - pc is inside a Mach-O image and OUTSIDE the JIT pool, i.e.
+             *     host/system code (guest code runs from the pool, and PE
+             *     modules are not Mach-O images so dladdr cannot name them) */
+            {
+                int in_pool = rxb && pc >= rxb && pc < rxb + ios_jit_pool_size_global;
+                Dl_info dli;
+
+                if (!ios_thread_is_registered( thread ) && state->__x[18] == 0 && !in_pool
+                    && dladdr( (const void *)(uintptr_t)pc, &dli ) != 0)
+                {
+                    static int native_declines;
+                    if (native_declines < 16)
+                    {
+                        native_declines++;
+                        dprintf( 2, "[mach-deliver] rev=ml540 NATIVE-THREAD DECLINE pc=0x%llx (%s`%s) "
+                                    "sp=0x%llx addr=0x%llx -> kernel default handler\n",
+                                 (unsigned long long)pc,
+                                 dli.dli_fname ? dli.dli_fname : "?",
+                                 dli.dli_sname ? dli.dli_sname : "?",
+                                 (unsigned long long)sp, (unsigned long long)fault_addr );
+                    }
+                    return 0;
+                }
+            }
+
             /* ml378: BEST-EFFORT DELIVERY instead of declining.
              *
              * ml372 declined here because a frame outside the TEB's stack made
@@ -5806,6 +6304,8 @@ static int ios_make_wine_logging_safe( void )
  * invisible. Re-protecting a page after each attribution makes its NEXT
  * writer fault too, at a cost of only ~N faults per page. */
 #define IOS_SRCWATCH_PER_PAGE 3
+#define IOS_SRCWATCH_RIPS 24        /* distinct writers tracked in the census */
+#define IOS_SRCWATCH_TILE 254       /* Chromium tile pitch (256 less 1px border each side) */
 
 static struct {
     volatile uintptr_t base;      /* page-aligned watch start, 0 = disarmed */
@@ -5814,24 +6314,71 @@ static struct {
     volatile int       repeats;   /* faults on already-unprotected pages */
     volatile int       armed;
     unsigned char      seen[IOS_SRCWATCH_PAGES];
+    /* ml548: image geometry, so a fault offset can be reported as (x,y) and a
+     * TILE COLUMN instead of a raw byte offset. Without this the log needs
+     * offline arithmetic to mean anything, and the whole question is "which
+     * tile column did this writer touch". */
+    volatile unsigned   img_w, img_h, img_stride;
+    volatile unsigned long row_lo, row_hi;   /* watched row band */
+    /* per-writer tile-column census: which columns did each guest RIP write? */
+    volatile uint64_t   rip_id[IOS_SRCWATCH_RIPS];
+    volatile unsigned   rip_colmask[IOS_SRCWATCH_RIPS];
+    volatile unsigned   rip_hits[IOS_SRCWATCH_RIPS];
+    volatile int        rip_n;
 } ios_srcwatch;
 
-/* Called from win32u's dibdrv_PutImage with Chromium's SOURCE bitmap. */
-void ios_srcwatch_arm( const void *bits, unsigned long len )
+/* ml530: the watch arms ONCE (the ios_srcwatch.armed guard), so two call sites
+ * competing for it means whichever runs first silently wins and the other is
+ * never armed at all — a probe that reports nothing while looking healthy.
+ * There are now two subjects:
+ *
+ *   "render" — win32u's dibdrv_PutImage, Chromium's SOURCE bitmap (the original
+ *              use; hit a hard ceiling, see project_render_corruption_hunt)
+ *   "js"     — the assembled steamui JS buffer in NtReadFile (#78: V8 reports
+ *              `SyntaxError: Invalid or unexpected token` on source our file
+ *              reads deliver 73/73 byte-perfect, so something writes to it
+ *              afterwards)
+ *
+ * MYTHIC_SRCWATCH names which one to arm. "1" keeps the legacy render meaning. */
+void ios_srcwatch_arm_for( const void *bits, unsigned long len, const char *tag )
 {
-    static int enabled = -1;
+    const char *want = getenv( "MYTHIC_SRCWATCH" );
     uintptr_t b, e;
 
-    if (enabled < 0) enabled = (getenv("MYTHIC_SRCWATCH") != NULL);
-    if (!enabled || ios_srcwatch.armed || !bits || len < 0x10000) return;
+    /* ml531: the floor and the once-only guard were both tuned for the render
+     * subject and both silently killed the js subject.
+     *
+     *  - len < 0x10000 rejected EVERY contiguous JS buffer: the ones Steam reads
+     *    in a single shot are 1-25KB (sp.js 2178, 716.js 5217, 9108.js 8426,
+     *    2294.js 22495), so the ml530 control run logged seven "arming srcwatch"
+     *    lines and produced ZERO [srcwatch] ARMED. A floor that rejects the whole
+     *    population is a probe that cannot fire.
+     *  - armed-once meant the FIRST small file (sp.js) would have taken the slot
+     *    for the run even if the floor had allowed it, and the file that actually
+     *    fails is loaded later. Re-arm instead, unprotecting the previous region
+     *    first so no page is left write-protected without a handler tracking it —
+     *    that would surface as a stray AV in whatever touched it next. */
+    unsigned long floor = !strcmp( tag, "js" ) ? 0x400 : 0x10000;
+
+    if (!want || !tag) return;
+    if (strcmp( want, tag ) && !(!strcmp( want, "1" ) && !strcmp( tag, "render" ))) return;
+    if (!bits || len < floor) return;
+
+    if (ios_srcwatch.armed)
+    {
+        /* Release the previous subject before taking a new one. */
+        uintptr_t ob = ios_srcwatch.base, oe = ios_srcwatch.end;
+        ios_srcwatch.armed = 0;
+        if (ob && oe > ob) mprotect( (void *)ob, oe - ob, PROT_READ | PROT_WRITE );
+    }
 
     b = (uintptr_t)bits & ~(uintptr_t)0x3FFF;             /* 16K pages on iOS */
     e = ((uintptr_t)bits + len + 0x3FFF) & ~(uintptr_t)0x3FFF;
 
     if (mprotect( (void *)b, e - b, PROT_READ ) != 0)
     {
-        ERR("[srcwatch] arm FAILED bits=%p len=%lu errno=%d — staying off rev=ml514\n",
-            bits, len, errno);
+        ERR("[srcwatch] arm FAILED subject=%s bits=%p len=%lu errno=%d — staying off rev=ml530\n",
+            tag, bits, len, errno);
         return;
     }
     ios_srcwatch.base = b;
@@ -5840,8 +6387,80 @@ void ios_srcwatch_arm( const void *bits, unsigned long len )
     ios_srcwatch.repeats = 0;
     memset( (void *)ios_srcwatch.seen, 0, sizeof(ios_srcwatch.seen) );
     ios_srcwatch.armed = 1;
-    ERR("[srcwatch] ARMED base=%p end=%p (%lu bytes, %lu pages) rev=ml514\n",
-        (void *)b, (void *)e, (unsigned long)(e - b), (unsigned long)((e - b) >> 14));
+    /* ml549: resolve the exact-RIP export now — arming happens long after the
+     * emulator module is mapped, and the resolver is one-shot. */
+    { extern void ios_resolve_fex_rip_lookup( void ); ios_resolve_fex_rip_lookup(); }
+    ERR("[srcwatch] ARMED subject=%s base=%p end=%p (%lu bytes, %lu pages) rev=ml530\n",
+        tag, (void *)b, (void *)e, (unsigned long)(e - b), (unsigned long)((e - b) >> 14));
+}
+
+/* Legacy entry point: win32u's dibdrv_PutImage. */
+void ios_srcwatch_arm( const void *bits, unsigned long len )
+{
+    ios_srcwatch_arm_for( bits, len, "render" );
+}
+
+/* ml548: geometry-aware arm.
+ *
+ * Two reasons this exists rather than reusing the plain entry point:
+ *
+ *  1. TARGETING. Arming the whole 1.2MB bitmap spreads a 400-attribution budget
+ *     across ~76 pages, so the clear (which touches EVERY page first) dominates
+ *     and the content painters — the writers that would name a displaced band —
+ *     stay invisible. MYTHIC_SRCWATCH_ROWS=lo,hi restricts the watch to one
+ *     horizontal band so the budget lands where displacement was measured.
+ *  2. READABILITY. Storing stride lets a fault offset be reported as (x,y) and a
+ *     tile column directly, instead of needing offline arithmetic to interpret.
+ *
+ * The band is chosen from the consensus-median analysis: pick rows where an
+ * element is known to land in the wrong tile column. */
+void ios_srcwatch_arm_geom( const void *bits, unsigned long len,
+                            unsigned w, unsigned h, unsigned stride )
+{
+    const char *rows = getenv( "MYTHIC_SRCWATCH_ROWS" );
+    unsigned long lo = 0, hi = h;
+    const void *abits = bits;
+    unsigned long alen = len;
+
+    if (rows && stride)
+    {
+        char *endp = NULL;
+        unsigned long a = strtoul( rows, &endp, 0 );
+        unsigned long b = (endp && *endp == ',') ? strtoul( endp + 1, NULL, 0 ) : 0;
+        if (b > a && b <= h)
+        {
+            lo = a; hi = b;
+            abits = (const char *)bits + (size_t)lo * stride;
+            alen  = (size_t)(hi - lo) * stride;
+        }
+    }
+    ios_srcwatch.img_w = w;
+    ios_srcwatch.img_h = h;
+    ios_srcwatch.img_stride = stride;
+    ios_srcwatch.row_lo = lo;
+    ios_srcwatch.row_hi = hi;
+    ios_srcwatch.rip_n = 0;
+    memset( (void *)ios_srcwatch.rip_id, 0, sizeof(ios_srcwatch.rip_id) );
+    memset( (void *)ios_srcwatch.rip_colmask, 0, sizeof(ios_srcwatch.rip_colmask) );
+    memset( (void *)ios_srcwatch.rip_hits, 0, sizeof(ios_srcwatch.rip_hits) );
+    ios_srcwatch_arm_for( abits, alen, "render" );
+    if (ios_srcwatch.armed)
+        ERR("[srcwatch] GEOM %ux%u stride=%u rows=[%lu,%lu) tile=%d rev=ml548\n",
+            w, h, stride, lo, hi, IOS_SRCWATCH_TILE);
+}
+
+/* Census dump: which TILE COLUMNS did each writer touch? A painter that should
+ * only ever touch one column but shows bits for two is the finding. */
+void ios_srcwatch_census( void )
+{
+    int i;
+    if (ios_srcwatch.rip_n <= 0) return;
+    for (i = 0; i < ios_srcwatch.rip_n && i < IOS_SRCWATCH_RIPS; i++)
+        ERR("[srcwatch-census] writer=%d guest_rip=%p hits=%u tile_cols=0x%x%s rev=ml548\n",
+            i, (void *)(uintptr_t)ios_srcwatch.rip_id[i], ios_srcwatch.rip_hits[i],
+            ios_srcwatch.rip_colmask[i],
+            (ios_srcwatch.rip_colmask[i] & (ios_srcwatch.rip_colmask[i] - 1))
+                ? "  <== MULTI-COLUMN" : "");
 }
 
 /* Returns 1 if the fault belonged to the watch and was consumed.
@@ -5854,7 +6473,7 @@ void ios_srcwatch_arm( const void *bits, unsigned long len )
 static int ios_srcwatch_handle( const arm_thread_state64_t *st, uintptr_t addr )
 {
     uintptr_t page;
-    uint64_t x28, rip = 0;
+    uint64_t x28, rip = 0, exact_rip = 0;
     mach_vm_size_t got = 0;
     int n;
 
@@ -5877,6 +6496,7 @@ static int ios_srcwatch_handle( const arm_thread_state64_t *st, uintptr_t addr )
             {
                 dprintf(STDERR_FILENO, "[srcwatch] repeat storm (%d) — unprotecting ALL and "
                         "disarming; %d attributions rev=ml517\n", r, ios_srcwatch.pages);
+                { extern void ios_srcwatch_census( void ); ios_srcwatch_census(); }
                 mprotect( (void *)ios_srcwatch.base, ios_srcwatch.end - ios_srcwatch.base,
                           PROT_READ | PROT_WRITE );
                 ios_srcwatch.armed = 0;
@@ -5895,15 +6515,133 @@ static int ios_srcwatch_handle( const arm_thread_state64_t *st, uintptr_t addr )
     if (x28) mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(x28 + 0x18),
                                      sizeof(rip), (mach_vm_address_t)&rip, &got );
 
+    /* ml549: the RIP above is BLOCK-GRANULAR — FEX only syncs CpuStateFrame+0x18 at
+     * block boundaries, so it names the calling block, not the instruction that
+     * executed. ml548 disassembled one and got `movq %rbp,%rcx; callq` (call setup)
+     * instead of a store, which is why the writer could never be identified.
+     *
+     * FEX keeps a host-PC -> guest-RIP table in every block tail and walks it for
+     * exception reconstruction. ios_fex_rip_from_hostpc() is that same walk exported
+     * as C. The block header pointer is CPUState offset 0 == x28+0, and the host PC
+     * is right here in the fault state. Log BOTH so the difference is visible: if
+     * exact == block on every fault, the lookup is not working and nothing below it
+     * can be trusted. */
+    {
+        /* The lookup lives in xtajit64.dll (an ARM64EC PE), not in this Mach-O, so a
+         * weak extern would silently resolve to NULL. Use the pointer xtajit64 pushes
+         * down at init on the same unix-call that carries the JIT alias callback. */
+        extern unsigned long long (*ios_fex_rip_from_hostpc_cb)( unsigned long long, unsigned long long );
+        uint64_t blockhdr = 0;
+        mach_vm_size_t bgot = 0;
+        if (x28)
+            mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)x28,
+                                    sizeof(blockhdr), (mach_vm_address_t)&blockhdr, &bgot );
+        /* ml551: gate on the RESOLVED FLAG, never on the pointer. Calling this
+         * pointer while it held ASCII was what blacked out the window. */
+        extern volatile int ios_fex_rip_resolved;
+        if (ios_fex_rip_resolved && ios_fex_rip_from_hostpc_cb
+            && bgot == sizeof(blockhdr) && blockhdr)
+            exact_rip = ios_fex_rip_from_hostpc_cb(
+                blockhdr, (uint64_t)__darwin_arm_thread_state64_get_pc(*st) );
+    }
+
     n = ++ios_srcwatch.pages;
-    dprintf(STDERR_FILENO,
-        "[srcwatch] #%d off=+0x%lx page=+0x%lx guest_rip=%p host_pc=%p x28=%p%s rev=ml515\n",
-        n, (unsigned long)(addr - ios_srcwatch.base),
-        (unsigned long)(page - ios_srcwatch.base),
-        (void *)(uintptr_t)rip,
-        (void *)(uintptr_t)__darwin_arm_thread_state64_get_pc(*st),
-        (void *)(uintptr_t)x28,
-        (got == sizeof(rip)) ? "" : "  (rip UNREADABLE => host writer)");
+    {
+        /* ml548: report the destination in IMAGE terms and record which tile
+         * column this writer touched. A raw byte offset needs offline arithmetic
+         * to interpret, and "which tile column" is the entire question. */
+        unsigned long off = (unsigned long)(addr - ios_srcwatch.base);
+        unsigned stride = ios_srcwatch.img_stride;
+        unsigned long yy = 0, xx = 0; int col = -1;
+        if (stride)
+        {
+            yy = ios_srcwatch.row_lo + off / stride;
+            xx = (off % stride) / 4;
+            col = (int)(xx / IOS_SRCWATCH_TILE);
+        }
+        dprintf(STDERR_FILENO,
+            "[srcwatch] #%d off=+0x%lx -> x=%lu y=%lu tile_col=%d EXACT_rip=%p block_rip=%p host_pc=%p x28=%p%s rev=ml549\n",
+            n, off, xx, yy, col,
+            (void *)(uintptr_t)exact_rip,
+            (void *)(uintptr_t)rip,
+            (void *)(uintptr_t)__darwin_arm_thread_state64_get_pc(*st),
+            (void *)(uintptr_t)x28,
+            (got == sizeof(rip)) ? "" : "  (rip UNREADABLE => host writer)");
+
+        if (col >= 0 && col < 32)
+        {
+            int i, slot = -1;
+            for (i = 0; i < ios_srcwatch.rip_n && i < IOS_SRCWATCH_RIPS; i++)
+                if (ios_srcwatch.rip_id[i] == rip) { slot = i; break; }
+            if (slot < 0 && ios_srcwatch.rip_n < IOS_SRCWATCH_RIPS)
+            {
+                slot = ios_srcwatch.rip_n++;
+                ios_srcwatch.rip_id[slot] = rip;
+            }
+            if (slot >= 0)
+            {
+                ios_srcwatch.rip_colmask[slot] |= (1u << col);
+                ios_srcwatch.rip_hits[slot]++;
+            }
+        }
+    }
+
+    /* ml534: DUMP THE WHOLE REGISTER FILE — do not guess the mapping.
+     *
+     * ml533 assumed the Windows ARM64EC ABI (RAX=x8, RDX=x1, RSP=x23) and the
+     * data immediately refuted it: "RAX" read 0x1b8,0x1b3,0x1ad,0x1a7 — i.e.
+     * 440,435,429,423, a ROW COUNTER counting down from the buffer height (440),
+     * and "[RSP]" yielded another stack address 0x2b8 away rather than a return
+     * address. FEX uses its own `x64::SRA` span, not the EC ABI table.
+     *
+     * So stop guessing. Dump x0..x30 for the first few faults and identify the
+     * registers OFFLINE by what they contain — the destination register must equal
+     * the faulting address, a caller/return value lands in libcef's code range
+     * (device base 0x71e1910000 + .text), and a stack pointer sits in the guest
+     * stack band. That is self-calibrating: it cannot be wrong about the mapping
+     * because it assumes none.
+     *
+     * Bounded to the first 8 faults — 2052 fired in ml533, and 31 registers each
+     * would bury the log. */
+    {
+        /* ml535: budget the dumps PER DISTINCT WRITER, not globally.
+         *
+         * ml534 used one global budget of 8 and the CLEAR consumed every slot —
+         * it runs first and marches page by page (faults at ...f0000, ...f4000,
+         * ...f8000 with x0 advancing in step), exactly the starvation that capped
+         * ml517. Meanwhile the writer we actually want is the CONTENT PAINTER:
+         * this run it was the TOP writer at 1293 faults (guest_rip +0x582c89)
+         * versus 1086 for the clear (+0x41258f0), and it got zero register dumps.
+         *
+         * A per-rip budget guarantees every distinct writer is sampled regardless
+         * of who runs first or faults most. Same lesson as the ml516 cap that
+         * counted EVENTS instead of DISTINCT SUBJECTS. */
+        enum { SW_RIPS = 8, SW_PER_RIP = 2 };
+        static volatile uint64_t seen_rip[SW_RIPS];
+        static volatile int      seen_cnt[SW_RIPS];
+        int slot = -1, i2, d = 0;
+
+        for (i2 = 0; i2 < SW_RIPS; i2++)
+        {
+            if (seen_rip[i2] == rip) { slot = i2; break; }
+            if (seen_rip[i2] == 0)   { seen_rip[i2] = rip; slot = i2; break; }
+        }
+        if (slot >= 0 && seen_cnt[slot] < SW_PER_RIP) d = ++seen_cnt[slot];
+
+        if (d)
+        {
+            char buf[560];
+            int off = 0, i;
+            for (i = 0; i <= 30 && off < (int)sizeof(buf) - 24; i++)
+                off += snprintf( buf + off, sizeof(buf) - off, "%s%d=%llx",
+                                 i ? " x" : "x", i, (unsigned long long)st->__x[i] );
+            dprintf(STDERR_FILENO,
+                "[srcwatch]   #%d REGS writer=%d/%d guest_rip=%p fault=%p sp=%p lr=%p | %s rev=ml535\n",
+                n, slot, d, (void *)(uintptr_t)rip, (void *)addr,
+                (void *)(uintptr_t)__darwin_arm_thread_state64_get_sp(*st),
+                (void *)(uintptr_t)__darwin_arm_thread_state64_get_lr(*st), buf);
+        }
+    }
 
     /* ml517: unprotect just long enough for THIS write to land, then the
      * page is re-armed on the next fault path below if its per-page budget
@@ -6670,15 +7408,37 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                     tsd_r &= ~7ULL;
                     teb_r = (uintptr_t)*(void **)(tsd_r + 275 * 8);
 
-                    if (rspq < 6 && teb_r)
+                    /* ml558: this probe KILLED ml557.
+                     *
+                     * TSD slot 275 is not ours -- pthread_exit_wrapper's own comment
+                     * says so. On a NATIVE (non-wine) thread some Apple framework's
+                     * value sits there, we read it as a TEB, and TEB+0x1788 came back
+                     * 0x40; *(0x40+0x30) faulted at 0x70 inside the signal handler.
+                     *
+                     * Worse, the `rspq < 6` cap could never engage: rspq++ was BELOW
+                     * the faulting load, so the counter never advanced and the probe
+                     * re-faulted forever (5,000+ times in ml557) until the fault-stuck
+                     * breaker diverted the thread into abort_thread.
+                     *
+                     * Two rules restored: (1) only look at TSD 275 on a thread we
+                     * actually registered, (2) SPEND THE BUDGET FIRST -- increment
+                     * before the risky deref, so a fault can cost at most 6 tries. */
+                    if (rspq < 6 && ios_teb_is_registered(teb_r))
                     {
-                        void *cpuarea_r = *(void**)(teb_r + 0x1788);
+                        void *cpuarea_r;
+                        rspq++;                       /* spend it BEFORE we can fault */
+                        cpuarea_r = *(void**)(teb_r + 0x1788);
+                        if ((uintptr_t)cpuarea_r < 0x10000)
+                        {
+                            ERR("  [rsp-trunc] cpuarea=%p implausible (TSD275 not a wine TEB) "
+                                "-- skipping deref rev=ml558\n", cpuarea_r);
+                            cpuarea_r = NULL;
+                        }
                         if (cpuarea_r)
                         {
                             uint64_t *frame_r = *(uint64_t**)((char*)cpuarea_r + 0x30);
                             if (frame_r)
                             {
-                                rspq++;
                                 /* ml272: offsets CONFIRMED from FEX's own [state-offsets]
                                  * line -- rip=0x18 gregs=0x20 gregs[RSP]=0x40
                                  * callret_sp=0xb0 callret_sp_base=0xb8 flags=0x3f0.
@@ -7788,8 +8548,19 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             /* name the memory once per class — this is the probe that finally
              * identifies WHAT state the page is in (ml419 had no region info) */
             {
-                static int busrgn2;
-                if (busrgn2++ < 10)
+                /* ml560: SEPARATE BUDGETS PER CLASS.
+                 *
+                 * ml559 lost the run that mattered to this cap. The single
+                 * `busrgn2 < 10` counter was drained by ten early ALIGNMENT
+                 * faults (69 of them that run), so when the fatal UNREADABLE
+                 * fault arrived at cnt=127 there was no budget left and the
+                 * region was never described. The noise class starved the
+                 * subject class — an event cap where a per-subject cap was
+                 * needed. Unreadable faults now have their own budget that
+                 * alignment faults cannot touch. */
+                static int busrgn2, busrgn_unread;
+                int bus_is_unread = (rd_kr != KERN_SUCCESS);
+                if (bus_is_unread ? (busrgn_unread++ < 8) : (busrgn2++ < 10))
                 {
                     mach_vm_address_t ba = (mach_vm_address_t)(uintptr_t)siginfo->si_addr;
                     mach_vm_size_t bs = 0;
@@ -7810,14 +8581,258 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                                         (vm_region_info_t)&bbi, &bbc, &bbo ) == KERN_SUCCESS &&
                         mach_vm_region( mach_task_self(), &xa, &xs, VM_REGION_EXTENDED_INFO,
                                         (vm_region_info_t)&xi, &xc, &xo ) == KERN_SUCCESS)
+                    {
                         ERR("[bus-rgn]   region=0x%llx+0x%llx prot=%d max=%d share_mode=%d user_tag=%d\n",
                             (unsigned long long)ba, (unsigned long long)bs,
                             bbi.protection, bbi.max_protection, xi.share_mode, xi.user_tag);
+
+                        /* ml560: WHO OWNS THIS PAGE, and why can't it be materialised?
+                         *
+                         * ml559's fatal fault reported kr=10 (KERN_MEMORY_ERROR) on an
+                         * address that was mapped, page-aligned, and RW both at handler
+                         * entry and during the handler — yet a read probe of it FAILED.
+                         * That is neither an absence fault nor a protection fault, so
+                         * "protection was stripped" cannot be the explanation and the
+                         * reheal below is a no-op for it.
+                         *
+                         * These fields separate the live hypotheses outright:
+                         *   external_pager=1   -> section/file backed (a Valve or CEF
+                         *                         shared-memory object) — suspect the
+                         *                         backing object died or was truncated
+                         *   external_pager=0   -> anonymous; then swapped_out>0 points at
+                         *                         a compressor/decompression failure
+                         *   purgeable VOLATILE/EMPTY -> the region was PURGED; the fix is
+                         *                         ownership/lifetime, not protection
+                         *   resident=0 + dirtied=0   -> never materialised at all
+                         * user_tag names the allocator; shadow_depth/ref_count expose a
+                         * broken COW chain. */
+                        {
+                            int purge_state = -1;
+                            kern_return_t pk = mach_vm_purgable_control(
+                                mach_task_self(), ba, VM_PURGABLE_GET_STATE,
+                                (int *)&purge_state );
+                            ERR("[bus-rgn]   OWNER extpager=%u resident=%u swapped=%u "
+                                "dirtied=%u reusable=%u refcnt=%u shadow=%u  purgeable=%s(0x%x) "
+                                "rev=ml560\n",
+                                (unsigned)xi.external_pager, xi.pages_resident,
+                                xi.pages_swapped_out, xi.pages_dirtied, xi.pages_reusable,
+                                xi.ref_count, (unsigned)xi.shadow_depth,
+                                pk != KERN_SUCCESS ? "not-purgeable" :
+                                  ((purge_state & VM_PURGABLE_STATE_MASK) == VM_PURGABLE_EMPTY ? "EMPTY(PURGED)" :
+                                   (purge_state & VM_PURGABLE_STATE_MASK) == VM_PURGABLE_VOLATILE ? "VOLATILE(can be purged)" :
+                                   (purge_state & VM_PURGABLE_STATE_MASK) == VM_PURGABLE_NONVOLATILE ? "nonvolatile" : "other"),
+                                pk == KERN_SUCCESS ? (unsigned)purge_state : 0u);
+                            ERR("[bus-rgn]   VERDICT %s rev=ml560\n",
+                                xi.external_pager
+                                  ? "<== SECTION/FILE-BACKED — backing object is the suspect"
+                                  : (xi.pages_swapped_out
+                                       ? "<== ANONYMOUS + SWAPPED OUT — compressor/decompress suspect"
+                                       : (xi.pages_resident == 0
+                                            ? "<== ANONYMOUS, NEVER RESIDENT — never materialised"
+                                            : "<== ANONYMOUS AND RESIDENT — none of the standard stories fit")));
+
+                        /* ml561: WHO MADE THIS MAPPING, and which pages materialise?
+                         *
+                         * Two facts settle the "unbacked tail" story. First the
+                         * provenance: if offset+host_size runs past the file's real
+                         * size, the tail pages have no backing and touching them gives
+                         * exactly this kr=10. Second the page census: probe every host
+                         * page of the region and print which ones read — the prediction
+                         * is that pages below +0x10000 succeed and the rest fail. If
+                         * instead ALL pages read, the fault was transient and the whole
+                         * EOF theory is wrong; the census says so either way. */
+                        {
+                            extern void ios_map_describe( const void *addr, char *out, size_t outlen );
+                            char prov[420];
+                            char census[96];
+                            unsigned ci = 0;
+                            mach_vm_address_t pa;
+                            ios_map_describe( (const void *)(uintptr_t)ba, prov, sizeof(prov) );
+                            ERR("[bus-rgn]   PROVENANCE %s rev=ml561\n", prov);
+                            for (pa = ba; pa < ba + bs && ci < sizeof(census) - 2; pa += 0x4000)
+                            {
+                                unsigned char t; mach_vm_size_t got = 0;
+                                census[ci++] = (mach_vm_read_overwrite( mach_task_self(), pa, 1,
+                                                  (mach_vm_address_t)(uintptr_t)&t, &got )
+                                                == KERN_SUCCESS && got == 1) ? '.' : 'X';
+                            }
+                            census[ci] = 0;
+                            ERR("[bus-rgn]   PAGE-CENSUS 16KB pages from 0x%llx: [%s]  "
+                                "('.'=materialises 'X'=fails; fault is at +0x%llx) rev=ml561\n",
+                                (unsigned long long)ba, census,
+                                (unsigned long long)((uintptr_t)siginfo->si_addr - (uintptr_t)ba));
+                        }
+
+                        /* ml561 (Sol's discriminator): DUMP THE GUEST FILL ARGUMENTS.
+                         *
+                         * The recurring victim is Skia's 2D 32-bit rect fill at
+                         * libcef+0x41258F0, verified by disassembling the PHONE's
+                         * libcef.dll:
+                         *     fill32(dest=rcx, value=edx, width_dwords=r8d,
+                         *            row_stride=r9, height=[rsp+0x30])
+                         * ml554 and ml559 both faulted at EXACTLY region_base+0x10000
+                         * (the 64KB Windows allocation granularity) in an 0x14000 region
+                         * — i.e. four 16KB pages materialise and the fifth does not.
+                         *
+                         * Two stories fit, and these numbers separate them outright:
+                         *   fill extent <= region end  -> the VIEW is right and the
+                         *                                 BACKING is short (section
+                         *                                 sizing/lifetime bug: mapping
+                         *                                 past EOF gives exactly this)
+                         *   fill extent >  region end  -> the guest OVERRAN; then the
+                         *                                 width/stride/height tuple is
+                         *                                 itself suspect, which would be
+                         *                                 the first real bridge to the
+                         *                                 tile-displacement bug
+                         *
+                         * No FEX reconstruction needed: under ARM64EC the guest regs ARE
+                         * fixed ARM regs (rcx=x0, rdx=x1, r8=x2, r9=x3, r10=x4, rax=x8,
+                         * rsp=x23) — confirmed by disassembling FEX's own output for this
+                         * exact function. Reading the signal context cannot perturb FEX. */
+                        /* ml562 CORRECTION: only interpret registers as fill arguments
+                         * when the fault is actually the unreadable class. On ml561's
+                         * ALIGNMENT faults this block printed "FILL OVERRUNS THE REGION —
+                         * guest geometry is wrong" from registers that were not fill
+                         * arguments at all — a confident verdict with no precondition.
+                         * A probe that always renders a verdict is worse than silent. */
+                        if (!bus_is_unread)
+                            ERR("[fill-args] (skipped — not an unreadable-page fault; "
+                                "registers are not fill arguments here) rev=ml562\n");
+                        else
+                        {
+                            uint64_t g_rcx = REGn_sig(0,  bus_ctx);
+                            uint64_t g_rdx = REGn_sig(1,  bus_ctx);
+                            uint64_t g_r8  = REGn_sig(2,  bus_ctx);
+                            uint64_t g_r9  = REGn_sig(3,  bus_ctx);
+                            uint64_t g_r10 = REGn_sig(4,  bus_ctx);
+                            uint64_t g_rax = REGn_sig(8,  bus_ctx);
+                            uint64_t g_rsp = REGn_sig(23, bus_ctx);
+                            uint32_t height = 0;
+                            mach_vm_size_t hgot = 0;
+                            int have_h = (mach_vm_read_overwrite( mach_task_self(),
+                                            (mach_vm_address_t)(g_rsp + 0x30), 4,
+                                            (mach_vm_address_t)(uintptr_t)&height,
+                                            &hgot ) == KERN_SUCCESS && hgot == 4);
+                            uint64_t w  = (uint32_t)g_r8, str = (uint32_t)g_r9;
+                            uint64_t rows_left = (uint32_t)g_rax;
+                            /* extent still to be written from the CURRENT row base */
+                            uint64_t last = g_rcx + (rows_left ? (rows_left - 1) * str : 0)
+                                                  + (w ? w * 4 : 0);
+                            /* ml563 (Sol was right): gating on bus_is_unread is NOT a
+                             * fill32 gate — any unreadable fault would still be decoded
+                             * under the fill ABI. A RIP check needs the module base,
+                             * which we do not have in a signal handler, so verify the
+                             * REGISTER FILE is consistent with fill32 instead:
+                             *   cursor r10 must BE the faulting address,
+                             *   width/stride/height positive, row bytes <= stride,
+                             *   row base <= cursor.
+                             * All four held in ml561's three real events (r10 == addr,
+                             * 256*4 == stride 1024, height 256). When they do not hold,
+                             * say so and print NO verdict. */
+                            int fill_ok = (g_r10 == (uint64_t)(uintptr_t)siginfo->si_addr) &&
+                                          w > 0 && str > 0 && have_h && height > 0 &&
+                                          (w * 4) <= str && g_rcx <= g_r10;
+                            if (!fill_ok)
+                            {
+                                ERR("[fill-args] registers are NOT consistent with the fill32 ABI "
+                                    "(r10=0x%llx vs addr=%p, width=%llu stride=%llu height=%u) "
+                                    "— NOT interpreting, no verdict rev=ml563\n",
+                                    (unsigned long long)g_r10, siginfo->si_addr,
+                                    (unsigned long long)w, (unsigned long long)str, height);
+                            }
+                            else
+                            ERR("[fill-args] rcx(dest_row)=0x%llx edx(val)=0x%08x "
+                                "r8d(width_dw)=%llu r9(stride)=%llu r10(cursor)=0x%llx "
+                                "eax(rows_left)=%llu rsp=0x%llx height@rsp+0x30=%s%u rev=ml561\n",
+                                (unsigned long long)g_rcx, (unsigned)(uint32_t)g_rdx,
+                                (unsigned long long)w, (unsigned long long)str,
+                                (unsigned long long)g_r10, (unsigned long long)rows_left,
+                                (unsigned long long)g_rsp, have_h ? "" : "UNREADABLE:", height);
+                            if (fill_ok)
+                            ERR("[fill-args]   region=[0x%llx,0x%llx)  cursor_off=0x%llx  "
+                                "projected_last=0x%llx  %s rev=ml561\n",
+                                (unsigned long long)ba, (unsigned long long)(ba + bs),
+                                (unsigned long long)(g_r10 - ba),
+                                (unsigned long long)last,
+                                last <= (uint64_t)(ba + bs)
+                                  ? "<== FILL FITS THE REGION — backing is short, NOT an overrun"
+                                  : "<== FILL OVERRUNS THE REGION — guest geometry is wrong");
+                        }
+                        }
+                    }
                     else
                         ERR("[bus-rgn]   mach_vm_region FAILED (address unmapped)\n");
                     {
                         extern void ios_dump_fault_region( void *addr );
                         ios_dump_fault_region( siginfo->si_addr );
+                    }
+                }
+            }
+
+            /* ml552: THE WRITE-SIDE TWIN of the reheal below.
+             *
+             * The existing reheal only fires when the page is UNREADABLE
+             * (rd_kr != KERN_SUCCESS). But iOS strips PROT_WRITE while leaving
+             * PROT_READ intact, and then the read probe SUCCEEDS, this whole
+             * branch is skipped, and a plain guest store dies as a fatal
+             * c0000005 -- with no reheal ever attempted.
+             *
+             * That is exactly the login-window crash: the faulting instruction
+             * reconstructs to libcef+0x41258FB, the loop head of Chromium's
+             * frame CLEAR (`movl %edx,(%r10)`), i.e. a STORE into the render
+             * bitmap. Across 5 runs, every run that logged [bus-reheal] also
+             * crashed and every run without it did not -- protection stripping
+             * and the crash travel together.
+             *
+             * So: readable page + WRITE fault + wine expects PROT_WRITE + host
+             * protection lacks it  =>  restore and resume, same as the read side.
+             * Always logs the wine-vs-host comparison for the first few, so if
+             * this case never actually occurs we find out instead of assuming.
+             */
+            if (rd_kr == KERN_SUCCESS)
+            {
+                DWORD64 esr = get_fault_esr( bus_ctx );
+                int is_write = (int)((esr >> 6) & 1);          /* ISS.WnR */
+                extern int ios_page_expected_prot( const void *addr );
+                int want = ios_page_expected_prot( siginfo->si_addr );
+                mach_vm_address_t ra = (mach_vm_address_t)(uintptr_t)siginfo->si_addr;
+                mach_vm_size_t rs = 0;
+                vm_region_basic_info_data_64_t rbi;
+                mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+                mach_port_t ro = MACH_PORT_NULL;
+                int host_prot = -1;
+
+                if (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_t)&rbi, &rc, &ro ) == KERN_SUCCESS)
+                    host_prot = rbi.protection;
+
+                {
+                    static unsigned long wr_seen, wr_healed;
+                    int stripped = (is_write && (want & PROT_WRITE) &&
+                                    host_prot >= 0 && !(host_prot & VM_PROT_WRITE));
+                    ++wr_seen;
+                    if (wr_seen <= 12 || (wr_seen % 4096) == 0)
+                        ERR("[wr-strip] #%lu addr=%p pc=%p esr=0x%llx write=%d "
+                            "wine_want=%d host_prot=%d %s (seen=%lu healed=%lu) rev=ml552\n",
+                            wr_seen, siginfo->si_addr, pc, (unsigned long long)esr,
+                            is_write, want, host_prot,
+                            stripped ? "<== HOST STRIPPED WRITE" : "(not a strip)",
+                            wr_seen, wr_healed);
+
+                    if (stripped)
+                    {
+                        enum { WR_HPAGE = 0x4000 };
+                        char *hp = (char *)((uintptr_t)siginfo->si_addr & ~(uintptr_t)(WR_HPAGE - 1));
+                        if (!mprotect( hp, WR_HPAGE, want ))
+                        {
+                            ++wr_healed;
+                            ERR("[wr-strip] restored prot=%d on %p — resuming "
+                                "(healed=%lu) rev=ml552\n", want, hp, wr_healed);
+                            ios_fixup_x18_for_return( bus_ctx );
+                            return;
+                        }
+                        ERR("[wr-strip] mprotect(%p, %d) FAILED errno=%d — falling to AV rev=ml552\n",
+                            (void *)hp, want, errno);
                     }
                 }
             }
@@ -7844,8 +8859,15 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                         char *hpage = (char *)((uintptr_t)siginfo->si_addr & ~(uintptr_t)(BUS_HPAGE - 1));
                         if (!mprotect( hpage, BUS_HPAGE, want ))
                         {
-                            ERR("[bus-reheal] #%d restored prot=%d on %p (wine says committed"
-                                "+readable; host had stripped it) — resuming\n",
+                            /* ml560: the old text asserted "host had stripped it".
+                             * ml559 disproved that for the fatal case: the same fault
+                             * reported entryprot=3 nowprot=3 — protection was never
+                             * stripped, the page simply could not be materialised
+                             * (kr=10). Say what is actually known: the read probe
+                             * failed and we re-applied wine's intended protection. */
+                            ERR("[bus-reheal] #%d re-applied prot=%d on %p (read probe FAILED; "
+                                "wine says committed+readable — NOT verified as a protection "
+                                "strip, see [bus-rgn] OWNER/VERDICT) — resuming rev=ml560\n",
                                 rehealed, want, hpage);
                             ios_fixup_x18_for_return( bus_ctx );
                             return;
@@ -9159,12 +10181,28 @@ void ios_dump_all_thread_stacks(void)
             {
                 uint64_t w = 0;
                 mach_vm_size_t g = 0;
+                /* ml585: also resolve the WINE TID from TEB->ClientId
+                 * .UniqueThread (TEB+0x48). Without it every stack is keyed
+                 * only by Mach port, and correlating a sample with
+                 * [srv-queues]/[srv-stuck] means hunting for an unrelated
+                 * line that happens to print both — which is exactly the
+                 * detour that cost time on ml584. */
+                uint64_t wtid = 0;
+                mach_vm_size_t g2 = 0;
+                int have_wtid = (mach_vm_read_overwrite(mach_task_self(),
+                        (mach_vm_address_t)(st.__x[18] + 0x48), 8,
+                        (mach_vm_address_t)&wtid, &g2) == KERN_SUCCESS && g2 == 8);
                 if (mach_vm_read_overwrite(mach_task_self(),
                         (mach_vm_address_t)(st.__x[18] + 0x370), 8,
                         (mach_vm_address_t)&w, &g) == KERN_SUCCESS && g == 8)
-                    snprintf(tebstate, sizeof(tebstate), " teb+370=0x%llx", (unsigned long long)w);
+                    snprintf(tebstate, sizeof(tebstate), " teb=0x%llx wtid=%04llx teb+370=0x%llx",
+                             (unsigned long long)st.__x[18],
+                             have_wtid ? (unsigned long long)wtid : 0ull,
+                             (unsigned long long)w);
                 else
-                    snprintf(tebstate, sizeof(tebstate), " teb+370=UNREADABLE");
+                    snprintf(tebstate, sizeof(tebstate), " teb=0x%llx wtid=%04llx teb+370=UNREADABLE",
+                             (unsigned long long)st.__x[18],
+                             have_wtid ? (unsigned long long)wtid : 0ull);
             }
             fprintf(stderr, "[thread-stacks] port=0x%x \"%s\" pc=%s`%s+0x%llx run=%d susp=%d "
                     "cpu=%d x8=0x%llx x18=0x%llx sp=0x%llx%s\n",

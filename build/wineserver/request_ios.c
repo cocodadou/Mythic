@@ -373,11 +373,21 @@ void read_request( struct thread *thread )
 
 error:
     if (!ret)  /* closed pipe */
+    {
+        /* ml586: this kill was previously SILENT — the 0060-family autopsy
+         * needs the fd number and tid on every request-channel death */
+        fprintf( stderr, "[srv-own] read_request EOF tid=%04x pid=%04x request_unixfd=%d -> kill_thread rev=ml586\n",
+                 thread->id, thread->process->id, get_unix_fd( thread->request_fd ) );
         kill_thread( thread, 0 );
+    }
     else if (ret > 0)
         fatal_protocol_error( thread, "partial read %d\n", ret );
     else if (errno != EWOULDBLOCK && (EWOULDBLOCK == EAGAIN || errno != EAGAIN))
+    {
+        fprintf( stderr, "[srv-own] read_request ERR tid=%04x pid=%04x request_unixfd=%d errno=%d rev=ml586\n",
+                 thread->id, thread->process->id, get_unix_fd( thread->request_fd ), errno );
         fatal_protocol_error( thread, "read: %s\n", strerror( errno ));
+    }
 }
 
 /* receive a file descriptor on the process socket */
@@ -421,16 +431,25 @@ int receive_fd( struct process *process )
 
         if (!thread || thread->process != process || thread->state == TERMINATED)
         {
-            if (debug_level)
-                fprintf( stderr, "%04x: *fd* %d <- %d bad thread id\n",
-                         data.tid, data.fd, fd );
+            /* ml586: previously silent (debug_level off) — a misrouted send_fd
+             * (client picked the wrong master socket) dies exactly here */
+            fprintf( stderr, "[srv-own] receive_fd BAD tid=%04x on pid=%04x client_fd=%d server_dup=%d cause=%s rev=ml586\n",
+                     data.tid, process->id, data.fd, fd,
+                     !thread ? "no-thread" : (thread->state == TERMINATED ? "terminated" : "WRONG-PROCESS") );
             close( fd );
         }
         else
         {
+            struct stat fdt_st;
             if (debug_level)
                 fprintf( stderr, "%04x: *fd* %d <- %d\n",
                          thread->id, data.fd, fd );
+            /* ml586: log pipe/socket receipts — these are thread comm fds; the
+             * pid field catches deliveries arriving on the wrong master socket */
+            if (fd != -1 && !fstat( fd, &fdt_st ) && (S_ISFIFO(fdt_st.st_mode) || S_ISSOCK(fdt_st.st_mode)))
+                fprintf( stderr, "[srv-own] receive_fd tid=%04x pid=%04x client_fd=%d server_dup=%d kind=%s rev=ml586\n",
+                         thread->id, process->id, data.fd, fd,
+                         S_ISFIFO(fdt_st.st_mode) ? "fifo" : "sock" );
             thread_add_inflight_fd( thread, data.fd, fd );
         }
         if (thread) release_object( thread );

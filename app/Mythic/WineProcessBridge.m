@@ -16,6 +16,10 @@
 #include <setjmp.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <limits.h>
+#include <string.h>
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
@@ -39,6 +43,84 @@ static os_log_t wine_proc_log(void) {
 
 #define LOG(fmt, ...) os_log(wine_proc_log(), "[WineProc] " fmt, ##__VA_ARGS__)
 
+/* ---- ml581: undo the hand-made AppData skeleton ------------------------
+ *
+ * While chasing the Steam login window I hand-created
+ * drive_c/users/mobile/AppData/{Roaming,LocalLow}/... on the device with
+ * devicectl, each leaf holding a placeholder ".keep" file (devicectl cannot
+ * copy an empty directory). That was a mistake: Wine populates the profile
+ * itself, and it decides per-directory by EXISTENCE. Pre-creating Roaming
+ * made every one of those checks pass, so the population that builds
+ * Start Menu\Programs never ran -- the taskbar lost its Start button and
+ * the virtual desktop stopped booting properly, four runs running.
+ *
+ * devicectl has no delete verb, so the undo has to live in the app. This
+ * deletes ONLY files literally named ".keep", then removes directories that
+ * are empty as a result, walking bottom-up and stopping at AppData itself.
+ * A directory holding anything real is left completely alone, so this can
+ * never destroy user or Steam data -- it only restores the "absent" state
+ * Wine's population is gated on. Idempotent: after the first clean boot
+ * repopulates the tree, there are no .keep files left and it does nothing. */
+static int mythic_prune_keep_tree(const char *dir, int depth)
+{
+    DIR *d = opendir( dir );
+    if (!d) return 0;                       /* absent/unreadable => nothing to do */
+
+    int survivors = 0;
+    struct dirent *ent;
+    while ((ent = readdir( d )))
+    {
+        if (!strcmp( ent->d_name, "." ) || !strcmp( ent->d_name, ".." )) continue;
+
+        char path[PATH_MAX];
+        if (snprintf( path, sizeof(path), "%s/%s", dir, ent->d_name ) >= (int)sizeof(path))
+        {
+            survivors++;                    /* can't address it => treat as real */
+            continue;
+        }
+
+        struct stat st;
+        if (lstat( path, &st ) != 0) { survivors++; continue; }
+
+        if (S_ISDIR( st.st_mode ) && depth > 0)
+        {
+            if (mythic_prune_keep_tree( path, depth - 1 ) > 0) survivors++;
+            else if (rmdir( path ) != 0) survivors++;   /* non-empty or denied */
+            else LOG( "keep-prune: rmdir %{public}s", path );
+        }
+        else if (S_ISREG( st.st_mode ) && !strcmp( ent->d_name, ".keep" ))
+        {
+            if (unlink( path ) != 0) survivors++;
+            else LOG( "keep-prune: unlink %{public}s", path );
+        }
+        else survivors++;                   /* anything real keeps the dir alive */
+    }
+    closedir( d );
+    return survivors;
+}
+
+static void mythic_undo_appdata_skeleton(NSString *prefix)
+{
+    NSString *users = [prefix stringByAppendingPathComponent:@"drive_c/users"];
+    NSArray *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:users error:nil];
+    for (NSString *user in names)
+    {
+        NSString *appdata = [NSString stringWithFormat:@"%@/%@/AppData", users, user];
+        /* depth 6 covers Roaming/<Vendor>/<Product>/<...> comfortably; the
+         * recursion is bounded so a symlink loop can't run away. */
+        for (NSString *leaf in @[ @"Roaming", @"LocalLow", @"Local" ])
+        {
+            NSString *path = [appdata stringByAppendingPathComponent:leaf];
+            if (mythic_prune_keep_tree( path.fileSystemRepresentation, 6 ) == 0)
+            {
+                if (rmdir( path.fileSystemRepresentation ) == 0)
+                    LOG( "keep-prune: rmdir %{public}s", path.UTF8String );
+            }
+        }
+    }
+}
+
+
 // Wine's main entry point (from ntdll unix loader.c, statically linked)
 extern void __wine_main(int argc, char *argv[]);
 
@@ -49,6 +131,60 @@ static pthread_t g_wine_thread;
 static volatile int g_wine_running = 0;
 static char *g_prefix_path = NULL;
 
+/***********************************************************************
+ *           mythic_seed_prefix_if_needed
+ *
+ * Extract the bundled prefix template on first launch and (re)create the
+ * dosdevices links. Idempotent: the .update-timestamp probe makes every call
+ * after the first a single stat().
+ *
+ * ml588 — MUST RUN BEFORE THE WINESERVER STARTS. This used to live inside
+ * wine_process_thread(), which starts ~2s AFTER wineserver_start(). On a fresh
+ * prefix that ordering silently destroyed the shipped registry: wineserver's
+ * init_registry() (server/main.c:268) found no system.reg, built an EMPTY
+ * registry, and its first save then overwrote the 3.7MB / 17,479-key file the
+ * template had just written -- ml587's device prefix was left with 24 keys.
+ * Everything registry-backed broke on a fresh install while a hand-maintained
+ * dev prefix kept working, which is why this hid for so long: no WinRT
+ * ActivatableClassId (Thumper aborts on RoGetActivationFactory for
+ * Windows.Gaming.Input.Gamepad), and no Fonts keys (the #61/#70 dwrite fix).
+ */
+void mythic_seed_prefix_if_needed(const char *prefix_path) {
+    @autoreleasepool {
+        if (!prefix_path) return;
+        NSString *prefix = [NSString stringWithUTF8String:prefix_path];
+        NSString *stamp = [prefix stringByAppendingPathComponent:@".update-timestamp"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        [fm createDirectoryAtPath:prefix withIntermediateDirectories:YES attributes:nil error:nil];
+
+        if (![fm fileExistsAtPath:stamp]) {
+            NSString *tgz = [[NSBundle mainBundle] pathForResource:@"prefix-template" ofType:@"tar.gz"];
+            if (!tgz) {
+                LOG("prefix-template.tar.gz missing from bundle!");
+            } else {
+                LOG("Seeding prefix from %{public}s", tgz.UTF8String);
+                if (mythic_extract_prefix_tgz(tgz.UTF8String, prefix_path) != 0) {
+                    LOG("prefix extraction FAILED");
+                } else {
+                    LOG("prefix seeded to %{public}s", prefix_path);
+                }
+            }
+        }
+
+        // (Re)create dosdevices/c: -> ../drive_c. The tarball omits
+        // dosdevices because Mac's z: -> / is wrong here.
+        NSString *dosdev = [prefix stringByAppendingPathComponent:@"dosdevices"];
+        [fm createDirectoryAtPath:dosdev withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *cLink = [dosdev stringByAppendingPathComponent:@"c:"];
+        [fm removeItemAtPath:cLink error:nil];
+        [fm createSymbolicLinkAtPath:cLink withDestinationPath:@"../drive_c" error:nil];
+
+        /* ml581: see mythic_undo_appdata_skeleton() above. */
+        mythic_undo_appdata_skeleton( prefix );
+    }
+}
+
 static void *wine_process_thread(void *arg) {
     @autoreleasepool {
         /* Perf: the guest main thread runs ON this pthread. Promote to
@@ -58,36 +194,11 @@ static void *wine_process_thread(void *arg) {
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
         LOG("Wine process thread started");
 
-        // Seed prefix from bundled template on first launch (Proton-style).
-        // The presence of .update-timestamp means wineboot has already run
-        // (either for real or via our pre-seed), so the ntdll-side
-        // run_wineboot will skip the launch path.
-        {
-            NSString *prefix = [NSString stringWithUTF8String:g_prefix_path];
-            NSString *stamp = [prefix stringByAppendingPathComponent:@".update-timestamp"];
-            NSFileManager *fm = [NSFileManager defaultManager];
-            if (![fm fileExistsAtPath:stamp]) {
-                NSString *tgz = [[NSBundle mainBundle] pathForResource:@"prefix-template" ofType:@"tar.gz"];
-                if (!tgz) {
-                    LOG("prefix-template.tar.gz missing from bundle!");
-                } else {
-                    LOG("Seeding prefix from %{public}s", tgz.UTF8String);
-                    if (mythic_extract_prefix_tgz(tgz.UTF8String, g_prefix_path) != 0) {
-                        LOG("prefix extraction FAILED");
-                    } else {
-                        LOG("prefix seeded to %{public}s", g_prefix_path);
-                    }
-                }
-            }
-
-            // (Re)create dosdevices/c: -> ../drive_c. The tarball omits
-            // dosdevices because Mac's z: -> / is wrong here.
-            NSString *dosdev = [prefix stringByAppendingPathComponent:@"dosdevices"];
-            [fm createDirectoryAtPath:dosdev withIntermediateDirectories:YES attributes:nil error:nil];
-            NSString *cLink = [dosdev stringByAppendingPathComponent:@"c:"];
-            [fm removeItemAtPath:cLink error:nil];
-            [fm createSymbolicLinkAtPath:cLink withDestinationPath:@"../drive_c" error:nil];
-        }
+        /* ml588: seeding itself now happens in wineserver_start(), BEFORE the
+         * server loads the registry. Kept here as a safety net for any path
+         * that reaches Wine without going through wineserver_start() — the
+         * stamp probe makes it a no-op stat once the prefix exists. */
+        mythic_seed_prefix_if_needed(g_prefix_path);
 
         // Set environment for Wine
         setenv("WINEPREFIX", g_prefix_path, 1);

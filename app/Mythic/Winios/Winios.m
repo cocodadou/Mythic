@@ -119,6 +119,32 @@ static unsigned winios_resident_mb(void) {
 }
 
 
+/* ml526: startup phase timeline.
+ *
+ * Steam takes ~33s from the desktop's first present to the login window, and we
+ * could only account for it in coarse chunks pieced together from Steam's own
+ * cumulative logs. mythic-log cannot time anything on its own: its
+ * `[HH:MM:SS.mmm]` prefixes stop after the boot phase, and `[HEARTBEAT]` goes to
+ * os_log only (0 hits in mythic-log). The only way to bound a run at all was the
+ * last `[footprint] cycle=N` × 2s — which is 2s-granular and says nothing about
+ * what happened in between.
+ *
+ * So: one monotonic origin, stamped at the first call, and a line per milestone.
+ * Callable from Swift, from ntdll-unix (same Mach-O), and from here. Passive —
+ * it changes no behaviour, so it can ship alongside an experiment without
+ * violating one-variable-per-run. */
+static double wph_t0;
+static pthread_mutex_t wph_lock = PTHREAD_MUTEX_INITIALIZER;
+void winios_phase(const char *name)
+{
+    double now = winios_now_mono(), first;
+    pthread_mutex_lock( &wph_lock );
+    if (wph_t0 == 0.0) wph_t0 = now;
+    first = wph_t0;
+    pthread_mutex_unlock( &wph_lock );
+    dprintf(STDERR_FILENO, "[phase] %-22s t+%7.3fs rev=ml526\n", name ? name : "(null)", now - first);
+}
+
 /* ml522: is the debugger relationship still alive?
  *
  * ⚠️ REPLACES ml521's mmap(MAP_JIT)+mprotect(PROT_EXEC) probe, which was a
@@ -345,10 +371,62 @@ void winios_pDestroyWindow(HWND hwnd) {
 }
 
 UINT winios_pShowWindow(HWND hwnd, INT cmd, RECT *rect, UINT swp) {
-    /* Returning 0 means "we didn't override the swp flags — let Wine
-     * use its default behavior." Plus the rect already came from
-     * win32u's calculations. No-op for now. */
-    return 0;
+    /* ml528 (#86 VARIANCE): the sentinel for "we did not override the swp
+     * flags" is ~0, NOT 0. This returned 0 — and 0 is a perfectly valid flag
+     * word meaning "no flags at all", so win32u took it literally and threw
+     * away everything show_window() had just computed.
+     *
+     *   win32u/window.c:4842
+     *     else if ((new_swp = user_driver->pShowWindow(hwnd, cmd, &newPos, swp)) == ~0)
+     *     { ... else new_swp = swp; }        <- only reached when we return ~0
+     *     swp = new_swp;
+     *     NtUserSetWindowPos( hwnd, HWND_TOP, ..., swp );
+     *
+     * and for the case that matters:
+     *   case SW_SHOW:  swp |= SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE;
+     *
+     * So every ShowWindow that reached this hook lost SWP_SHOWWINDOW, and the
+     * window was moved/resized but never made visible. Measured directly on
+     * the Steam login popup — identical rect, ex-style, thread and SetWindowPos
+     * traffic in a working and a failing run, differing in exactly one bit:
+     *   fail: 0x1010a "Sign in to Steam" style=86ca0000 vis=0
+     *   ok:   0x1010a "Sign in to Steam" style=96ca0000 vis=1   (0x10000000 = WS_VISIBLE)
+     * No WS_VISIBLE => no [surf-create] for the hwnd => zero presents => nothing
+     * on screen, while Steam's own log happily reports PopupHTMLWindow and
+     * BrowserReady:131073.
+     *
+     * ⚠️ It is intermittent rather than total because there are paths that never
+     * consult us: `if (IsRectEmpty(&newPos)) new_swp = swp;` skips the driver
+     * entirely, and a window created already-WS_VISIBLE or shown by a later
+     * SetWindowPos carrying SWP_SHOWWINDOW never comes through here.
+     *
+     * ~0 is what nulldrv_ShowWindow returns (driver_ios.c:1340), i.e. this is
+     * now behaviour-identical to having no hook at all — which is what the
+     * original comment intended.
+     *
+     * ml529: log the hook ITSELF. The ml528 analysis INFERRED whether this ran
+     * by looking for a `[win-pos] flags=00000000` (the swp=0 signature) and
+     * found none — but `[win-pos]` only logs `n <= 200 || n % 128 == 0`, and the
+     * login window's events land at #190-200, so a call just past the cap would
+     * be invisible. Inferring a probe's coverage instead of measuring it is how
+     * that analysis went wrong; this answers it directly.
+     *
+     * Also logs whether the window is already WS_VISIBLE-bound for the given
+     * cmd, so a run that freezes with a dead cursor can be checked against the
+     * activation theory: swp=0 carried neither SWP_NOACTIVATE nor SWP_NOZORDER
+     * while NtUserSetWindowPos is called with HWND_TOP, so the old code would
+     * ACTIVATE and RAISE an invisible window — an input sink that would look
+     * exactly like "desktop frozen, cursor gone, logs still moving". */
+    {
+        static volatile int sw_n;
+        int n = __sync_add_and_fetch( &sw_n, 1 );
+        if (n <= 64 || (n % 64) == 0)
+            dprintf( STDERR_FILENO,
+                     "[show-win] #%d hwnd=%p cmd=%d swp_in=%08x -> returning ~0 "
+                     "(pre-ml528 returned 0, which destroyed SWP_SHOWWINDOW) rev=ml529\n",
+                     n, hwnd, cmd, (unsigned)swp );
+    }
+    return ~0u;
 }
 
 void winios_pWindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
@@ -820,6 +898,59 @@ static void winios_dump_surface_png(HWND hwnd, NSData *data, int sw, int sh, int
     });
 }
 
+/* ml536: dump Chromium's SOURCE bitmap, straight from dibdrv_PutImage.
+ *
+ * The paired surfdump is written from the window surface AFTER the blit. Having
+ * both lets one offline comparison answer what five srcwatch iterations could
+ * not: whether the displaced panel is already present in Chromium's input, or
+ * appears only in our output.
+ *
+ * Deliberately reuses winios_dump_surface_named, so both PNGs are produced by
+ * the identical encoder — the only difference between them is the buffer, which
+ * is the whole point. Bounded and gated on MYTHIC_DUMP_SURFACES so it costs
+ * nothing unless we are hunting. */
+/* ml537: the src dump and the surface dump must be PAIRED, or the comparison
+ * is worthless. They fire at different points — src at blit time from
+ * dibdrv_PutImage, surface at flush time from winios_surface_present, gated by
+ * its own independent MYTHIC_SURF_SEQ burst logic — so an unpaired src-003 and
+ * seq-... could easily be different FRAMES, and any difference between them
+ * would be frame-to-frame change rather than corruption. That would have looked
+ * exactly like a finding.
+ *
+ * So: a src dump arms `wph_pair`, and the very next present of any window dumps
+ * its surface under the SAME pair number. That is the tightest coupling
+ * available from these two call sites.
+ * ⚠️ Still not atomic — more than one blit can land between presents, so the
+ * surface may reflect a later blit than the src. Treat a difference as a lead,
+ * not proof, unless the src is clean and the surface is grossly displaced. */
+static volatile int wph_pair;          /* pair id armed by a src dump, 0 = none */
+static volatile int wph_pair_n;
+
+void winios_dump_srcbits(const void *bits, int w, int h, int stride) {
+    static int on = -1;
+    if (on < 0) on = getenv("MYTHIC_DUMP_SURFACES") != NULL;
+    if (!on || !bits || w <= 0 || h <= 0 || stride < w * 4) return;
+    if (wph_pair) return;              /* a pair is already awaiting its surface */
+    /* ml542: was 12. Sample size is now the binding constraint on the render
+     * hunt: 9 captured frames yielded exactly ONE clear instance of the defect
+     * (adjacent tiles carrying duplicate content), which is too thin to say
+     * whether the duplication is always +1 tile and always in the same
+     * direction. 120 SRC frames is ~1.2 MB of PNG — nothing against a 4096 MB
+     * jetsam ceiling — and the offline tile-provenance classifier scores a whole
+     * run in seconds. */
+    if (wph_pair_n >= 120) return;
+    @autoreleasepool {
+        int id = ++wph_pair_n;
+        NSData *d = [NSData dataWithBytes:bits length:(size_t)stride * h];
+        winios_dump_surface_named(d, w, h, stride,
+            [NSString stringWithFormat:@"pair-%03d-SRC-%dx%d.png", id, w, h]);
+        dprintf(STDERR_FILENO,
+                "[srcdump] pair=%03d SRC %dx%d stride=%d bits=%p — awaiting surface rev=ml537\n",
+                id, w, h, stride, bits);
+        wph_pair = id;                 /* arm: next present completes the pair */
+    }
+}
+
 /* Called from winios_surface_flush (wine thread) with the surface's
  * whole DIB. Copy immediately — `bits` is only valid for this call. */
 void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
@@ -828,6 +959,18 @@ void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
     NSData *data = [NSData dataWithBytes:bits length:(size_t)stride * sh];
     static int dumpSurf = -1;
     if (dumpSurf < 0) dumpSurf = getenv("MYTHIC_DUMP_SURFACES") != NULL;
+    /* ml537: complete an armed src/surface pair with the FIRST present after the
+     * blit, so the two PNGs are as close to the same frame as these call sites
+     * allow. Named identically apart from SRC/SURF. */
+    if (dumpSurf && wph_pair) {
+        int id = wph_pair;
+        wph_pair = 0;
+        winios_dump_surface_named(data, sw, sh, stride,
+            [NSString stringWithFormat:@"pair-%03d-SURF-hwnd%p-%dx%d.png", id, hwnd, sw, sh]);
+        dprintf(STDERR_FILENO,
+                "[srcdump] pair=%03d SURF hwnd=%p %dx%d stride=%d — pair COMPLETE rev=ml537\n",
+                id, hwnd, sw, sh, stride);
+    }
     if (dumpSurf) winios_dump_surface_png(hwnd, data, sw, sh, stride);
 
     /* ml493: PER-HWND accounting. The counter used to be global, so a

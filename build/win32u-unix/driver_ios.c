@@ -471,7 +471,10 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
     {
         static unsigned pos_n;
         unsigned n = ++pos_n;
-        if (n <= 200 || (n % 128) == 0)
+        /* ml529: 200 was too tight — the Steam login popup's events land at
+         * #190-200, i.e. exactly where the log ran out, which made a
+         * swp=0 signature indistinguishable from absence. */
+        if (n <= 1200 || (n % 128) == 0)
         {
             const RECT *v = &new_rects->visible;
             dprintf( 2, "[win-pos] #%u hwnd=%p after=%p flags=%08x vis={%d,%d,%d,%d} "

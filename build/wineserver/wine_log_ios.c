@@ -37,7 +37,13 @@ void ws_log(const char *fmt, ...)
     /* os_log removed: hundreds of messages/sec fill the shared buffer,
      * blocking the main thread RunLoop and causing iOS SIGKILL.
      * File log + UI callback are sufficient. */
-    wine_ui_log(buf);
+    /* ml573: ws_log_quiet was declared in this file and in the header and then
+     * NEVER READ — the UI callback ran unconditionally, so "quiet" silenced
+     * nothing. That matters beyond noise: wine_ui_log crosses into Swift and
+     * allocates, so every ws_log call pulls the host allocator into paths like
+     * the Mach exception thread. Honouring the flag makes it a usable A/B for
+     * the libsystem_malloc corruption (file logging keeps working either way). */
+    if (!ws_log_quiet) wine_ui_log(buf);
     pthread_mutex_lock(&g_wineserver_log_mutex);
     if (g_wineserver_log_file) {
         struct timeval tv;

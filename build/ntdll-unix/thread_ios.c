@@ -1111,6 +1111,23 @@ static void contexts_from_server( CONTEXT *context, struct context_data server_c
  */
 static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
 {
+    /* iOS-Mythic ml558: a NATIVE (non-wine) thread can reach here.
+     *
+     * ml557 died exactly this way: a native thread faulted, the [fault-stuck]
+     * breaker diverted it to abort_thread -> here, NtCurrentTeb() was NULL, and
+     * `ntdll_get_thread_data()->alert_fd` faulted at 0x394. That fault storms,
+     * the breaker diverts to abort_thread AGAIN, and we recurse until the stack
+     * is gone -- 5,000+ iterations, sp walking down ~0x70 each time. A thread
+     * with no wine TEB owns no wine fds, so there is simply nothing to close;
+     * exiting quietly is both correct and the only way out of the loop. */
+    if (!NtCurrentTeb())
+    {
+        static unsigned long noteb_n;
+        if (++noteb_n <= 8)
+            dprintf(2, "[pthread-exit] NO WINE TEB (native thread) — closing nothing, "
+                       "exiting cleanly (n=%lu) rev=ml558\n", noteb_n);
+        pthread_exit( UIntToPtr(status) );
+    }
     close( ntdll_get_thread_data()->alert_fd );
     close( ntdll_get_thread_data()->wait_fd[0] );
     close( ntdll_get_thread_data()->wait_fd[1] );
@@ -1531,6 +1548,12 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
         free( objattr );
         return STATUS_TOO_MANY_OPENED_FILES;
     }
+    {
+        /* ml586 fd-ownership trace (ledger lives in server_ios.c) */
+        extern void ios_fdt_reg_request_pipe( int rd, int wr, void *peb );
+        extern void *ios_jit_current_peb(void);
+        ios_fdt_reg_request_pipe( request_pipe[0], request_pipe[1], ios_jit_current_peb() );
+    }
     wine_server_send_fd( request_pipe[0] );
 
     if (!access) access = THREAD_ALL_ACCESS;
@@ -1547,6 +1570,10 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
             *handle = wine_server_ptr_handle( reply->handle );
             tid = reply->tid;
         }
+        {
+            extern void ios_fdt_mark_closed( int fd );
+            ios_fdt_mark_closed( request_pipe[0] );  /* expected handoff close */
+        }
         close( request_pipe[0] );
     }
     SERVER_END_REQ;
@@ -1554,6 +1581,10 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     free( objattr );
     if (status)
     {
+        {
+            extern void ios_fdt_mark_closed( int fd );
+            ios_fdt_mark_closed( request_pipe[1] );
+        }
         close( request_pipe[1] );
         return status;
     }
@@ -1602,6 +1633,10 @@ done:
     if (status)
     {
         NtClose( *handle );
+        {
+            extern void ios_fdt_mark_closed( int fd );
+            ios_fdt_mark_closed( request_pipe[1] );
+        }
         close( request_pipe[1] );
         return status;
     }
@@ -1891,6 +1926,46 @@ NTSTATUS WINAPI NtAlertThread( HANDLE handle )
 }
 
 
+#include <dlfcn.h>
+
+extern int ios_thread_registry_count(void);
+extern uintptr_t ios_thread_registry_teb(int i);
+extern thread_t ios_thread_registry_mach(int i);
+
+/* ml559 helpers for [xterm-where]: resolve a wine thread HANDLE to the Mach
+ * thread we registered for it. The registry is keyed by mach_thread and stores
+ * the TEB, and the TEB carries ClientId.UniqueThread — so handle -> tid (via the
+ * server) -> registry scan -> mach_thread. Lock-free; read-only. */
+static BOOL ios_terminate_is_self( HANDLE handle )
+{
+    return handle == GetCurrentThread() || handle == 0;
+}
+
+static thread_t ios_mach_thread_for_handle( HANDLE handle )
+{
+    DWORD tid = 0;
+    int i, count;
+
+    SERVER_START_REQ( get_thread_info )
+    {
+        req->handle = wine_server_obj_handle( handle );
+        req->access = THREAD_QUERY_LIMITED_INFORMATION;
+        if (!wine_server_call( req )) tid = reply->tid;
+    }
+    SERVER_END_REQ;
+    if (!tid) return 0;
+
+    count = ios_thread_registry_count();
+    for (i = 0; i < count; i++)
+    {
+        uintptr_t teb = ios_thread_registry_teb( i );
+        if (teb && (DWORD)(ULONG_PTR)((TEB *)teb)->ClientId.UniqueThread == tid)
+            return ios_thread_registry_mach( i );
+    }
+    return 0;
+}
+
+
 /******************************************************************************
  *              NtTerminateThread  (NTDLL.@)
  */
@@ -1898,6 +1973,46 @@ NTSTATUS WINAPI NtTerminateThread( HANDLE handle, LONG exit_code )
 {
     unsigned int ret;
     BOOL self;
+
+    /* iOS-Mythic ml559 (#74 successor, DISCRIMINATOR — not a fix):
+     *
+     * ml558 died on a `BRK #1` (__builtin_trap) inside a system library, on a
+     * thread we do not own, immediately after FEX logged "[thr-term] CROSS-TERM
+     * tid=0x260 — victim heap not finalized". The tempting story is "we killed a
+     * thread inside a libsystem critical section, so the next system call
+     * trapped". That story is UNPROVEN, and asserting exactly this kind of
+     * plausible chain has been wrong three times tonight, so this DECIDES it:
+     *
+     *   victim PC inside a SYSTEM image -> mechanism supported
+     *   victim PC in guest/JIT code     -> mechanism refuted, look elsewhere
+     *
+     * Must sample BEFORE terminate_thread — afterwards the victim can already be
+     * gone and thread_get_state would report nothing (or another thread's state).
+     * Prints on every cross-thread kill including the boring ones, so "nothing
+     * dangerous was killed" is a real observation rather than silence. */
+    if (!ios_terminate_is_self( handle ))
+    {
+        static unsigned long xterm_n;
+        thread_t vt = ios_mach_thread_for_handle( handle );
+        if (++xterm_n <= 24 && vt)
+        {
+            arm_thread_state64_t vs;
+            mach_msg_type_number_t vc = ARM_THREAD_STATE64_COUNT;
+            if (thread_get_state( vt, ARM_THREAD_STATE64, (thread_state_t)&vs, &vc ) == KERN_SUCCESS)
+            {
+                uintptr_t vpc = (uintptr_t)arm_thread_state64_get_pc( vs );
+                Dl_info di;
+                int ok = dladdr( (void *)vpc, &di );
+                dprintf( 2, "[xterm-where] #%lu victim pc=0x%llx %s`%s+0x%llx %s rev=ml559\n",
+                         xterm_n, (unsigned long long)vpc,
+                         ok && di.dli_fname ? di.dli_fname : "?",
+                         ok && di.dli_sname ? di.dli_sname : "?",
+                         ok && di.dli_saddr ? (unsigned long long)(vpc - (uintptr_t)di.dli_saddr) : 0ull,
+                         ok ? "<== INSIDE A MACH-O IMAGE"
+                            : "(no image — guest/JIT code; system-lock theory refuted for this kill)" );
+            }
+        }
+    }
 
     SERVER_START_REQ( terminate_thread )
     {

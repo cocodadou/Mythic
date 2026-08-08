@@ -97,3 +97,9 @@ research/
 *.bak
 photorec.se2
 .DS_Store
+
+# Build/deploy artifacts (regenerable; keep them out of history)
+*.ipa
+clean-prefix/
+build/x64-tests/asmconf_gen/
+build/x64-tests/asmconf_obj/

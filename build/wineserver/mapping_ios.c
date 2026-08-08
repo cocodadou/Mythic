@@ -324,7 +324,34 @@ int grow_file( int unix_fd, file_pos_t new_size )
     /* this should work around ftruncate implementations that can't extend files */
     if (pwrite( unix_fd, &zero, 1, size ) != -1)
     {
-        ftruncate( unix_fd, size );
+        /* iOS-Mythic ml563: VERIFY the file actually reached the requested size.
+         *
+         * NOTE (correcting ml562): a discarded ftruncate CANNOT explain a short
+         * file. The pwrite above lands at offset `size`, extending the file to
+         * size+1; ftruncate then trims one byte. So a failed ftruncate leaves the
+         * file one byte too LONG, never short. This check is hygiene, not the
+         * explanation for the 0x10000/0x20000 backing files ml561 found.
+         *
+         * Treat EVERY way of not reaching the requested size as failure — a short
+         * file must never be handed out as a full-size section, because the client
+         * will map the whole view and SIGBUS past EOF. errno is saved immediately;
+         * printing it after later successful calls shows a stale value. */
+        int tr = ftruncate( unix_fd, size );
+        int saved_errno = errno;
+        struct stat vst;
+        int fs = fstat( unix_fd, &vst );
+        if (tr == -1 || fs == -1 || (file_pos_t)vst.st_size != new_size)
+        {
+            static unsigned long shortn;
+            if (++shortn <= 64)
+                ws_log("[srv-grow] SHORT FILE fd=%d requested=%llu actual=%lld "
+                       "ftruncate=%d fstat=%d errno=%d — refusing rev=ml563\n",
+                       unix_fd, (unsigned long long)new_size,
+                       fs == 0 ? (long long)vst.st_size : -1LL, tr, fs, saved_errno);
+            errno = saved_errno;
+            file_set_error();
+            return 0;
+        }
         return 1;
     }
     file_set_error();
@@ -1116,6 +1143,12 @@ static struct mapping *create_mapping( struct object *root, const struct unicode
         if ((unix_fd = create_temp_file( mapping->size )) == -1) goto error;
         if (!(mapping->fd = create_anonymous_fd( &mapping_fd_ops, unix_fd, &mapping->obj,
                                                  FILE_SYNCHRONOUS_IO_NONALERT ))) goto error;
+        /* ml571: caching RESTORED. The ml570 A/B test disabled this to prove the
+         * stale-fd theory — [map-eof] went from 2-every-run to 0 and the Steam
+         * login page rendered correctly for the first time. The cache itself was
+         * never the problem; its KEYING was (thread-local for a per-process
+         * object). server_ios.c is now PEB-keyed, so caching is safe again and we
+         * get the server round-trip back. */
         allow_fd_caching( mapping->fd );
     }
     return mapping;

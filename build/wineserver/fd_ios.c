@@ -1046,6 +1046,17 @@ static signed char ios_fd_is_inet( int user, int fd )
         memset( nfd + cache_size, 0xff, (newsize - cache_size) * sizeof(*nfd) );
         cache_fd = nfd; cache_val = nval; cache_size = newsize;
     }
+    /* ml579: CACHE RESTORED. The ml576 A/B ran 30.8M classifications across two
+     * runs and found the cache would have been wrong TWICE, with ZERO of the
+     * harmful direction (real INET misread as pipe). The stale-(user,fd) theory
+     * is refuted, so the bypass has done its job — and it was expensive: ~188,000
+     * getsockname() calls per second on the server's hot poll path. Steam gives
+     * each CM ping exactly 1000 ms, so starving the poll loop that hard can eat
+     * the deadline before the encrypted /cmping/ request is even written.
+     *
+     * The missing invalidation is still a latent correctness bug (nothing clears
+     * cache_fd/cache_val when add_poll_user/remove_poll_user recycle a slot); it
+     * simply is not the network failure. Fix it on merit, not as a network lead. */
     if (cache_fd[user] != fd)
     {
         struct sockaddr_storage ss;
@@ -1097,6 +1108,18 @@ void main_loop(void)
     {
         static int ios_iter = 0;
         static int ios_events_fired = 0;
+        /* ml585 poll-loop census. AGGREGATE ONLY — emitted at the existing
+         * 50k-iteration heartbeat, never per event, so the probe cannot
+         * perturb the loop it measures (ml582 ran 2,935 iter/s; a per-event
+         * log would dominate the very timing in question). */
+        static unsigned long long ios_c_inet = 0;    /* real poll() dispatches      */
+        static unsigned long long ios_c_synin = 0;   /* synthetic POLLIN            */
+        static unsigned long long ios_c_synout = 0;  /* synthetic POLLOUT           */
+        static unsigned long long ios_c_semret = 0;  /* wake-sem returned EARLY     */
+        static unsigned long long ios_c_semto = 0;   /* wake-sem timed out (slept)  */
+        static unsigned long long ios_late_max_us = 0;  /* worst timer lateness     */
+        static int ios_syn_top_user = -1, ios_syn_top_n = 0;  /* noisiest poll user */
+        static unsigned ios_syn_per_user[64];        /* rolling, low 6 bits of user */
         static int ios_post_inject = 0;  /* trace first N iters after injection */
         static int ios_client_fd_start = -1;  /* first poll index added by injection */
         unsigned long long ios_next_timer_ns = ~0ull;  /* ns until next timer (deadline-aware sleep) */
@@ -1139,6 +1162,13 @@ void main_loop(void)
             if (ios_iter % 50000 == 0)
             {
                 ws_log("[wineserver-fd] iter=%d act=%d nb=%d ef=%d", ios_iter, active_users, nb_users, ios_events_fired);
+                ws_log("[srv-poll] iter=%d inet=%llu synIN=%llu synOUT=%llu semEarly=%llu semSlept=%llu "
+                       "lateMax=%lluus topUser=%d/%d",
+                       ios_iter, ios_c_inet, ios_c_synin, ios_c_synout,
+                       ios_c_semret, ios_c_semto, ios_late_max_us,
+                       ios_syn_top_user, ios_syn_top_n);
+                memset( ios_syn_per_user, 0, sizeof(ios_syn_per_user) );
+                ios_syn_top_user = -1; ios_syn_top_n = 0;
             }
 
             /* [srv-queues] desktop-mode diagnostic: dump every thread's
@@ -1158,8 +1188,15 @@ void main_loop(void)
                     if (now.tv_sec - qdump_last.tv_sec >= 10)
                     {
                         extern void ios_dump_msg_queues(void);
+                        extern void ios_dump_stuck_waits(void);
                         qdump_last = now;
                         ios_dump_msg_queues();
+                        /* ml585: name the object behind any wait that has
+                         * been outstanding >5s (see queue_ios.c). Rides the
+                         * existing 10s cadence — no new timer, no new thread,
+                         * and NOT a synchronous all-thread stack sample,
+                         * which would perturb the scheduler we are measuring. */
+                        ios_dump_stuck_waits();
                     }
                 }
             }
@@ -1195,15 +1232,65 @@ void main_loop(void)
              * pickup latency: the 55-vs-60 FPS gap. */
             {
                 unsigned long long sleep_ns = 1000000ull;
+                /* ml585: timer lateness = how long past a due timer's deadline
+                 * we actually resumed. This is the number that matters for the
+                 * 77s Steam stalls — a starved loop shows up here even when the
+                 * event counts look ordinary. Measured around the sleep only. */
+                static mach_timebase_info_data_t lt_tb;
+                unsigned long long lt_t0, lt_slept_ns;
+                if (!lt_tb.denom) mach_timebase_info( &lt_tb );
+                lt_t0 = mach_absolute_time();
                 if (ios_next_timer_ns < sleep_ns) sleep_ns = ios_next_timer_ns;
                 if (sleep_ns > 0)
                 {
-                    if (ios_srv_wake_sem)
+                    /* ml585 A/B, default OFF. MYTHIC_SRV_NOSEM=1 ignores the
+                     * wake semaphore and sleeps the computed duration outright.
+                     *
+                     * Why: semaphore_signal() is a COUNTING operation and
+                     * ios_srv_wake_sem_signal() (line ~42) fires on every
+                     * client request with no coalescing and no drain. Once the
+                     * signal rate exceeds the loop rate the count never reaches
+                     * zero, semaphore_timedwait returns instantly forever, and
+                     * the loop stops sleeping — ml584 measured 2,935 iter/s
+                     * against a 1 ms floor that caps it at ~1,000/s.
+                     *
+                     * This gate changes ONLY the wait mechanism. sleep_ns is
+                     * computed identically above, timers are processed by the
+                     * same get_next_timeout() call, and no poll/readiness
+                     * semantics change — so a difference between the two runs
+                     * is attributable to the wake path alone. We still DRAIN
+                     * the pending count so the backlog can't leak into a later
+                     * toggle or mask the effect. */
+                    static int nosem = -1;
+                    if (nosem < 0)
+                    {
+                        const char *e = getenv("MYTHIC_SRV_NOSEM");
+                        nosem = (e && *e == '1');
+                        ws_log("[srv-poll] MYTHIC_SRV_NOSEM=%d (%s wake path)",
+                               nosem, nosem ? "FIXED-SLEEP A/B" : "default semaphore");
+                    }
+                    if (ios_srv_wake_sem && !nosem)
                     {
                         mach_timespec_t wts;
+                        kern_return_t wkr;
                         wts.tv_sec = (unsigned int)(sleep_ns / 1000000000ull);
                         wts.tv_nsec = (int)(sleep_ns % 1000000000ull);
-                        semaphore_timedwait( ios_srv_wake_sem, wts );
+                        wkr = semaphore_timedwait( ios_srv_wake_sem, wts );
+                        if (wkr == KERN_OPERATION_TIMED_OUT) ios_c_semto++;
+                        else ios_c_semret++;
+                    }
+                    else if (ios_srv_wake_sem && nosem)
+                    {
+                        static mach_timebase_info_data_t tb;
+                        mach_timespec_t z = { 0, 0 };
+                        unsigned long long dl;
+                        /* drain every queued signal, then sleep the full tick */
+                        while (semaphore_timedwait( ios_srv_wake_sem, z ) == KERN_SUCCESS)
+                            ios_c_semret++;
+                        if (!tb.denom) mach_timebase_info( &tb );
+                        dl = mach_absolute_time() + sleep_ns * tb.denom / tb.numer;
+                        mach_wait_until( dl );
+                        ios_c_semto++;
                     }
                     else
                     {
@@ -1214,6 +1301,12 @@ void main_loop(void)
                                  + sleep_ns * ios_tb.denom / ios_tb.numer;
                         mach_wait_until( deadline );
                     }
+                }
+                lt_slept_ns = (mach_absolute_time() - lt_t0) * lt_tb.numer / lt_tb.denom;
+                if (ios_next_timer_ns != ~0ull && lt_slept_ns > ios_next_timer_ns)
+                {
+                    unsigned long long late_us = (lt_slept_ns - ios_next_timer_ns) / 1000ull;
+                    if (late_us > ios_late_max_us) ios_late_max_us = late_us;
                 }
             }
             set_current_time();
@@ -1260,7 +1353,7 @@ void main_loop(void)
                             int u = rp_user[k];
                             if (!rp[k].revents) continue;
                             if (pollfd[u].fd != rp[k].fd) continue;
-                            ios_events_fired++;
+                            ios_events_fired++; ios_c_inet++;
                             fd_poll_event( poll_users[u], rp[k].revents );
                         }
                     }
@@ -1273,7 +1366,7 @@ void main_loop(void)
                         int u = rp_user[k];
                         if (!rp[k].revents) continue;
                         if (pollfd[u].fd != rp[k].fd) continue;  /* user removed mid-dispatch */
-                        ios_events_fired++;
+                        ios_events_fired++; ios_c_inet++;
                         fd_poll_event( poll_users[u], rp[k].revents );
                     }
                 }
@@ -1310,6 +1403,7 @@ void main_loop(void)
                             /* Client fd (socketpair/pipe from injection) —
                              * always try, ioctl broken for AF_UNIX on iOS */
                             revents |= POLLIN;
+                            ios_c_synin++;
                         }
                         else
                         {
@@ -1321,11 +1415,20 @@ void main_loop(void)
                     }
 
                     if (pollfd[i].events & POLLOUT)
+                    {
                         revents |= POLLOUT;
+                        ios_c_synout++;
+                    }
 
                     if (revents)
                     {
+                        unsigned slot = (unsigned)i & 63;
                         ios_events_fired++;
+                        if (++ios_syn_per_user[slot] > (unsigned)ios_syn_top_n)
+                        {
+                            ios_syn_top_n = (int)ios_syn_per_user[slot];
+                            ios_syn_top_user = i;
+                        }
                         fd_poll_event( poll_users[i], revents );
                     }
                 }
@@ -2424,6 +2527,18 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
                 set_error( STATUS_OBJECT_NAME_COLLISION );
                 goto error;
             }
+            /* ml563: the OTHER shrink path — O_TRUNC. ml562 only covered
+             * set_fd_eof(), so "no shrink logged" would have meant "not covered"
+             * rather than "did not happen". Log dev+ino so a short section file
+             * can be matched to the truncation that shortened it. */
+            if (st.st_size > 0)
+            {
+                static unsigned long trunc0n;
+                if (++trunc0n <= 64)
+                    ws_log("[srv-trunc0] O_TRUNC fd=%d dev=%llu ino=%llu %lld -> 0 rev=ml563\n",
+                           fd->unix_fd, (unsigned long long)st.st_dev,
+                           (unsigned long long)st.st_ino, (long long)st.st_size);
+            }
             ftruncate( fd->unix_fd, 0 );
         }
     }
@@ -3371,6 +3486,21 @@ static void set_fd_eof( struct fd *fd, file_pos_t eof )
             {
                 set_error( STATUS_USER_MAPPED_FILE );
                 return;
+            }
+        }
+        {
+            /* ml562: name every SHRINK of a file we may be backing a section with.
+             * ml561 showed section files that are short at map time; this says
+             * whether they were born short or truncated afterwards. */
+            struct stat bst;
+            if (!fstat( fd->unix_fd, &bst ) && (off_t)eof < bst.st_size)
+            {
+                static unsigned long shrinkn;
+                if (++shrinkn <= 64)
+                    ws_log("[srv-eof] SHRINK fd=%d dev=%llu ino=%llu %lld -> %lld rev=ml563\n",
+                           fd->unix_fd, (unsigned long long)bst.st_dev,
+                           (unsigned long long)bst.st_ino,
+                           (long long)bst.st_size, (long long)eof);
             }
         }
         if (ftruncate( fd->unix_fd, eof ) == -1) file_set_error();

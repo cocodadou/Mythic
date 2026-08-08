@@ -141,6 +141,16 @@ int wineserver_start(const char *prefix_path) {
 
     wine_log_msg("Starting wineserver with prefix: %s", prefix_path);
 
+    /* ml588: seed the prefix BEFORE the server thread starts. init_registry()
+     * runs within milliseconds of the thread launching, and if system.reg is
+     * not on disk by then the server builds an empty registry and its first
+     * save overwrites the template's (ml587: 17,479 keys -> 24). Seeding is
+     * idempotent, so this costs one stat() on every launch after the first. */
+    {
+        extern void mythic_seed_prefix_if_needed(const char *prefix_path);
+        mythic_seed_prefix_if_needed(prefix_path);
+    }
+
     g_wineserver_running = 1;
 
     /* 2026-07-04 perf: the wineserver thread used to be created at LOWERED

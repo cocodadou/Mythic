@@ -4300,3 +4300,133 @@ void ios_dump_msg_queues(void)
     }
     fflush( stderr );
 }
+
+/* ============================================================
+ * ml585: [srv-stuck] — resolve LONG-RUNNING waits to real objects.
+ *
+ * Companion to the in-flight wait registry in ntdll-unix/server_ios.c.
+ * A wait that never returns cannot be reported on exit, so the client
+ * publishes it on ENTRY; this walks that table and, for any wait older
+ * than the threshold, resolves each handle against the owning process's
+ * handle table and dumps the object.
+ *
+ * This is the direct question ml584 left open: explorer's shell thread
+ * (Wine tid 0024) sat in NtWaitForSingleObject under rpcrt4 -> combase at
+ * an identical sp 20s apart while its queue accumulated post=56 with
+ * QS_PAINT set. We know WHERE it waits; this names WHAT it waits on and
+ * whether that object is signalled.
+ *
+ * Safety: object_ops->signaled() takes an opaque wait_queue_entry that
+ * mutex_signaled and friends dereference, so it is NOT callable from
+ * here. ops->dump() is the server's own debug facility, takes no entry,
+ * and prints exactly the state we need (event.c:119 -> "Event manual=%d
+ * signaled=%d"). Reporting is rate-limited per (tid,handle) so a wedge
+ * that lasts minutes cannot flood the log it is being diagnosed in.
+ * ============================================================ */
+
+#define IOS_WAITREG_SLOTS 512
+struct ios_wait_entry
+{
+    volatile unsigned int  seq;
+    void                  *teb;
+    unsigned int           wine_tid;
+    unsigned long long     t0_ns;
+    unsigned int           flags;
+    long long              timeout;
+    int                    op;
+    int                    count;
+    unsigned int           handles[8];
+    void                  *ret_pc;
+};
+extern struct ios_wait_entry ios_wait_reg[IOS_WAITREG_SLOTS];
+
+struct ios_stuck_find { unsigned int tid; struct thread *found; };
+
+static int ios_stuck_match( struct process *process, void *arg )
+{
+    struct ios_stuck_find *f = arg;
+    struct thread *t;
+    LIST_FOR_EACH_ENTRY( t, &process->thread_list, struct thread, proc_entry )
+        if (t->id == f->tid) { f->found = t; return 1; }
+    return 0;
+}
+
+void ios_dump_stuck_waits(void)
+{
+    static int thresh_s = -1;
+    static unsigned reports;
+    struct timespec now;
+    unsigned long long now_ns;
+    int i;
+
+    if (thresh_s < 0)
+    {
+        const char *e = getenv("MYTHIC_STUCK_WAIT_SECS");
+        thresh_s = e && *e ? atoi(e) : 5;
+        if (thresh_s < 1) thresh_s = 1;
+    }
+    if (reports > 400) return;              /* hard ceiling for the run */
+
+    clock_gettime( CLOCK_MONOTONIC, &now );
+    now_ns = (unsigned long long)now.tv_sec * 1000000000ull + now.tv_nsec;
+
+    for (i = 0; i < IOS_WAITREG_SLOTS; i++)
+    {
+        struct ios_wait_entry *e = &ios_wait_reg[i];
+        unsigned int s0 = e->seq, s1;
+        struct ios_stuck_find f;
+        unsigned long long age_ms;
+        int h;
+
+        if (!(s0 & 1)) continue;            /* even => not in a wait */
+        if (!e->t0_ns || now_ns < e->t0_ns) continue;
+        age_ms = (now_ns - e->t0_ns) / 1000000ull;
+        if (age_ms < (unsigned long long)thresh_s * 1000ull) continue;
+
+        __sync_synchronize();
+        s1 = e->seq;
+        if (s1 != s0) continue;             /* torn read: it moved, skip */
+
+        reports++;
+        fprintf( stderr, "[srv-stuck] tid=%04x teb=%p age=%llums op=%d flags=%08x "
+                 "timeout=%lld alertable=%d nhandles=%d caller=%p\n",
+                 e->wine_tid, e->teb, age_ms, e->op, e->flags,
+                 (long long)e->timeout, !!(e->flags & SELECT_ALERTABLE),
+                 e->count, e->ret_pc );
+
+        f.tid = e->wine_tid; f.found = NULL;
+        enum_processes( ios_stuck_match, &f );
+        if (!f.found)
+        {
+            fprintf( stderr, "[srv-stuck]   (no server thread for tid %04x)\n", e->wine_tid );
+            continue;
+        }
+
+        for (h = 0; h < e->count && h < 8; h++)
+        {
+            struct object *obj = get_handle_obj( f.found->process, e->handles[h], 0, NULL );
+            if (!obj)
+            {
+                clear_error();
+                fprintf( stderr, "[srv-stuck]   h[%d]=%08x -> UNRESOLVABLE\n", h, e->handles[h] );
+                continue;
+            }
+            {
+                const WCHAR *name; data_size_t len = 0; unsigned int k;
+                fprintf( stderr, "[srv-stuck]   h[%d]=%08x obj=%p type=", h, e->handles[h], obj );
+                for (k = 0; k < obj->ops->type->name.len / sizeof(WCHAR); k++)
+                    fputc( (char)obj->ops->type->name.str[k], stderr );
+                name = get_object_name( obj, &len );
+                if (name && len)
+                {
+                    fprintf( stderr, " name=" );
+                    for (k = 0; k < len / sizeof(WCHAR); k++) fputc( (char)name[k], stderr );
+                }
+                fprintf( stderr, " waiters=%d state=", !list_empty( &obj->wait_queue ) );
+                obj->ops->dump( obj, 1 );   /* prints its own newline */
+            }
+            release_object( obj );
+        }
+    }
+    fflush( stderr );
+}

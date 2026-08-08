@@ -719,6 +719,55 @@ static void *ios_pool_warmer_thread( void *arg )
                             (unsigned long long)vmi.reusable >> 20, cycle);
                 }
             }
+            /* ml566: WHEN does the host malloc zone become corrupt?
+             *
+             * ml565 settled the mechanism: at the fatal trap the process had
+             * 868 MB of headroom and a 1 MB mach_vm_allocate SUCCEEDED, so the
+             * libsystem_malloc BRK is NOT out-of-memory — the zone is genuinely
+             * corrupt. wineserver's alloc_object is merely the next caller to
+             * walk a damaged free list; it is the victim, not the culprit.
+             *
+             * Knowing WHO corrupts it starts with knowing WHEN. malloc_zone_check
+             * walks and validates every zone, so the first cycle it fails brackets
+             * the damage to a 2-second window that can be read straight off the
+             * surrounding log. Note this whole app is ONE process: the zone is
+             * shared by our Swift/ObjC code, wine, wineserver, FEX, DXMT and any
+             * wild guest write, so the bracket is the only cheap way in.
+             *
+             * Self-calibrating: the first PASS is logged too, with its cost in ms.
+             * Without that, silence would be ambiguous between "heap healthy" and
+             * "probe never ran". If the cost turns out to be large we will see it
+             * immediately and can back the interval off. */
+            {
+                extern int malloc_zone_check( void *zone );
+                static int zone_bad, zone_announced;
+                if (!zone_bad)
+                {
+                    struct timeval t0, t1;
+                    int ok;
+                    gettimeofday( &t0, NULL );
+                    ok = malloc_zone_check( NULL );
+                    gettimeofday( &t1, NULL );
+                    {
+                        long ms = (t1.tv_sec - t0.tv_sec) * 1000
+                                + (t1.tv_usec - t0.tv_usec) / 1000;
+                        if (!ok)
+                        {
+                            zone_bad = 1;
+                            dprintf(2, "[zone-check] *** HOST MALLOC ZONE FIRST FAILED AT cycle=%u "
+                                       "(%ld ms) — corruption happened within the last ~2s; read the "
+                                       "log immediately above this line rev=ml566\n", cycle, ms);
+                        }
+                        else if (!zone_announced)
+                        {
+                            zone_announced = 1;
+                            dprintf(2, "[zone-check] armed and PASSING at cycle=%u (%ld ms per check) "
+                                       "rev=ml566\n", cycle, ms);
+                        }
+                    }
+                }
+            }
+
             /* ml359 WHERE does the footprint live? ml359 died at the kernel's
              * 4096MB high watermark (EXC_RESOURCE MEMORY/HWM) with internal at
              * 3043MB, and the totals above cannot attribute that to the pool
@@ -777,6 +826,45 @@ static void *ios_pool_warmer_thread( void *arg )
                         else b = B_OTHER;
                         band_dirty[b] += d;
                         band_res[b] += (unsigned long long)info.pages_resident << 14;
+                    }
+                    /* ml569: does the HOST MALLOC HEAP overlap memory we reserved?
+                     *
+                     * ml565-568 established the malloc BRK is real corruption, not OOM
+                     * (830-950 MB free, vm_allocate succeeds at the trap), and that the
+                     * trapping CALLER varies — sometimes alloc_object, sometimes wholly
+                     * inside libsystem_malloc — so whoever allocates next is just the
+                     * unlucky one, not the culprit. What does correlate, perfectly across
+                     * 14 runs, is FOOTPRINT: traps at 3145-3339 MB, never at 3015-3114.
+                     *
+                     * A wild write to a roughly fixed address explains that: inert while
+                     * the malloc heap is too small to reach it, fatal once the heap grows
+                     * over it. The cheapest version of that story is that WE map on top of
+                     * libmalloc's heap. The log already shows the converse happening
+                     * ([pool-va] ... INSIDE RX pool <== foreign map/unmap), so the address
+                     * spaces demonstrably interleave.
+                     *
+                     * Darwin tags malloc's own regions, so overlap is directly checkable.
+                     * Prints the first few offenders AND a per-cycle count, so "no overlap"
+                     * is a real negative rather than silence. */
+                    {
+                        unsigned t = info.user_tag;
+                        int is_malloc = (t == 1 || t == 2 || t == 3 || t == 4 ||
+                                         t == 6 || t == 7 || t == 8 || t == 9 || t == 11);
+                        const char *bn = NULL;
+                        if (prx && raddr >= prx && raddr < prx + pps)      bn = "JIT-POOL-RX";
+                        else if (prw && raddr >= prw && raddr < prw + pps) bn = "JIT-POOL-RW";
+                        else if (raddr < 0x1000000000ULL)                  bn = NULL; /* normal host */
+                        else if (raddr >= 0x7000000000ULL && raddr < 0x7400000000ULL) bn = "GUEST";
+                        else if (raddr >= 0x7400000000ULL && raddr < 0x7c00000000ULL) bn = "CEF-PA-POOL";
+                        else if (raddr >= 0x7c00000000ULL && raddr < 0x8000000000ULL) bn = "FEX-HOST";
+                        if (is_malloc && bn)
+                        {
+                            static unsigned long ovl;
+                            if (++ovl <= 12)
+                                dprintf(2, "[heap-overlap] MALLOC region 0x%llx+0x%llx tag=%u sits in "
+                                           "the %s band — we and libmalloc share this VA rev=ml569\n",
+                                        (unsigned long long)raddr, (unsigned long long)rsize, t, bn);
+                        }
                     }
                     if (d)
                     {
@@ -1986,6 +2074,57 @@ static volatile size_t ios_jit_tail_reserved = 0;
  * bounded and reuse is usually exact. */
 #define IOS_TAIL_CARVE_MAX 256
 static struct { size_t off; size_t size; int free; } ios_tail_carves[IOS_TAIL_CARVE_MAX];
+
+/* ml557 (#74 REGRESSION): is any thread's PC currently INSIDE this tail carve?
+ *
+ * ml438 made a MEM_RELEASE of a live tail EC-buffer carve mark it free for reuse,
+ * to stop the tail space leaking forever. But it marks the carve free WITHOUT
+ * asking whether a thread is still executing JIT code in it, and `tail REUSE`
+ * hands the same range straight back out to the next requester, which then
+ * compiles different code over it.
+ *
+ * ml556 caught exactly that: carve rx=0x1543f8000 size=0x1000000 was FREEd and
+ * REUSEd eight times, and the fatal fault landed at host pc 0x154d4008c — INSIDE
+ * that range — with garbage registers (base reg = 0x40 -> a NULL+0x40 atomic
+ * load). A thread was running in code that had been recycled underneath it.
+ *
+ * That also explains why the fatal site MOVES between runs (frame clear /
+ * PartitionAlloc refcount CHECK / NULL-this call): the victim depends on what
+ * happened to be compiled into the recycled range.
+ *
+ * Frees are rare (33-53 per run), so a full thread scan here costs nothing
+ * measurable. Refusing to free an occupied carve reinstates a BOUNDED leak —
+ * which is what ml438 set out to fix — but a leak is strictly better than
+ * executing recycled code, and the carve becomes freeable on the next release
+ * once the thread has left. */
+static int ios_tail_carve_occupied( const void *base, size_t size )
+{
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t count = 0, i;
+    uintptr_t lo = (uintptr_t)base, hi = lo + size;
+    mach_port_t self = mach_thread_self();
+    int occupied = 0;
+
+    if (task_threads( mach_task_self(), &threads, &count ) != KERN_SUCCESS)
+        return 0;                                  /* cannot tell -> old behaviour */
+    for (i = 0; i < count; i++)
+    {
+        arm_thread_state64_t st;
+        mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+        if (threads[i] != self &&
+            thread_get_state( threads[i], ARM_THREAD_STATE64,
+                              (thread_state_t)&st, &sc ) == KERN_SUCCESS)
+        {
+            uintptr_t pc = (uintptr_t)arm_thread_state64_get_pc( st );
+            if (pc >= lo && pc < hi) { occupied = 1; }
+        }
+        mach_port_deallocate( mach_task_self(), threads[i] );
+    }
+    mach_vm_deallocate( mach_task_self(), (mach_vm_address_t)threads,
+                        count * sizeof(*threads) );
+    mach_port_deallocate( mach_task_self(), self );
+    return occupied;
+}
 static unsigned ios_tail_carve_n;
 static pthread_mutex_t ios_tail_carve_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -2209,10 +2348,109 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
  * calls also push through the stored callback (see above). */
 struct ios_push_jit_aliases_args {
     void (*callback)(unsigned long long, unsigned long long, unsigned long long);
+    /* ml549: xtajit64's exact host-PC -> guest-RIP lookup, pushed on the same call. */
+    unsigned long long (*rip_from_hostpc)(unsigned long long, unsigned long long);
 };
+
+/* ml549: consumed by the fault probes (srcwatch et al) so they can report the
+ * instruction that actually executed instead of the block-granular RIP stored in
+ * CpuStateFrame+0x18. NULL until xtajit64 binds, and on non-iOS/native paths. */
+unsigned long long (*ios_fex_rip_from_hostpc_cb)(unsigned long long, unsigned long long) = NULL;
+/* ml551: set ONLY by a successful resolve. Never infer "resolved" from the pointer
+ * being non-NULL -- ml550 found this global holding 0x6c6c642e65736162, i.e. the
+ * ASCII "base.dll", so a non-NULL test both skipped the resolve AND let the fault
+ * handler CALL a string as a function. That wild jump inside the Mach handler left
+ * the srcwatch page protected, the guest's write never landed, and the window went
+ * black -- we caused it. */
+volatile int ios_fex_rip_resolved = 0;
+
+/* ml549: resolve xtajit64's exact-RIP lookup WITHOUT touching PE-side ntdll.
+ *
+ * The obvious route (bind it in arm64ec_process_init_dispatchers and push the pointer
+ * down) requires changing the unix-call struct, which changes an ABI shared with a
+ * PREBUILT ntdll.dll -- an old ntdll would write one field while this side read two,
+ * handing us a garbage pointer to call. Rebuilding that ntdll needs a strip+pad recipe
+ * that is not in the tree, so this resolves the export here instead.
+ *
+ * Exact, no heuristics: ios_jit_mappings[] already records every mapped module's PE base
+ * and size, and ios_pe_module_name() names them. Find the emulator module, walk its
+ * export directory, done. Returns NULL (and says so) if anything is missing, so a failed
+ * resolve can never be mistaken for "the lookup ran and found nothing". */
+static void *ios_pe_find_export( const unsigned char *base, const char *want )
+{
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)base;
+    const IMAGE_NT_HEADERS64 *nt;
+    const IMAGE_EXPORT_DIRECTORY *exp;
+    const DWORD *names, *funcs;
+    const WORD *ords;
+    DWORD i, va, sz;
+
+    if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+    nt = (const IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
+    va = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    sz = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+    if (!va || !sz) return NULL;
+    exp = (const IMAGE_EXPORT_DIRECTORY *)(base + va);
+    names = (const DWORD *)(base + exp->AddressOfNames);
+    ords  = (const WORD  *)(base + exp->AddressOfNameOrdinals);
+    funcs = (const DWORD *)(base + exp->AddressOfFunctions);
+    for (i = 0; i < exp->NumberOfNames; i++)
+        if (!strcmp( (const char *)(base + names[i]), want ))
+            return (void *)(base + funcs[ords[i]]);
+    return NULL;
+}
+
+void ios_resolve_fex_rip_lookup( void )
+{
+    static int tried;
+    int i;
+
+    /* ml550: announce ENTRY before any logic. ml549 printed NOTHING from this
+     * function even though its caller's very next line (the srcwatch ARMED ERR)
+     * did print -- so either this was never called or it died inside. An
+     * unconditional entry line makes those two cases distinguishable instead of
+     * leaving silence to interpret. */
+    {
+        unsigned long long raw = (unsigned long long)(uintptr_t)ios_fex_rip_from_hostpc_cb;
+        char asc[9]; int k;
+        for (k = 0; k < 8; k++)
+        { unsigned char c = (unsigned char)(raw >> (8 * k)); asc[k] = (c >= 32 && c < 127) ? c : '.'; }
+        asc[8] = 0;
+        dprintf( 2, "[exact-rip] enter tried=%d resolved=%d cb=0x%llx ascii=\"%s\" mappings=%d rev=ml551\n",
+                 tried, ios_fex_rip_resolved, raw, asc, ios_jit_mapping_count );
+    }
+    if (tried || ios_fex_rip_resolved) return;
+    tried = 1;
+    ios_fex_rip_from_hostpc_cb = NULL;   /* discard whatever was sitting there */
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        const char *nm = ios_pe_module_name( ios_jit_mappings[i].pe_base,
+                                             ios_jit_mappings[i].size );
+        if (!nm) continue;
+        if (!strstr( nm, "xtajit64" ) && !strstr( nm, "arm64ecfex" )) continue;
+        dprintf( 2, "[exact-rip] candidate=%s base=%p size=0x%lx -- parsing exports rev=ml550\n",
+                 nm, ios_jit_mappings[i].pe_base, (unsigned long)ios_jit_mappings[i].size );
+        ios_fex_rip_from_hostpc_cb = ios_pe_find_export( ios_jit_mappings[i].pe_base,
+                                                         "BTCpu64IosRipFromHostPC" );
+        if (ios_fex_rip_from_hostpc_cb) ios_fex_rip_resolved = 1;
+        dprintf( 2, "[exact-rip] module=%s base=%p export=%p %s rev=ml551\n",
+                 nm, ios_jit_mappings[i].pe_base, (void *)ios_fex_rip_from_hostpc_cb,
+                 ios_fex_rip_resolved ? "RESOLVED" : "NOT FOUND (old xtajit64?)" );
+        return;
+    }
+    dprintf( 2, "[exact-rip] emulator module not in ios_jit_mappings (%d entries) -- "
+                "exact RIP unavailable rev=ml549\n", ios_jit_mapping_count );
+}
 
 NTSTATUS unixcall_ios_push_jit_aliases(void *args)
 {
+    /* ml549: stash the exact-RIP lookup before anything can early-return. */
+    {
+        const struct ios_push_jit_aliases_args *a = args;
+        if (a) ios_fex_rip_from_hostpc_cb = a->rip_from_hostpc;
+    }
+
     struct ios_push_jit_aliases_args *params = args;
     int i;
     if (!params || !params->callback) return STATUS_INVALID_PARAMETER;
@@ -7960,30 +8198,87 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
  * Reads memory back rather than echoing intent, and only when the protection actually permits
  * reading, so the probe can never itself fault.
  */
-static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect )
+static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect, int was_committed )
 {
-    static unsigned long rc_n;
+    /* ml544: PER-BAND budgets, and cover the GUEST band too.
+     *
+     * As written this probe could not see the memory the render hunt cares about,
+     * for two independent reasons:
+     *   1. `ios_is_arena_addr` is (p >= 0x7400000000), so the GUEST band is excluded
+     *      outright — and CEF's render bitmap lives there (ml538 SRC bits were at
+     *      0x7042ba0000).
+     *   2. Even inside the covered range, all 40 reports in ml543 were spent on
+     *      0x7c... FEX-band commits before any pool commit was sampled. That is
+     *      exactly the starvation this probe's own comment warns about, happening
+     *      to it anyway.
+     * ⇒ its "0 STALE ON COMMIT" said nothing about tile memory.
+     *
+     * Why it matters: tile (0,1) of the login window holds blurred game-library
+     * pixels from the SPLASH screen, surviving into a later page. Stale bytes in
+     * RECOMMITTED memory would produce exactly that, and Windows guarantees
+     * MEM_COMMIT yields zero-filled pages.
+     *
+     * Separate counters so a chatty band can never starve a quiet one. */
+    /* ml545: CENSUS, not a capped sample.
+     *
+     * ml544 capped each band at 40 reports and the budget was exhausted during
+     * WINE BOOT (last guest sample at log line 2384, all of them 0x7038.. thread
+     * stacks) while the webhelper spawned at 4838 and the first CEF render was at
+     * 15575 -- the ENTIRE CEF phase went unsampled, so "0 stale" said nothing about
+     * tile memory. That is the third time a cap has defeated this probe, once after
+     * I had already "fixed" it.
+     *
+     * Use the pattern that demonstrably works here (the [unaligned-guest] census,
+     * whose emu=16 simd=0 other=0 IS trustworthy): counters are UNBOUNDED, every
+     * anomaly is logged, only the uninteresting OK lines are rate-limited, and
+     * every line carries the running totals -- so a silent log can never be
+     * mistaken for a clean one. */
+    static unsigned long ck_hi, ck_lo, stale_hi, stale_lo, recommit_n;
+    unsigned long seq;
+    int hi;
 
-    if (!base || !size || !ios_is_arena_addr( base )) return;
+    if (!base || !size) return;
     if (protect & (PAGE_NOACCESS | PAGE_GUARD)) return;
     if (!(protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
                      PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
         return;
 
-    if (++rc_n > 40) return;
+    /* ml546 defect #1: only a FRESH commit (reserved/decommitted -> committed) is
+     * required to read back as zero. Re-committing memory that is ALREADY committed
+     * -- which is what a protection change looks like from here -- correctly PRESERVES
+     * contents, so flagging it is a false positive. ml545 reported 3 such events at
+     * one base with protect alternating 0x2/0x4/0x2, and I nearly read them as
+     * violations. Count them separately instead of reporting them as stale. */
+    if (was_committed) { ++recommit_n; return; }
+
+    hi = ios_is_arena_addr( base );
+    seq = hi ? ++ck_hi : ++ck_lo;
     {
         size_t chk = size < 64 ? (size_t)size : 64;
         long nz = ios_first_nonzero( base, chk );
         if (nz < 0)
-            dprintf( 2, "[commit-zero] #%lu OK base=%p size=0x%lx protect=0x%x "
-                     "(first 0x%lx bytes verified zero)\n",
-                     rc_n, base, (unsigned long)size, (unsigned)protect, (unsigned long)chk );
+        {
+            /* boring: first few, then sparse -- but the totals ride along */
+            if (seq <= 8 || (seq % 4096) == 0)
+                dprintf( 2, "[commit-zero] #%lu %s OK base=%p size=0x%lx protect=0x%x "
+                         "(zero) checked=%lu/%lu stale=%lu/%lu recommit=%lu rev=ml546\n",
+                         seq, hi ? "arena/pool" : "GUEST",
+                         base, (unsigned long)size, (unsigned)protect,
+                         ck_lo, ck_hi, stale_lo, stale_hi, recommit_n );
+        }
         else
         {
-            const unsigned char *b = (const unsigned char *)base;
-            dprintf( 2, "[commit-zero] #%lu *** STALE ON COMMIT *** base=%p size=0x%lx "
-                     "protect=0x%x first_nonzero=+0x%lx bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                     rc_n, base, (unsigned long)size, (unsigned)protect, (unsigned long)nz,
+            /* ml546 defect #2: ml545 printed bytes[0..7] from BASE while reporting
+             * first_nonzero=+0x8 -- so it printed eight zeros and told us nothing
+             * about the actual stale content. Print from the offending offset. */
+            const unsigned char *b = (const unsigned char *)base + nz;
+            if (hi) stale_hi++; else stale_lo++;      /* ALWAYS logged: this is the signal */
+            dprintf( 2, "[commit-zero] #%lu %s *** STALE ON COMMIT *** base=%p size=0x%lx "
+                     "protect=0x%x first_nonzero=+0x%lx checked=%lu/%lu stale=%lu/%lu recommit=%lu "
+                     "bytes@nz=%02x %02x %02x %02x %02x %02x %02x %02x rev=ml546\n",
+                     seq, hi ? "arena/pool" : "GUEST",
+                     base, (unsigned long)size, (unsigned)protect, (unsigned long)nz,
+                     ck_lo, ck_hi, stale_lo, stale_hi, recommit_n,
                      b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7] );
         }
     }
@@ -8492,6 +8787,102 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
     return map_file_into_view_ex( view, fd, start, size, offset, vprot, removable, TRUE );
 }
 
+/* ml561 (Sol's provenance recorder): remember HOW each file mapping was made.
+ *
+ * ml554 and ml559 both faulted at EXACTLY view_base+0x10000 — the 64KB Windows
+ * allocation granularity — inside an 0x14000 region, with kr=10
+ * (KERN_MEMORY_ERROR) on a page that was RW the whole time. Four 16KB pages
+ * materialise; the fifth does not. The single most likely cause of "mapped, RW,
+ * but cannot be materialised" is a file mapping that extends PAST END OF FILE:
+ * POSIX gives SIGBUS for those pages, and Mach reports KERN_MEMORY_ERROR.
+ *
+ * Note map_size is rounded with the GUEST 4KB page_mask while iOS host pages are
+ * 16KB, and nothing here compares offset+host_size against the file's real size.
+ * This records the facts so the next fatal fault can say whether the backing
+ * actually covered the view, instead of us guessing.
+ *
+ * Bounded, allocation-free, lock-free — safe to read from a signal handler.
+ * Deliberately does NOT dup or retain the fd: doing so could accidentally repair
+ * a lifetime bug and hide the very thing we are trying to see. */
+#define IOS_MAP_RING 256
+static struct {
+    const char *base; size_t view_size, start, size, map_size, host_size;
+    long long offset, file_size;
+    unsigned long long dev, ino;
+    int shared, for_image, valid;
+} ios_map_ring[IOS_MAP_RING];
+static volatile unsigned ios_map_ring_n;
+
+static void ios_map_record( const void *view_base, size_t view_size, size_t start, size_t size,
+                            size_t map_size, size_t host_size, int fd, long long offset,
+                            int shared, int for_image )
+{
+    unsigned slot = __sync_fetch_and_add( &ios_map_ring_n, 1 ) % IOS_MAP_RING;
+    struct stat st;
+    ios_map_ring[slot].valid = 0;
+    ios_map_ring[slot].base = (const char *)view_base;
+    ios_map_ring[slot].view_size = view_size;
+    ios_map_ring[slot].start = start;
+    ios_map_ring[slot].size = size;
+    ios_map_ring[slot].map_size = map_size;
+    ios_map_ring[slot].host_size = host_size;
+    ios_map_ring[slot].offset = offset;
+    ios_map_ring[slot].shared = shared;
+    ios_map_ring[slot].for_image = for_image;
+    if (fd >= 0 && !fstat( fd, &st ))
+    {
+        ios_map_ring[slot].file_size = (long long)st.st_size;
+        ios_map_ring[slot].dev = (unsigned long long)st.st_dev;
+        ios_map_ring[slot].ino = (unsigned long long)st.st_ino;
+    }
+    else ios_map_ring[slot].file_size = -1;
+    __sync_synchronize();
+    ios_map_ring[slot].valid = 1;
+}
+
+/* Signal-handler-safe: describe the mapping containing `addr`, or say plainly
+ * that no file mapping covers it (which is itself a real answer — it would mean
+ * the page is anonymous and the EOF story is wrong). */
+void ios_map_describe( const void *addr, char *out, size_t outlen )
+{
+    unsigned n = __sync_fetch_and_add( &ios_map_ring_n, 0 );
+    unsigned lim = n < IOS_MAP_RING ? n : IOS_MAP_RING;
+    const char *a = (const char *)addr;
+    int best = -1;
+    unsigned i;
+
+    for (i = 0; i < lim; i++)
+    {
+        if (!ios_map_ring[i].valid) continue;
+        if (a >= ios_map_ring[i].base + ios_map_ring[i].start &&
+            a <  ios_map_ring[i].base + ios_map_ring[i].start + ios_map_ring[i].map_size)
+            best = (int)i;                     /* later records win */
+    }
+    if (best < 0)
+    {
+        snprintf( out, outlen, "NO file mapping covers this address "
+                               "(anonymous — EOF/backing story does NOT apply)" );
+        return;
+    }
+    {
+        long long end_needed = ios_map_ring[best].offset + (long long)ios_map_ring[best].host_size;
+        snprintf( out, outlen,
+                  "view=%p+0x%zx start=0x%zx size=0x%zx map=0x%zx host=0x%zx off=0x%llx "
+                  "%s %s file_size=0x%llx dev=%llu ino=%llu need_off_end=0x%llx %s",
+                  (void *)ios_map_ring[best].base, ios_map_ring[best].view_size,
+                  ios_map_ring[best].start, ios_map_ring[best].size,
+                  ios_map_ring[best].map_size, ios_map_ring[best].host_size,
+                  ios_map_ring[best].offset,
+                  ios_map_ring[best].shared ? "MAP_SHARED" : "MAP_PRIVATE",
+                  ios_map_ring[best].for_image ? "image" : "section",
+                  ios_map_ring[best].file_size, ios_map_ring[best].dev, ios_map_ring[best].ino,
+                  end_needed,
+                  ios_map_ring[best].file_size >= 0 && end_needed > ios_map_ring[best].file_size
+                    ? "<== MAPPING EXTENDS PAST END OF FILE — unbacked tail, this is the bug"
+                    : "<== backing covers the mapping; EOF is NOT the explanation" );
+    }
+}
+
 static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t start, size_t size,
                                        off_t offset, unsigned int vprot, BOOL removable,
                                        BOOL for_image )
@@ -8541,8 +8932,77 @@ static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t st
        and if alignment is correct */
     if ((!removable || (flags & MAP_SHARED)) && host_addr == map_addr && host_size == map_size)
     {
+        /* iOS-Mythic ml563: THE DIRECT INVARIANT — check the backing BEFORE mapping.
+         *
+         * ml561 proved the Steam/CEF killer: a 0x40000 section view mmap'd over a
+         * backing file of only 0x10000/0x20000 bytes. Every page past EOF is
+         * unbacked, so Skia's 256x256 tile fill SIGBUSes the moment it crosses that
+         * offset — fault offset == file size, exactly, 3/3 events, with the guest's
+         * geometry provably correct.
+         *
+         * This check is synchronous and unconditional at the exact mmap: no ring
+         * lookup, no address reuse, no wrap, no signal-handler inference, and the
+         * file size is read at the moment it matters.
+         *
+         * REPAIR, carefully: growing a real on-disk file would corrupt user data
+         * (a game asset, a save). wineserver unlinks anonymous section temp files
+         * immediately after creating them, so `st_nlink == 0` identifies exactly
+         * those — a pagefile-backed section, which Windows guarantees is fully
+         * backed for its whole size. Growing THAT restores correct semantics rather
+         * than papering over anything. Anything with a link count stays untouched
+         * and is reported instead. */
+        {
+            struct stat mst;
+            /* ml564: flag only when a WHOLE host page lies past EOF.
+             *
+             * ml563's predicate (`offset+host_size > st_size`) fired on every file
+             * whose size is not page-aligned — 64/64 events were benign tails like
+             * file_size=0xc2122 need=0xc3000, and they consumed the entire budget.
+             * POSIX makes the final PARTIAL page of a mapping accessible and
+             * zero-filled; only pages lying entirely beyond EOF fault. That is the
+             * shape ml561 caught (file 0x10000, need 0x40000 — twelve whole pages
+             * past the end), and it is the only shape worth a log line. */
+            /* ml570: mst was READ BEFORE fstat FILLED IT here — an uninitialized
+             * read (the value was recomputed afterwards, so the effect was benign,
+             * but it was undefined behaviour and is fixed). */
+            off_t eof_pages = 0;
+            if (!fstat( fd, &mst ) &&
+                (eof_pages = (((off_t)mst.st_size + (off_t)host_page_mask) & ~(off_t)host_page_mask),
+                 eof_pages < (off_t)(offset + (off_t)host_size)))
+            {
+                static unsigned long eofn;
+                int anon_section = (mst.st_nlink == 0) && (flags & MAP_SHARED) && !for_image;
+                /* ml570: STOP GROWING THE FILE. The ml564 repair assumed the fd
+                 * belonged to this section and was merely undersized. It probably
+                 * does NOT: the iOS fd cache is `_Thread_local` while Windows
+                 * handles are per-PROCESS, so a handle closed by one thread stays
+                 * cached in another, and after wineserver recycles the numeric
+                 * handle that thread maps the OLD inode. st_nlink==0 proves only
+                 * "unlinked", never "the right object" — so ftruncate here extends
+                 * an unrelated section and corrupts it, on top of hiding the
+                 * identity bug. Report, do not mutate. */
+                int repaired = -1;
+                if (++eofn <= 64)
+                    dprintf(2, "[map-eof] view=%p+0x%zx start=0x%zx size=0x%zx map=0x%zx "
+                               "host=0x%zx off=0x%llx file_size=0x%llx need=0x%llx nlink=%u "
+                               "dev=%llu ino=%llu %s %s -- %s wholepage rev=ml564\n",
+                            view->base, view->size, start, size, map_size, host_size,
+                            (unsigned long long)offset, (unsigned long long)mst.st_size,
+                            (unsigned long long)(offset + (off_t)host_size),
+                            (unsigned)mst.st_nlink,
+                            (unsigned long long)mst.st_dev, (unsigned long long)mst.st_ino,
+                            (flags & MAP_SHARED) ? "MAP_SHARED" : "MAP_PRIVATE",
+                            for_image ? "image" : "section",
+                            anon_section ? "SHORT anon section — NOT repairing (fd identity unproven; suspect stale _Thread_local fd cache)"
+                            : "SHORT mapping with links — reporting only");
+            }
+        }
         if (mmap( host_addr, host_size, prot, flags, fd, offset ) != MAP_FAILED)
+        {
+            ios_map_record( view->base, view->size, start, size, map_size, host_size,
+                            fd, (long long)offset, (flags & MAP_SHARED) != 0, for_image );
             return STATUS_SUCCESS;
+        }
 
         switch (errno)
         {
@@ -8769,25 +9229,41 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
          * not zero.
          *
          * Arena-band only, capped, so this cannot storm a log. */
-        if (ios_is_arena_addr( base ))
+        /* ml547: same census conversion as [commit-zero]. As written this was
+         * arena-band only (excluding the GUEST band where CEF's render bitmap
+         * lives) AND capped at 40 -- and in ml546 all 40 reports went to ONE
+         * repeated FEX-band address (0x7c012a1000), so guest and pool decommits
+         * were never measured at all. Unbounded counters, every anomaly logged,
+         * only the OK lines rate-limited, totals on every line. */
         {
-            static unsigned long dc_n;
-            if (++dc_n <= 40)
+            static unsigned long dc_hi, dc_lo, dcbad_hi, dcbad_lo;
+            int dc_isarena = ios_is_arena_addr( base );
+            unsigned long dc_n = dc_isarena ? ++dc_hi : ++dc_lo;
             {
                 if (dc_verify && dc_vsize)
                 {
                     size_t chk = dc_vsize < 64 ? dc_vsize : 64;
                     long nz = ios_first_nonzero( dc_verify, chk );
                     if (nz < 0)
-                        dprintf( 2, "[decommit-zero] #%lu OK base=%p size=0x%lx branch=%s "
-                                 "(first 0x%lx bytes verified zero)\n",
-                                 dc_n, base, (unsigned long)size, dc_branch, (unsigned long)chk );
+                    {
+                        if (dc_n <= 8 || (dc_n % 4096) == 0)
+                            dprintf( 2, "[decommit-zero] #%lu %s OK base=%p size=0x%lx branch=%s "
+                                     "(zero) checked=%lu/%lu notzero=%lu/%lu rev=ml547\n",
+                                     dc_n, dc_isarena ? "arena/pool" : "GUEST",
+                                     base, (unsigned long)size, dc_branch,
+                                     dc_lo, dc_hi, dcbad_lo, dcbad_hi );
+                    }
                     else
                     {
-                        const unsigned char *b = (const unsigned char *)dc_verify;
-                        dprintf( 2, "[decommit-zero] #%lu *** NOT ZEROED *** base=%p size=0x%lx "
-                                 "branch=%s first_nonzero=+0x%lx bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                                 dc_n, base, (unsigned long)size, dc_branch, (unsigned long)nz,
+                        /* print from the OFFENDING offset, not from base */
+                        const unsigned char *b = (const unsigned char *)dc_verify + nz;
+                        if (dc_isarena) dcbad_hi++; else dcbad_lo++;
+                        dprintf( 2, "[decommit-zero] #%lu %s *** NOT ZEROED *** base=%p size=0x%lx "
+                                 "branch=%s first_nonzero=+0x%lx checked=%lu/%lu notzero=%lu/%lu "
+                                 "bytes@nz=%02x %02x %02x %02x %02x %02x %02x %02x rev=ml547\n",
+                                 dc_n, dc_isarena ? "arena/pool" : "GUEST",
+                                 base, (unsigned long)size, dc_branch, (unsigned long)nz,
+                                 dc_lo, dc_hi, dcbad_lo, dcbad_hi,
                                  b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7] );
                     }
                 }
@@ -12033,6 +12509,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     }
     else  /* commit the pages */
     {
+        int was_committed = (get_page_vprot( base ) & VPROT_COMMITTED) != 0;
         if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
         else if (view->protect & SEC_FILE) status = STATUS_ALREADY_COMMITTED;
         else if (view->protect & VPROT_FREE_PLACEHOLDER) status = STATUS_CONFLICTING_ADDRESSES;
@@ -12048,7 +12525,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             SERVER_END_REQ;
         }
         /* ml293 (task #52): PA-arena recommit must read back as zero. */
-        if (!status) ios_verify_commit_zero( base, size, protect );
+        if (!status) ios_verify_commit_zero( base, size, protect, was_committed );
     }
 
     if (!status && (attributes & MEM_EXTENDED_PARAMETER_EC_CODE))
@@ -13715,6 +14192,17 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         for (i = 0; i < ios_tail_carve_n; i++)
         {
             if (ios_tail_carves[i].off != off || ios_tail_carves[i].free) continue;
+            /* ml557: do NOT recycle a carve a thread is still executing in. */
+            if (ios_tail_carve_occupied( base, ios_tail_carves[i].size ))
+            {
+                static unsigned long occ_n;
+                if (++occ_n <= 16 || (occ_n % 256) == 0)
+                    dprintf(2, "[jit-pool] tail FREE REFUSED rx=%p size=0x%lx — a thread's "
+                               "PC is inside it (occupied=%lu) rev=ml557\n",
+                            base, (unsigned long)ios_tail_carves[i].size, occ_n);
+                carve_size = 0;
+                break;
+            }
             ios_tail_carves[i].free = 1;
             carve_size = ios_tail_carves[i].size;
             break;

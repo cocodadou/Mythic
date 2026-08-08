@@ -122,6 +122,7 @@ static void wine_log_write(const char *fmt, ...)
 #include <sys/thr.h>
 #endif
 #include <unistd.h>
+#include <dirent.h>
 #ifdef __APPLE__
 #include <crt_externs.h>
 #include <spawn.h>
@@ -212,6 +213,100 @@ BOOL *ios_process_exiting_ptr(void)
     return (i >= 0) ? &ios_proc_sockets[i].exiting : &process_exiting;
 }
 
+/* ─── ml586 fd-ownership trace ────────────────────────────────────────────
+ * Root-cause instrumentation for the 0060-family kills: some pseudo-process
+ * teardown closes wineserver-comm fds it doesn't own (broken runs ml579/580/
+ * 584/585 → services.exe's rpcrt4 listener dies → SCM RPC dead → explorer
+ * wedges in OpenSCManagerW → no Start menu). Ledger indexed by RAW FD NUMBER:
+ * registration tripwires when a live comm fd's number reappears (= someone
+ * closed it outside a traced site), teardown closes log owner-vs-closer,
+ * and the victim read paths autopsy their fd against the ledger. */
+#define IOS_FDT_MAX 4096
+enum ios_fdt_kind { FDT_NONE = 0, FDT_MASTER, FDT_REQUEST_RD, FDT_REQUEST_WR,
+                    FDT_REPLY_RD, FDT_REPLY_WR, FDT_WAIT_RD, FDT_WAIT_WR, FDT_CLOSED };
+static const char * const ios_fdt_names[] = { "none", "master", "request_rd", "request_wr",
+                                              "reply_rd", "reply_wr", "wait_rd", "wait_wr", "closed" };
+struct ios_fdt_ent
+{
+    unsigned char kind;       /* live kind, or FDT_CLOSED */
+    unsigned char prev_kind;  /* kind before a traced close */
+    unsigned int  tid;        /* registrar's wine tid */
+    void         *peb;        /* registrar's pseudo-process */
+    unsigned int  gen;        /* global registration counter */
+};
+static struct ios_fdt_ent ios_fdt[IOS_FDT_MAX];
+static unsigned int ios_fdt_gen;
+
+static void ios_fdt_reg( int fd, int kind, void *peb )
+{
+    struct ios_fdt_ent *e;
+    if (fd < 0 || fd >= IOS_FDT_MAX) return;
+    e = &ios_fdt[fd];
+    if (e->kind && e->kind != FDT_CLOSED)
+    {
+        /* live number re-registered: PROOF something closed it silently */
+        static int reuse_cap;
+        if (reuse_cap++ < 200)
+            wine_log_write("[fdtrace] SILENT-CLOSE fd=%d was %s owner_tid=%04x owner_peb=%p gen=%u; rereg %s tid=%04x peb=%p rev=ml586",
+                           fd, ios_fdt_names[e->kind], e->tid, e->peb, e->gen,
+                           ios_fdt_names[kind], (unsigned int)GetCurrentThreadId(), peb);
+    }
+    e->kind = (unsigned char)kind;
+    e->prev_kind = 0;
+    e->tid  = (unsigned int)GetCurrentThreadId();
+    e->peb  = peb;
+    e->gen  = __sync_add_and_fetch( &ios_fdt_gen, 1 );
+}
+
+/* exported for thread_ios.c: register a new thread's request pipe */
+void ios_fdt_reg_request_pipe( int rd, int wr, void *peb );
+void ios_fdt_reg_request_pipe( int rd, int wr, void *peb )
+{
+    ios_fdt_reg( rd, FDT_REQUEST_RD, peb );
+    ios_fdt_reg( wr, FDT_REQUEST_WR, peb );
+}
+
+/* expected close (e.g. reply-pipe handoff): update ledger, no log.
+ * NON-static: thread_ios.c marks its request-pipe handoff closes too. */
+void ios_fdt_mark_closed( int fd )
+{
+    if (fd < 0 || fd >= IOS_FDT_MAX) return;
+    if (ios_fdt[fd].kind && ios_fdt[fd].kind != FDT_CLOSED)
+        ios_fdt[fd].prev_kind = ios_fdt[fd].kind;
+    ios_fdt[fd].kind = FDT_CLOSED;
+}
+
+/* teardown close: log owner-vs-closer, flag cross-ownership loudly */
+static void ios_fdt_note_close( int fd, const char *why, void *dead_peb )
+{
+    struct ios_fdt_ent *e;
+    if (fd < 0 || fd >= IOS_FDT_MAX) return;
+    e = &ios_fdt[fd];
+    if (e->kind && e->kind != FDT_CLOSED)
+    {
+        int cross = (e->peb != dead_peb);
+        wine_log_write("[fdtrace]%s close fd=%d why=%s kind=%s owner_tid=%04x owner_peb=%p gen=%u closer_tid=%04x dead_peb=%p rev=ml586",
+                       cross ? " CROSS!" : "", fd, why, ios_fdt_names[e->kind],
+                       e->tid, e->peb, e->gen, (unsigned int)GetCurrentThreadId(), dead_peb);
+        e->prev_kind = e->kind;
+        e->kind = FDT_CLOSED;
+    }
+    else
+        wine_log_write("[fdtrace] close fd=%d why=%s untracked%s closer_tid=%04x dead_peb=%p rev=ml586",
+                       fd, why, (e->kind == FDT_CLOSED) ? " (prev comm fd)" : "",
+                       (unsigned int)GetCurrentThreadId(), dead_peb);
+}
+
+/* victim autopsy: what the ledger knows about a failing comm fd */
+static void ios_fdt_autopsy( const char *what, int fd, int ret, int err )
+{
+    struct ios_fdt_ent *e = (fd >= 0 && fd < IOS_FDT_MAX) ? &ios_fdt[fd] : NULL;
+    wine_log_write("[fdtrace] VICTIM %s tid=%04x fd=%d ret=%d errno=%d ledger=%s owner_tid=%04x owner_peb=%p gen=%u prev=%s rev=ml586",
+                   what, (unsigned int)GetCurrentThreadId(), fd, ret, err,
+                   e ? ios_fdt_names[e->kind] : "oob", e ? e->tid : 0, e ? e->peb : NULL,
+                   e ? e->gen : 0, e ? ios_fdt_names[e->prev_kind] : "oob");
+}
+
 static void ios_register_proc_socket(void *peb_id, int fd)
 {
     int idx = __sync_fetch_and_add(&ios_proc_socket_count, 1);
@@ -220,6 +315,7 @@ static void ios_register_proc_socket(void *peb_id, int fd)
         wine_log_write("[Wine child] proc-socket table FULL (%d)!", idx);
         return;
     }
+    ios_fdt_reg( fd, FDT_MASTER, peb_id );
     ios_proc_sockets[idx].fd = fd;
     ios_proc_sockets[idx].exiting = FALSE;
     __sync_synchronize();
@@ -413,6 +509,10 @@ static void read_reply_data( void *buffer, size_t size )
 #endif
         server_protocol_perror("read");
     }
+#ifdef WINE_IOS
+    /* EOF flavor: the server-side write end of our reply pipe vanished */
+    ios_fdt_autopsy( "reply-read-eof", ntdll_get_thread_data()->reply_fd, ret, errno );
+#endif
     /* the server closed the connection; time to die... */
     abort_thread(0);
 }
@@ -544,8 +644,21 @@ static int wait_select_reply( void *cookie )
             }
             return signaled;
         }
-        if (ret >= 0) server_protocol_error( "partial wakeup read %d\n", ret );
+        if (ret >= 0)
+        {
+#ifdef WINE_IOS
+            ios_fdt_autopsy( "wakeup-read", ntdll_get_thread_data()->wait_fd[0], ret, 0 );
+#endif
+            server_protocol_error( "partial wakeup read %d\n", ret );
+        }
         if (errno == EINTR) continue;
+#ifdef WINE_IOS
+        {
+            int saved_errno = errno;
+            ios_fdt_autopsy( "wakeup-read", ntdll_get_thread_data()->wait_fd[0], ret, saved_errno );
+            errno = saved_errno;
+        }
+#endif
         server_protocol_perror("wakeup read");
     }
 }
@@ -963,6 +1076,85 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
 /***********************************************************************
  *              server_wait
  */
+/***********************************************************************
+ *              ml585: IN-FLIGHT WAIT REGISTRY
+ *
+ * ml584 caught explorer's shell thread (Wine tid 0024 = Mach port 0xe903)
+ * blocked in NtWaitForSingleObject under rpcrt4 -> combase, cpu=0, at an
+ * IDENTICAL sp across two samples 20s apart, while its message queue piled
+ * up post=56 with QS_PAINT set. That is why the Start button never repaints
+ * AND why clicking it does nothing: one wedged thread, both symptoms.
+ *
+ * A sampler that logs on wait EXIT can never see this — the wait does not
+ * end. So publish the wait BEFORE entering it and clear it after. wineserver
+ * is a thread in this same Mach task, so it can walk this table directly and
+ * resolve the handles against the owning process's handle table (see
+ * ios_dump_stuck_waits in queue_ios.c) — no IPC, no extra syscalls.
+ *
+ * Cost on the healthy path: two stores and a clock read per wait. Bounded
+ * table, fixed slots, no allocation, no locks. A slot is only ever written
+ * by its owning thread; the reader tolerates torn reads by re-checking seq.
+ */
+#define IOS_WAITREG_SLOTS 512
+struct ios_wait_entry
+{
+    volatile unsigned int  seq;        /* even = idle, odd = in a wait  */
+    void                  *teb;
+    unsigned int           wine_tid;
+    unsigned long long     t0_ns;      /* CLOCK_MONOTONIC at wait entry */
+    unsigned int           flags;      /* SELECT_* (alertable etc.)     */
+    long long              timeout;    /* abs_timeout as passed down    */
+    int                    op;
+    int                    count;
+    unsigned int           handles[8];
+    void                  *ret_pc;     /* caller of server_wait         */
+};
+struct ios_wait_entry ios_wait_reg[IOS_WAITREG_SLOTS];
+
+static struct ios_wait_entry *ios_wait_slot(void)
+{
+    /* Stable per-thread slot: TEB pointer hashed. Collisions only cost
+     * fidelity of the report, never correctness — a colliding thread
+     * overwrites the entry and the stuck one is simply not reported. */
+    uintptr_t t = (uintptr_t)NtCurrentTeb();
+    return &ios_wait_reg[(t >> 16) % IOS_WAITREG_SLOTS];
+}
+
+static void ios_wait_enter( const union select_op *op, data_size_t size,
+                            UINT flags, timeout_t abs_timeout, void *ret_pc )
+{
+    struct ios_wait_entry *e = ios_wait_slot();
+    struct timespec ts;
+    int i, n = 0;
+
+    e->seq++;                       /* -> odd: entry is being written  */
+    __sync_synchronize();
+    e->teb      = NtCurrentTeb();
+    e->wine_tid = (unsigned int)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread;
+    e->flags    = flags;
+    e->timeout  = abs_timeout;
+    e->ret_pc   = ret_pc;
+    e->op       = op ? (int)op->op : -1;
+    if (op && size >= sizeof(op->wait) - sizeof(op->wait.handles))
+    {
+        n = (int)((size - offsetof(union select_op, wait.handles)) / sizeof(obj_handle_t));
+        if (n > 8) n = 8;
+        if (n < 0) n = 0;
+        for (i = 0; i < n; i++) e->handles[i] = op->wait.handles[i];
+    }
+    e->count = n;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    e->t0_ns = (unsigned long long)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    __sync_synchronize();
+}
+
+static void ios_wait_leave(void)
+{
+    struct ios_wait_entry *e = ios_wait_slot();
+    __sync_synchronize();
+    e->seq++;                       /* -> even: no longer waiting */
+}
+
 unsigned int server_wait( const union select_op *select_op, data_size_t size, UINT flags,
                           const LARGE_INTEGER *timeout )
 {
@@ -983,7 +1175,10 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
                       (uintptr_t)NtCurrentTeb() == ios_srv_game_teb;
         struct timespec t0, t1;
         if (is_game) clock_gettime( CLOCK_MONOTONIC, &t0 );
+        ios_wait_enter( select_op, size, flags, abs_timeout,
+                        __builtin_return_address(0) );
         ret = server_select( select_op, size, flags, abs_timeout, NULL, &apc );
+        ios_wait_leave();
         if (is_game)
         {
             clock_gettime( CLOCK_MONOTONIC, &t1 );
@@ -1179,7 +1374,14 @@ void CDECL wine_server_send_fd( int fd )
 #endif
         if (ret >= 0) server_protocol_error( "partial write %d\n", ret );
         if (errno == EINTR) continue;
-        if (errno == EPIPE) abort_thread(0);
+        if (errno == EPIPE)
+        {
+#ifdef WINE_IOS
+            /* ml586: silent-death path — master socket dead under us */
+            ios_fdt_autopsy( "send_fd-epipe", ios_current_fd_socket(), ret, EPIPE );
+#endif
+            abort_thread(0);
+        }
         server_protocol_perror( "sendmsg" );
     }
 }
@@ -1291,22 +1493,142 @@ C_ASSERT( sizeof(union fd_cache_entry) == sizeof(LONG64) );
 #define FD_CACHE_ENTRIES     128
 
 #ifdef WINE_IOS
-/* On iOS, Wine "processes" are threads sharing one address space.
- * The fd cache must be per-Wine-process (thread-local) because handle
- * values from different Wine processes can collide in the cache. */
+/* On iOS, Wine "processes" are threads sharing one address space, so handle
+ * values from different Wine processes can collide in one cache — the cache
+ * must therefore be PER PSEUDO-PROCESS.
+ *
+ * ml571: it used to be `_Thread_local`, on the reasoning that thread-local IS
+ * per-process. It is not. A pseudo-process is MANY threads sharing one PEB, so
+ * a thread-local cache is per-THREAD, and Windows handles belong to a process:
+ *
+ *   thread A maps section H     -> A caches H's unix fd
+ *   thread B closes H           -> NtClose clears only B's cache
+ *   wineserver recycles H       -> new section, correct size from the server
+ *   thread A maps H again       -> A's STALE fd -> maps the OLD inode
+ *
+ * That produced both of the walls we spent days on. Short backing (a constant
+ * 0x10000 behind 4MB and 256KB views) with grow/shrink/truncate probes ALL
+ * silent: the file was never short, we were fstat'ing a different file — and
+ * past its end lies SIGBUS, reported as KERN_MEMORY_ERROR. And when the stale
+ * fd happened to be big enough, no fault at all: two views of one section
+ * simply referenced different inodes, so tiles rendered another tile's pixels
+ * or zeroes. Disabling caching for anonymous sections (ml570) took [map-eof]
+ * from 2-every-run to 0 and the login page rendered correctly for the first
+ * time. Diagnosis by Sol.
+ *
+ * Keying by PEB is the same ownership model `ios_proc_sockets` above already
+ * uses, and for the same reason — `fd_socket` had this exact bug and was fixed
+ * in 5852209. Do NOT "simplify" this back to one global cache: handles from
+ * different pseudo-processes collide, which is what the thread-local was
+ * (wrongly) reaching for. */
 struct ios_fd_cache {
     union fd_cache_entry *blocks[FD_CACHE_ENTRIES];
     union fd_cache_entry initial_block[FD_CACHE_BLOCK_SIZE];
 };
-static _Thread_local struct ios_fd_cache *tl_fd_cache = NULL;
+
+#define IOS_MAX_FD_CACHES 64
+static struct ios_fd_cache_slot
+{
+    void *peb;                    /* pseudo-process identity */
+    struct ios_fd_cache *cache;
+    int in_use;                   /* separate flag: peb==NULL is a VALID key
+                                   * (the initial process), so NULL cannot
+                                   * double as "free slot" the way it does in
+                                   * ios_proc_sockets. */
+} ios_fd_caches[IOS_MAX_FD_CACHES];
+static volatile int ios_fd_cache_count = 0;
+static pthread_mutex_t ios_fd_cache_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct ios_fd_cache ios_fd_cache_fallback;   /* last resort, see below */
 
 static struct ios_fd_cache *ios_get_fd_cache(void)
 {
-    if (!tl_fd_cache)
+    void *cur = ios_jit_current_peb();
+    int i, n = __sync_fetch_and_add( &ios_fd_cache_count, 0 );
+
+    /* Fast path: lock-free scan. Safe because a slot is only ever published
+     * by bumping the count LAST, after peb+cache are visible. */
+    for (i = 0; i < n && i < IOS_MAX_FD_CACHES; i++)
+        if (ios_fd_caches[i].in_use && ios_fd_caches[i].peb == cur)
+            return ios_fd_caches[i].cache;
+
+    pthread_mutex_lock( &ios_fd_cache_alloc_lock );
+    n = ios_fd_cache_count;                       /* re-check under the lock */
+    for (i = 0; i < n && i < IOS_MAX_FD_CACHES; i++)
+        if (ios_fd_caches[i].in_use && ios_fd_caches[i].peb == cur)
+        {
+            pthread_mutex_unlock( &ios_fd_cache_alloc_lock );
+            return ios_fd_caches[i].cache;
+        }
+    if (n < IOS_MAX_FD_CACHES)
     {
-        tl_fd_cache = calloc( 1, sizeof(*tl_fd_cache) );
+        struct ios_fd_cache *c = calloc( 1, sizeof(*c) );
+        if (c)
+        {
+            ios_fd_caches[n].cache = c;
+            ios_fd_caches[n].peb   = cur;
+            ios_fd_caches[n].in_use = 1;
+            __sync_synchronize();                 /* publish before the count */
+            __sync_fetch_and_add( &ios_fd_cache_count, 1 );
+            dprintf( 2, "[fd-cache] rev=ml571 new PEB-keyed cache slot=%d peb=%p\n", n, cur );
+            pthread_mutex_unlock( &ios_fd_cache_alloc_lock );
+            return c;
+        }
     }
-    return tl_fd_cache;
+    else
+    {
+        static int warned;
+        if (!warned++)
+            dprintf( 2, "[fd-cache] rev=ml571 SLOTS FULL (%d) — peb=%p falls back to "
+                        "UNCACHED fds (correct, just slower)\n", IOS_MAX_FD_CACHES, cur );
+    }
+    pthread_mutex_unlock( &ios_fd_cache_alloc_lock );
+    /* Never return NULL: the fd_cache/fd_cache_initial_block macros dereference
+     * this directly, so NULL would be an immediate crash. Falling back to one
+     * shared cache reintroduces cross-process handle collisions — the very bug
+     * this keying exists to prevent — so it is loudly logged above and only
+     * reachable after 64 live pseudo-processes or a calloc failure. A shared
+     * cache is wrong; a NULL deref is fatal. */
+    return &ios_fd_cache_fallback;
+}
+
+/* ml571: drop a dead pseudo-process's cache and close every fd still in it.
+ * The thread-local caches had no destructor at all, so each dead thread leaked
+ * its cached fds and pinned the unlinked inodes behind them. */
+void ios_fd_cache_release( void *peb )
+{
+    int i, j, n, closed = 0;
+    struct ios_fd_cache *c = NULL;
+
+    pthread_mutex_lock( &ios_fd_cache_alloc_lock );
+    n = ios_fd_cache_count;
+    for (i = 0; i < n && i < IOS_MAX_FD_CACHES; i++)
+        if (ios_fd_caches[i].in_use && ios_fd_caches[i].peb == peb)
+        {
+            c = ios_fd_caches[i].cache;
+            ios_fd_caches[i].in_use = 0;
+            ios_fd_caches[i].cache = NULL;
+            break;
+        }
+    pthread_mutex_unlock( &ios_fd_cache_alloc_lock );
+    if (!c) return;
+
+    for (i = 0; i < FD_CACHE_ENTRIES; i++)
+    {
+        union fd_cache_entry *block = c->blocks[i];
+        if (!block) continue;
+        for (j = 0; j < FD_CACHE_BLOCK_SIZE; j++)
+            if (block[j].s.fd > 0)
+            {
+                /* ml586: the prime suspect close — a stale cache entry whose fd
+                 * number was recycled into another thread's comm pipe */
+                ios_fdt_note_close( block[j].s.fd, "fd-cache-release", peb );
+                close( block[j].s.fd );
+                closed++;
+            }
+        if (block != c->initial_block) free( block );
+    }
+    free( c );
+    dprintf( 2, "[fd-cache] rev=ml571 released peb=%p, closed %d cached fd(s)\n", peb, closed );
 }
 
 #define fd_cache           (ios_get_fd_cache()->blocks)
@@ -1875,6 +2197,19 @@ static int init_thread_pipe(void)
 
     if (server_pipe( reply_pipe ) == -1) server_protocol_perror( "pipe" );
     if (server_pipe( ntdll_get_thread_data()->wait_fd ) == -1) server_protocol_perror( "pipe" );
+#ifdef WINE_IOS
+    {
+        void *peb = ios_jit_current_peb();
+        ios_fdt_reg( reply_pipe[0], FDT_REPLY_RD, peb );
+        ios_fdt_reg( reply_pipe[1], FDT_REPLY_WR, peb );
+        ios_fdt_reg( ntdll_get_thread_data()->wait_fd[0], FDT_WAIT_RD, peb );
+        ios_fdt_reg( ntdll_get_thread_data()->wait_fd[1], FDT_WAIT_WR, peb );
+        wine_log_write("[fdtrace] pipes tid=%04x peb=%p master=%d reply=%d/%d wait=%d/%d rev=ml586",
+                       (unsigned int)GetCurrentThreadId(), peb, ios_current_fd_socket(),
+                       reply_pipe[0], reply_pipe[1],
+                       ntdll_get_thread_data()->wait_fd[0], ntdll_get_thread_data()->wait_fd[1]);
+    }
+#endif
     wine_server_send_fd( reply_pipe[1] );
     wine_server_send_fd( ntdll_get_thread_data()->wait_fd[1] );
     ntdll_get_thread_data()->reply_fd = reply_pipe[0];
@@ -1900,8 +2235,16 @@ void process_exit_wrapper( int status )
         void *dead_peb = ios_proc_sockets[i].peb;
         wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d): closing child fd_socket=%d",
                        status, ios_proc_sockets[i].fd);
+        ios_fdt_note_close( ios_proc_sockets[i].fd, "exit-master", dead_peb );
         close( ios_proc_sockets[i].fd );
         ios_proc_sockets[i].peb = NULL;
+        /* ml571: drop this pseudo-process's fd cache and close what it held.
+         * Must happen on the SAME identity used to key it, and before the JIT
+         * reclaim below reuses anything. */
+        {
+            extern void ios_fd_cache_release( void *peb );
+            ios_fd_cache_release( dead_peb );
+        }
         /* Task #25: release this pseudo-process's JIT pool allocations
          * (module copies, trampolines, FEX CodeBuffers). Children only —
          * the session (else-branch) lives as long as the app. Reuse is
@@ -1915,6 +2258,112 @@ void process_exit_wrapper( int status )
     wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d)", status );
     exit( status );  /* on iOS, wine_ios_exit shim longjmps back to wine_process_thread */
 }
+
+
+#ifdef WINE_IOS
+/***********************************************************************
+ *           ios_create_drive_symlinks
+ *
+ * Publish \DosDevices\X: objects for the drives that exist in the prefix.
+ *
+ * On a normal Wine host mountmgr.sys does this at boot: create_drive_devices()
+ * walks $WINEPREFIX/dosdevices and add_dosdev_mount_point() creates the
+ * \DosDevices\X: -> \Device\HarddiskVolumeN symlink (mountmgr.sys/mountmgr.c).
+ * iOS runs no winedevice.exe and mountmgr.sys is not even shipped, so nothing
+ * ever created them and the NT namespace listed ZERO drives. GetLogicalDrives()
+ * builds its bitmap by enumerating \DosDevices for two-character "X:" entries
+ * (kernelbase/volume.c), so it returned 0 and every drive-enumerating UI came up
+ * empty -- shell32's My Computer (CreateMyCompEnumList -> get_drive_map), the
+ * common file dialogs, installers checking for a target drive.
+ *
+ * Path RESOLUTION never depended on this: ntdll maps C:\... directly onto
+ * <config_dir>/dosdevices/c: on disk (unix/file.c), which is why launching
+ * programs by full path always worked and why adding these objects cannot
+ * change how any existing path resolves. This only makes drives LISTABLE.
+ *
+ * The device objects themselves still do not exist (no driver stack), so the
+ * link targets dangle -- same shape mountmgr would produce, minus the volume.
+ */
+static void ios_create_drive_symlinks(void)
+{
+    /* Explicit WCHAR arrays, NOT L"...": the unix side is built without
+     * -fshort-wchar, so a wide literal here would be 4-byte wchar_t. */
+    static const WCHAR link_prefixW[] = {'\\','D','o','s','D','e','v','i','c','e','s','\\'};
+    static const WCHAR dev_prefixW[]  = {'\\','D','e','v','i','c','e','\\',
+                                         'H','a','r','d','d','i','s','k','V','o','l','u','m','e'};
+    const unsigned int link_prefix_len = sizeof(link_prefixW) / sizeof(WCHAR);
+    const unsigned int dev_prefix_len  = sizeof(dev_prefixW) / sizeof(WCHAR);
+    char *dosdevices;
+    DIR *dir;
+    struct dirent *de;
+    int created = 0, seen = 0;
+
+    if (asprintf( &dosdevices, "%s/dosdevices", config_dir ) == -1) return;
+    if (!(dir = opendir( dosdevices )))
+    {
+        wine_log_write( "[drives] no dosdevices dir at %s (errno=%d) - no drives published",
+                        dosdevices, errno );
+        free( dosdevices );
+        return;
+    }
+    free( dosdevices );
+
+    while ((de = readdir( dir )))
+    {
+        WCHAR name[ sizeof(link_prefixW) / sizeof(WCHAR) + 2 ];
+        WCHAR target[ sizeof(dev_prefixW) / sizeof(WCHAR) + 2 ];
+        OBJECT_ATTRIBUTES attr;
+        UNICODE_STRING name_str, target_str;
+        unsigned int vol, digits = 0;
+        NTSTATUS status;
+        HANDLE handle;
+
+        /* mountmgr's own filter: exactly "<letter>:". Skips com1/lpt1 and the
+         * "c::" unix-device links that share this directory. */
+        if (strlen( de->d_name ) != 2 || de->d_name[1] != ':') continue;
+        if (de->d_name[0] < 'a' || de->d_name[0] > 'z') continue;
+        seen++;
+
+        memcpy( name, link_prefixW, sizeof(link_prefixW) );
+        /* MUST be upper case: GetLogicalDrives() derives the bit index as
+         * (ObjectName.Buffer[0] - 'A'), so a lower-case name would shift by 32+. */
+        name[link_prefix_len]     = de->d_name[0] - 'a' + 'A';
+        name[link_prefix_len + 1] = ':';
+        name_str.Buffer        = name;
+        name_str.Length        = (link_prefix_len + 2) * sizeof(WCHAR);
+        name_str.MaximumLength = name_str.Length;
+
+        vol = de->d_name[0] - 'a' + 1;
+        memcpy( target, dev_prefixW, sizeof(dev_prefixW) );
+        if (vol >= 10) target[dev_prefix_len + digits++] = '0' + vol / 10;
+        target[dev_prefix_len + digits++] = '0' + vol % 10;
+        target_str.Buffer        = target;
+        target_str.Length        = (dev_prefix_len + digits) * sizeof(WCHAR);
+        target_str.MaximumLength = target_str.Length;
+
+        /* Same attributes IoCreateSymbolicLink() uses (ntoskrnl.exe/ntoskrnl.c):
+         * PERMANENT so the object outlives this handle, OPENIF so a re-run is
+         * idempotent rather than an error. */
+        attr.Length                   = sizeof(attr);
+        attr.RootDirectory            = 0;
+        attr.ObjectName               = &name_str;
+        attr.Attributes               = OBJ_CASE_INSENSITIVE | OBJ_OPENIF | OBJ_PERMANENT;
+        attr.SecurityDescriptor       = NULL;
+        attr.SecurityQualityOfService = NULL;
+
+        status = NtCreateSymbolicLinkObject( &handle, SYMBOLIC_LINK_ALL_ACCESS, &attr, &target_str );
+        if (!status)
+        {
+            NtClose( handle );
+            created++;
+        }
+        else wine_log_write( "[drives] %c: symlink failed status=%08x",
+                             de->d_name[0], (unsigned int)status );
+    }
+    closedir( dir );
+    wine_log_write( "[drives] published %d/%d DOS drive(s) in \\DosDevices rev=ml587", created, seen );
+}
+#endif
 
 
 /***********************************************************************
@@ -1991,6 +2440,7 @@ size_t server_init_process(void)
     data->request_fd = wine_server_receive_fd( &version );
 #ifdef WINE_IOS
     wine_log_write("[Wine init_process] got request_fd=%d, version=%d (expected %d)", data->request_fd, version, SERVER_PROTOCOL_VERSION);
+    ios_fdt_reg( data->request_fd, FDT_REQUEST_WR, ios_jit_current_peb() );
 #endif
 
 #ifdef SO_PASSCRED
@@ -2049,6 +2499,9 @@ size_t server_init_process(void)
         }
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+    ios_fdt_mark_closed( reply_pipe );   /* expected handoff close (server holds a dup) */
+#endif
     close( reply_pipe );
 
 #ifdef WINE_IOS
@@ -2080,6 +2533,12 @@ size_t server_init_process(void)
     }
 
     set_thread_id( NtCurrentTeb(), pid, tid );
+
+#ifdef WINE_IOS
+    /* First process only (children use server_init_process_child), so the DOS
+     * drive objects are published exactly once, before the shell enumerates. */
+    ios_create_drive_symlinks();
+#endif
 
     for (i = 0; i < supported_machines_count; i++)
         if (supported_machines[i] == current_machine) return info_size;
@@ -2121,6 +2580,7 @@ size_t server_init_process_child( int child_fd_socket )
     /* Receive request_fd from wineserver */
     data->request_fd = wine_server_receive_fd( &version );
     wine_log_write("[Wine child] got request_fd=%d, version=%d", data->request_fd, version);
+    ios_fdt_reg( data->request_fd, FDT_REQUEST_WR, ios_jit_current_peb() );
 
     if (version != SERVER_PROTOCOL_VERSION)
         server_protocol_error( "version mismatch %d/%d\n", version, SERVER_PROTOCOL_VERSION );
@@ -2150,6 +2610,9 @@ size_t server_init_process_child( int child_fd_socket )
         }
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+    ios_fdt_mark_closed( reply_pipe );   /* expected handoff close (server holds a dup) */
+#endif
     close( reply_pipe );
 
     wine_log_write("[Wine child] init_first_thread ret=%d, pid=%d, tid=%d, info_size=%zu",
@@ -2556,6 +3019,9 @@ void server_init_thread( void *entry_point, BOOL *suspend )
         *suspend = reply->suspend;
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+    ios_fdt_mark_closed( reply_pipe );   /* expected handoff close (server holds a dup) */
+#endif
     close( reply_pipe );
 }
 

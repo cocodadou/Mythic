@@ -718,7 +718,6 @@ struct ContentView: View {
     @StateObject private var logStore = LogStore.shared
     @State private var jitStatus: JITStatus = .unknown
     @State private var entitlements: EntitlementStatus?
-    @State private var showSetupGuide = false
     @State private var debuggerAttached = isDebuggerAttached()
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
     @Environment(\.verticalSizeClass) private var vSizeClass
@@ -747,16 +746,6 @@ struct ContentView: View {
             .navigationTitle("Mythic")
             .navigationBarTitleDisplayMode(.inline)
             .navigationBarHidden(vSizeClass == .compact)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button(action: { showSetupGuide = true }) {
-                        Image(systemName: "questionmark.circle")
-                    }
-                }
-            }
-            .sheet(isPresented: $showSetupGuide) {
-                SetupGuideView()
-            }
             .onAppear {
                 jit_install_trap_handler()
                 entitlements = EntitlementStatus.check()
@@ -769,7 +758,6 @@ struct ContentView: View {
     /// key row, action buttons, log console.
     private var portraitBody: some View {
         VStack(spacing: 0) {
-            statusHeader
             // Readouts sit ABOVE the game strip, closest to the surface they
             // describe: entitlement indicators, then the present/FPS readout,
             // then the surface itself. (Only the KEY row stays below — it is
@@ -827,28 +815,14 @@ struct ContentView: View {
             ZStack {
                 Color.black
                 MythicMetalView()
+                // Controls removed for now (ml586): game-only landscape.
+                // The FPS readout stays, pinned in the right pillarbox bar —
+                // the window-level surface covers anything drawn over the
+                // game area itself, so it cannot ride on the game view.
                 HStack(spacing: 0) {
-                    // Left bar: D-pad (hold semantics — Thumper's turns
-                    // are held keys).
-                    VStack(spacing: 12) {
-                        Spacer()
-                        holdKeyButton("▲", vk: 0x26, big: true)
-                        HStack(spacing: 16) {
-                            holdKeyButton("◀", vk: 0x25, big: true)
-                            holdKeyButton("▶", vk: 0x27, big: true)
-                        }
-                        holdKeyButton("▼", vk: 0x28, big: true)
-                        Spacer()
-                    }
-                    .frame(width: barW)
                     Spacer(minLength: 0)
-                    // Right bar: FPS readout (compact) + menu keys.
-                    VStack(spacing: 12) {
+                    VStack {
                         FPSOverlay(compact: true)
-                        Spacer()
-                        keyButton("⏎", vk: 0x0D)
-                        keyButton("␣", vk: 0x20)
-                        keyButton("Esc", vk: 0x1B)
                         Spacer()
                     }
                     .frame(width: barW)
@@ -857,27 +831,6 @@ struct ContentView: View {
         }
         .ignoresSafeArea()
         .background(Color.black)
-    }
-
-    private var statusHeader: some View {
-        HStack {
-            // The "JIT Status" row only ever read "Not tested" — this probe was
-            // never wired to the live state, and the real JIT indicator sits
-            // directly below it. Removed rather than left lying (a status line
-            // that cannot change is worse than none). statusColor/statusText
-            // are kept: enableJITViaStikDebug() and the JIT self-tests still
-            // drive jitStatus, so re-adding a row is a one-liner if wanted.
-            Spacer()
-            VStack(alignment: .trailing, spacing: 4) {
-                Text("Device")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Text(deviceInfo)
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-            }
-        }
-        .padding()
     }
 
     /// Hold-to-press key: VK down on touch, VK up on release — for keys
@@ -912,8 +865,19 @@ struct ContentView: View {
             entitlementBadge("Memory+", granted: ents.increasedMemory)
             entitlementBadge("64-bit VA", granted: ents.extendedVA)
             Spacer()
+            // Device model rides in this row (the old standalone statusHeader
+            // row above it spent ~50pt of vertical space on nothing else).
+            VStack(alignment: .trailing, spacing: 0) {
+                Text("Device")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                Text(deviceInfo)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
         }
         .padding(.horizontal)
+        .padding(.top, 4)
         .padding(.bottom, 8)
         .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
             debuggerAttached = isDebuggerAttached()
@@ -956,7 +920,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
 
-                Button("🎮 Run Steam (S3 smoke test)") {
+                Button("Steam Testing") {
                     // Steam S3 first boot: virtual desktop (Steam needs a
                     // window manager) + services.exe (SCM → rpcss for Steam's
                     // COM, the chain proven in the rpcss milestone) + steam.exe
@@ -982,7 +946,9 @@ struct ContentView: View {
                     // question (fresh pixels never presented vs nothing
                     // painting upstream) is undecidable from the log alone
                     // because the [winios] present line caps at 12.
-                    setenv("MYTHIC_DUMP_SURFACES", "1", 1)
+                    // ml556: surface PNG dumping also off for the clean baseline —
+                    // it encodes a PNG on the present path. Restore "1" to re-enable.
+                    unsetenv("MYTHIC_DUMP_SURFACES")
                     // ml493: bursts of N CONSECUTIVE frames per window. The
                     // login window's black regions change every frame, which
                     // the 2s-throttled first/latest dump can never show —
@@ -995,7 +961,94 @@ struct ContentView: View {
                     // handled via the canonical thread_set_state path, so a
                     // protection fault can no longer reach the guest as an AV.
                     // ml514 hooked the wrong path: 0 faults, black window 2/2.
-                    setenv("MYTHIC_SRCWATCH", "1", 1)
+                    /* ml530 (#78): srcwatch subject = the assembled steamui JS buffer, not the
+                     // render bitmap. "1" would mean the legacy render subject, and the
+                     // watch arms only ONCE — so with both call sites live, whichever ran
+                     // first would silently win and the other would never arm at all.
+                     //
+                     // Target: V8 reports `SyntaxError: Invalid or unexpected token` on
+                     // steamui JS that our file reads deliver byte-perfect (ml489: 73/73
+                     // MATCH, the failing file 100% verified through NtReadFile). That is
+                     // the DOMINANT Steam variance — 27 of 45 attempts stall right after
+                     // BrowserReady because the UI script never parses — and the same
+                     // corrupter family as the render glitch, so it buys both. */
+                    /* ml533: back to the RENDER subject — the js subject is structurally
+                    // blocked (the failing steamui files are read through a reused 64KB
+                    // chunk buffer, so no assembled buffer exists in our view). The render
+                    // watch now names the CALLER via the guest return address at [RSP],
+                    // which is what the block-granular RIP could never do. */
+                    // ml556 CLEAN-BASELINE TEST: srcwatch OFF.
+                    //
+                    // It write-protects the render bitmap and takes a Mach fault
+                    // per page ON THE RENDER HOT PATH, and the correlation across
+                    // this session is stark:
+                    //     attributions 1824/2370/426/2721 -> run dies at 36-52 s
+                    //     attributions 0/0/0              -> run reaches 94-106 s
+                    // Runs carrying our instrumentation die in roughly half the
+                    // time. Before attributing the crash to Steam or to FEX we owe
+                    // ourselves the one-variable control: does it still crash with
+                    // the probe off? Re-enable by restoring "render".
+                    // ml574: arm the dead-release detector in wineserver.
+                    // O(n) walk of object_list on every release_object — slow by
+                    // design, diagnostic only. Set to "0" to disarm.
+                    // ml579: DISABLED. It walks the global wineserver object list on
+                    // EVERY release_object() — O(n) in the single-threaded server. It
+                    // already caught the free_async_queue over-release (ml574) and that
+                    // fix is shipped; leaving the detector armed just starves the server,
+                    // and Steam allows each CM ping only 1000 ms. Set to "1" to re-arm.
+                    setenv("MYTHIC_DEAD_RELEASE", "0", 1)
+                    setenv("MYTHIC_SRCWATCH", "off", 1)
+                    // ml548: restrict srcwatch to the row band where displacement
+                    // was actually MEASURED, so the 400-attribution budget is not
+                    // spent on the full-frame clear (which touches every page
+                    // first and made the content painters invisible in ml517).
+                    // Band from ml543 frame 009: the Steam logo core landed at
+                    // (96,188) instead of (350,188) — exactly -254 px, one tile
+                    // pitch — so rows 150..230 bracket the displaced element.
+                    // ml550: was "150,230" — chosen for the SPLASH logo. On a
+                    // login-window run that band produced ZERO attributions
+                    // (426 on the splash run), because nothing painted there.
+                    // Widen to most of the surface so the watch follows whatever
+                    // the frame actually draws; the per-page budget still bounds
+                    // the fault cost.
+                    setenv("MYTHIC_SRCWATCH_ROWS", "0,400", 1)
+                    // ml527 (#82 RETEST, ONE VARIABLE): run V8 with its JIT on.
+                    //
+                    // ml526's phase timeline made the case concrete — of ~39s to
+                    // the login window, the single biggest block is 13.0s of
+                    // BrowserReady -> GetDesiredSteamUIWindows, i.e. Steam's UI
+                    // JavaScript booting, and interpreted V8 costs 5-20x there.
+                    //
+                    // #82 convicted jitless-off because both trial runs parked
+                    // CrBrowserMain shortly after BrowserReady (ml474b +104s,
+                    // ml475 +4s). ⚠️ Both ran with StikDebug attached and
+                    // spinning, when every trap was a round-trip to a starved
+                    // debugger — the overhead that made webhelper bring-up 89s
+                    // instead of 9s (b439be6). V8's JIT emits runtime x86, the
+                    // heaviest trap/compile workload in the process, so it is
+                    // exactly what that overhead punished worst. The verdict may
+                    // not survive early detach.
+                    //
+                    // ⛔ VERDICT (ml527, 2 runs): #82 SURVIVES early detach — jitless
+                    // stays ON. Both jitless-off runs died in the SAME window ml474b
+                    // and ml475 died in: right after BrowserReady, before
+                    // GetDesiredSteamUIWindows was ever reached (13:20:19 and
+                    // 13:22:45), so 4/4 across two completely different debugger
+                    // regimes. The failure MODE changed — a c0000005 ->
+                    // chrome_elf.dll+0xd4153 -> ffff7001 Crashpad termination rather
+                    // than #82's park in NtWaitForAlertByThreadId — but the window is
+                    // identical, and jitless-ON reaches the login window repeatedly
+                    // through that same window.
+                    //
+                    // No consolation prize either: BrowserReady took 12s and 10s with
+                    // the JIT on vs 8-11s (median 9s) with it off, because V8's JIT
+                    // emits runtime x86 that FEX must then compile. So the debugger
+                    // overhead was NOT what convicted jitless-off, and the 13s of
+                    // Steam UI JavaScript stays unmeasured — neither run survived to
+                    // reach it.
+                    //
+                    // Flip to "0" only alongside a fix for the post-BrowserReady death.
+                    setenv("MYTHIC_JITLESS", "1", 1)
                     // ml514 note (kept for the record): The ml514 watch
                     // armed correctly (76 pages protected) but logged ZERO
                     // faults and produced an all-black window on two runs: the
@@ -1019,7 +1072,7 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.green)
 
-                Button("Run Desktop + services (R2v2)") {
+                Button("Wine Virtual Desktop") {
                     // S3-pre R2v2: raw rpcss.exe CANNOT run standalone —
                     // its wmain unconditionally StartServiceCtrlDispatcherW's
                     // (rpcss_main.c:282), which RPCs back to the SCM; without
@@ -1050,7 +1103,7 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.mint)
 
-                Button("Run Thumper (D3D11 / win10)") {
+                Button("Thumper (standalone)") {
                     // Game lives at Documents/wine/drive_c/Program Files/Thumper/
                     // (push via scripts/deploy-thumper.sh during development;
                     // bundled as resource for distribution later).
@@ -1063,7 +1116,7 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.pink)
 
-                Button("Run x64 cube (FEX/ARM64EC + DXMT)") {
+                Button("x64 DX11 cube") {
                     setenv("MYTHIC_EXE", "cube-x64.exe", 1)
                     unsetenv("MYTHIC_ARGS")
                     runWineFullSequence()
@@ -1071,7 +1124,7 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.purple)
 
-                Button("Run D3D11 Triangle") {
+                Button("arm64 DX11 cube") {
                     runTriangleTest()
                 }
                 .buttonStyle(.borderedProminent)
@@ -1131,10 +1184,26 @@ struct ContentView: View {
         .listStyle(.plain)
     }
 
-    private func timeString(_ date: Date) -> String {
+    // ml540: ONE formatter for the whole app, built once on first use.
+    //
+    // This used to construct a fresh DateFormatter on every call — once per log
+    // row per body evaluation — and each new instance opens ICU underneath
+    // (udat_open -> SimpleDateFormat::initialize). That is not just wasteful,
+    // it is where ml539 died: after Wine's main thread exited, ICU ran
+    // _platform_strcmp on a pointer into that dead thread's stack (x0 sat 0x68C
+    // below its recorded tsd_base) and took the whole app down. A single
+    // long-lived formatter does the ICU open ONCE, at first log render, long
+    // before Wine exists.
+    private static let hhmmss: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
-        return f.string(from: date)
+        return f
+    }()
+
+    // Main-thread only (SwiftUI body evaluation) — DateFormatter is not safe to
+    // share across threads.
+    private func timeString(_ date: Date) -> String {
+        ContentView.hhmmss.string(from: date)
     }
 
     private var statusColor: Color {
@@ -1391,10 +1460,12 @@ struct ContentView: View {
             // The remaining levers are USE-side: the 276MB of duplicate copies
             // (.text sharing) and the 214MB tail of EC code buffers.
             let poolSizeMB = 896
+            winios_phase("pool-alloc-begin")
             logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
             let t0 = CFAbsoluteTimeGetCurrent()
             let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
             let elapsed = CFAbsoluteTimeGetCurrent() - t0
+            winios_phase("pool-ready")
             logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")
 
             if let pool = pool {
@@ -1444,11 +1515,15 @@ struct ContentView: View {
                 logStore.log("[early-detach] rev=ml524 DISABLED — debugger stays attached all run")
             }
 
+            winios_phase("detach-done")
+
             // Step 2: Start wineserver
             self.startWineserver()
+            winios_phase("wineserver-up")
 
             // Step 3: Start Wine (debugger still attached for PE loading BRK calls)
             Thread.sleep(forTimeInterval: 2.0)
+            winios_phase("wine-start")
             self.startWineProcess()
 
             // Step 4: Wait for Wine to finish instead of fixed timer

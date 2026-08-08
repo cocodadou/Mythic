@@ -946,6 +946,16 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         }
     }
 
+    /* ml526: stamp every accepted spawn on the startup timeline. This is the
+     * boundary the coarse phase accounting could not see — steam.exe -> the
+     * webhelper spawn was a ~16s block with no internal detail. */
+    {
+        extern void winios_phase( const char *name );
+        char pbuf[160];
+        snprintf( pbuf, sizeof(pbuf), "spawn:%s", debugstr_us( &params->ImagePathName ) );
+        winios_phase( pbuf );
+    }
+
     /* task #34 single-process CEF: the 64GB VA window above the GPU carveout
      * can hold exactly ONE CEF instance's PartitionAlloc pools + one V8
      * sandbox (see virtual_ios.c slot allocator). Force steamwebhelper into
@@ -1174,8 +1184,32 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                  * FEX: ml512 flips VectorTSOEnabled + MemcpySetTSOEnabled
                  * defaults in the fork (unordered vector/memcpy accesses are
                  * the audited accuracy gap; x86 orders them, FEX did not). */
-                static const char sp[] = " --single-process --enable-logging=file --v=1 --log-severity=verbose"
-                                         " --no-proxy-server --winhttp-proxy-resolver --js-flags=--jitless";
+                /* ml526 (#82 RETEST): jitless is now A/B-able at runtime.
+                 *
+                 * ml476 restored --jitless because BOTH jitless-off runs parked
+                 * CrBrowserMain in NtWaitForAlertByThreadId shortly after
+                 * BrowserReady (ml474b +104s, ml475 +4s) and stopped writing
+                 * cef_log. ⚠️ Every one of those runs had StikDebug attached and
+                 * spinning, which we now know made each trap a round-trip to a
+                 * starved debugger — the same overhead that made webhelper
+                 * bring-up 89s instead of 9s (b439be6). V8's JIT emits runtime
+                 * x86, i.e. MORE trap/compile traffic than anything else in the
+                 * process, so it is exactly the workload that overhead punished
+                 * hardest. The #82 verdict may not survive its removal.
+                 *
+                 * Interpreted V8 costs 5-20x on all of Steam's UI JavaScript, so
+                 * this is the largest single startup lever we have.
+                 * MYTHIC_JITLESS=0 turns it off; default stays ON (unchanged). */
+                static const char sp_jitless[] = " --single-process --enable-logging=file --v=1 --log-severity=verbose"
+                                                 " --no-proxy-server --winhttp-proxy-resolver --js-flags=--jitless";
+                static const char sp_jit[]     = " --single-process --enable-logging=file --v=1 --log-severity=verbose"
+                                                 " --no-proxy-server --winhttp-proxy-resolver";
+                const char *jl = getenv( "MYTHIC_JITLESS" );
+                int jitless_on = !(jl && jl[0] == '0');
+                const char *sp = jitless_on ? sp_jitless : sp_jit;
+                dprintf(2, "[proc-gate] V8 %s (MYTHIC_JITLESS=%s) rev=ml526\n",
+                        jitless_on ? "JITLESS (interpreted)" : "JIT ENABLED — #82 retest",
+                        jl ? jl : "unset");
                 static const char dfs[] = "--disable-features=";
                 /* ml426 (#70): + segmentation-platform features. Four CreateBrowser
                  * runs died C00000FD in the CreateResponse→BrowserReady gap, and
@@ -1188,7 +1222,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                  * run: --js-flags=--jitless held in reserve if this fails. */
                 static const char brp[] = ",PartitionAllocBackupRefPtr,SegmentationPlatform"
                                           ",OptimizationTargetPrediction,OptimizationHints";
-                int sl = sizeof(sp) - 1;
+                int sl = (int)strlen( sp );
                 int dfl = sizeof(dfs) - 1, bl = sizeof(brp) - 1;
                 int df_end = -1;
                 {

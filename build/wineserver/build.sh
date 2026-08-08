@@ -65,6 +65,12 @@ PATCHED_FILES=(
     "mach_ios:mach_ios.c:mach.o"
     "unicode_ios:unicode_ios.c:unicode.o"
     "fd_ios:fd_ios.c:fd.o"
+    # ml574: object.c must appear in BOTH lists — SOURCES compiles it,
+    # REPLACEMENTS inserts it into the prebuilt base archive. An entry in
+    # only the first compiles, prints OK, and is silently discarded.
+    "object:$WINE_SRC/server/object.c:object.o"
+    # ml575: async.c carries the free_async_queue UAF fix.
+    "async:$WINE_SRC/server/async.c:async.o"
     "process_ios:$WINE_SRC/server/process.c:process.o"
     # Files needing rebuild only because the -Dws_* renames must apply
     # to both definers and callers — fixes 10 symbol collisions with win32u.
@@ -151,6 +157,8 @@ REPLACEMENTS=(
     "winstation.o:winstation.o"
     "thread.o:thread.o"
     "sock.o:sock.o"
+    "object.o:object.o"
+    "async.o:async.o"
 )
 
 for entry in "${REPLACEMENTS[@]}"; do

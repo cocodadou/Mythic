@@ -86,6 +86,11 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
 #define NTDLL_DWARF_H_NO_UNWINDER
 #include "dwarf.h"
 
+/* ml648: defined in virtual_ios.c, called from the SWPAL emulation path. */
+void ios_mono_bridge_capture( unsigned long long teb, unsigned long long frame,
+                              unsigned long long host_pc, unsigned long long fault_addr );
+
+
 /* ml255: storm gate -- see ios_storm_gate in virtual_ios.c for the rationale
  * (510 MB log from a 524k-iteration NULL-deref loop). */
 static int ios_sig_storm_gate( unsigned long *n )
@@ -2850,6 +2855,28 @@ static void *ios_mach_exception_thread( void *arg )
                             }
                             if (rt != 31) state.__x[rt] = old;  /* XZR discards the result */
                             emulated = 1;
+
+                            /* ml648: THIS is Mono's backpatcher, and this is the fault
+                             * FEX has never been allowed to see.
+                             *
+                             * On Windows the write traps, HandleRWXAccessViolation runs,
+                             * DetectMonoBackpatcherBlock recognises the XCHG and recompiles
+                             * the block so the store becomes a direct MonoBackpatcherWrite
+                             * call — no fault at all. On iOS we emulate here first, so that
+                             * optimisation has never once fired: [mono-cfg] says HOOKS
+                             * ARMED yet "Detected mono backpatcher" appears zero times,
+                             * and the bill is 40,639 exceptions/sec mean, 88,064 peak.
+                             *
+                             * Record RAW FACTS ONLY. No guest-RIP reconstruction, no opcode
+                             * decode, no allocation, no formatting, no locks, and above all
+                             * no call into ARM64EC code (ml613 crashed every launch doing
+                             * that). x28 is FEX's state frame, x18 the TEB; both are just
+                             * numbers here and are treated as untrusted. Everything is
+                             * interpreted later at the FEX safe point. */
+                            if (size_lg2 == 3)
+                                ios_mono_bridge_capture( state.__x[18], state.__x[28],
+                                                         (uint64_t)state.__pc,
+                                                         (uint64_t)fault_addr );
                             {
                                 static int swp_n;
                                 if (swp_n < 8)

@@ -115,6 +115,15 @@ extern kern_return_t vm_protect(mach_port_t target_task, vm_address_t address,
 #include "unix_private.h"
 #include "wine/debug.h"
 
+/* ml648: the Mono-bridge alias table is defined further down, but the anon-alias
+ * teardown paths ABOVE it must retire entries too — an unmapped alias left live
+ * would resolve a stale guest_rx to memory that no longer backs it. Declared here
+ * so those earlier call sites do not create an implicit declaration. */
+#include <stdint.h>
+void ios_mono_alias_publish( uint64_t guest_rx, uint64_t host_rw, uint64_t size );
+void ios_mono_alias_retire( uint64_t guest_rx );
+
+
 WINE_DEFAULT_DEBUG_CHANNEL(virtual);
 WINE_DECLARE_DEBUG_CHANNEL(module);
 WINE_DECLARE_DEBUG_CHANNEL(virtual_ranges);
@@ -2002,6 +2011,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
                             (unsigned long)off, (unsigned long)alloc_size);
                     ios_jit_anon_aliases[i].user_va_end = 0;
                     __sync_synchronize();
+                    ios_mono_alias_retire( ios_jit_anon_aliases[i].user_va );  /* ml648: unmap/teardown */
                     ios_jit_anon_aliases[i].user_va = 0;
                 }
             }
@@ -2693,6 +2703,159 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
  * new executable memory MUST NOT report success when this fails -- writes to that
  * range would then silently not route, which is exactly how the ULTRAKILL main
  * thread died. */
+/* ============================ ml648 MONO BRIDGE ============================
+ * See ios_mono_bridge.h for why this table is SEPARATE from IosAliasEntries.
+ * Short version: Module.S's ios_ffs_xlate_loop rewrites control-flow targets
+ * through that table, so a guest-RX -> RW pair in it would send calls into the
+ * non-executable mapping. Only MonoBackpatcherWrite reads this one. */
+#include "ios_mono_bridge.h"
+
+struct ios_mono_bridge g_ios_mono_bridge = { .abi_version = 1 };
+
+/* Faulting-thread registers are not trusted, and a probe must never fault
+ * inside a fault. Every dereference on the capture path goes through here —
+ * the same discipline the ml612 Floyd probe used. */
+static int ios_safe_read64( uint64_t addr, uint64_t *out )
+{
+    mach_vm_size_t got = 0;
+    if (addr < 0x1000 || (addr & 7)) return -1;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)addr,
+                                8, (mach_vm_address_t)out, &got ) != KERN_SUCCESS)
+        return -1;
+    return got == 8 ? 0 : -1;
+}
+
+/* Sequence-lock publication. Live entries carry an ODD generation; the writer
+ * bumps to EVEN first so any concurrent reader rejects the entry while its
+ * fields are in flux, then bumps to ODD once they are settled. A reader that
+ * samples the generation, reads, and samples again accepts only when both
+ * samples are equal and odd — so a retired-and-reused slot can never be
+ * mistaken for a live one, which is the case that would corrupt guest memory. */
+void ios_mono_alias_publish( uint64_t guest_rx, uint64_t host_rw, uint64_t size )
+{
+    struct ios_mono_bridge *b = &g_ios_mono_bridge;
+    unsigned int i, count = __atomic_load_n( &b->alias_count, __ATOMIC_ACQUIRE );
+
+    for (i = 0; i < count; i++)
+    {
+        if (b->aliases[i].guest_rx != guest_rx) continue;
+        __atomic_add_fetch( &b->aliases[i].generation, 1, __ATOMIC_RELEASE );   /* -> even, readers miss */
+        b->aliases[i].host_rw = host_rw;
+        b->aliases[i].size    = size;
+        __atomic_add_fetch( &b->aliases[i].generation, 1, __ATOMIC_RELEASE );   /* -> odd, live again */
+        return;
+    }
+    if (count >= IOS_MONO_MAX_ALIASES) return;   /* full: miss, never overwrite */
+
+    b->aliases[count].guest_rx = guest_rx;
+    b->aliases[count].host_rw  = host_rw;
+    b->aliases[count].size     = size;
+    __atomic_store_n( &b->aliases[count].generation, 1, __ATOMIC_RELEASE );     /* odd = live */
+    __atomic_store_n( &b->alias_count, count + 1, __ATOMIC_RELEASE );
+}
+
+void ios_mono_alias_retire( uint64_t guest_rx )
+{
+    struct ios_mono_bridge *b = &g_ios_mono_bridge;
+    unsigned int i, count = __atomic_load_n( &b->alias_count, __ATOMIC_ACQUIRE );
+
+    for (i = 0; i < count; i++)
+    {
+        if (b->aliases[i].guest_rx != guest_rx) continue;
+        if (b->aliases[i].generation & 1)
+            __atomic_add_fetch( &b->aliases[i].generation, 1, __ATOMIC_RELEASE ); /* -> even, dead */
+        return;
+    }
+}
+
+/* Handed to FEX once, PE->unix via WINE_UNIX_CALL — the safe direction. The
+ * reverse (native calling an ARM64EC export) is what killed every ml613 launch. */
+NTSTATUS unixcall_ios_mono_bridge_ptr( void *args )
+{
+    /* ml648: publish the FEX code range HERE, not from FEX — this side owns the
+     * JIT pool and knows its exact bounds. The Mach handler uses it to reject an
+     * implausible BlockBegin BEFORE dereferencing it; if the pool is not up yet
+     * the range stays 0, which disables that check rather than inventing one. */
+    {
+        extern void *ios_jit_rx_base_global;
+        extern size_t ios_jit_pool_size_global;
+        if (ios_jit_rx_base_global && ios_jit_pool_size_global)
+        {
+            g_ios_mono_bridge.code_lo = (uint64_t)ios_jit_rx_base_global;
+            g_ios_mono_bridge.code_hi = (uint64_t)ios_jit_rx_base_global + ios_jit_pool_size_global;
+        }
+    }
+    *(uint64_t *)args = (uint64_t)&g_ios_mono_bridge;
+    /* ml648 LIVENESS, one line, once. Without it a quiet run cannot be told
+     * apart from a dead one: "no qualifying SWPAL happened" and "the bridge was
+     * never wired up at all" look identical in the log. Absence of a probe
+     * string is not absence of the failure. FEX prints the companion lines once
+     * it has published the offsets and once it arms Mono. */
+    {
+        static int once;
+        if (!once++)
+            dprintf(2, "[mono-bridge] ml648 REGISTERED bridge=%p abi=%u code=[%p,%p) -- awaiting FEX"
+                       " offsets (capture stays inert until mono_base is armed)\n",
+                    (void *)&g_ios_mono_bridge, g_ios_mono_bridge.abi_version,
+                    (void *)g_ios_mono_bridge.code_lo, (void *)g_ios_mono_bridge.code_hi);
+    }
+    return 0;
+}
+
+/* Capture, called from the Mach SWPAL path. Records RAW FACTS ONLY: no guest
+ * RIP reconstruction, no opcode decode, no allocation, no formatting, no locks.
+ * Every interpretation happens later at the FEX safe point where
+ * ios_fex_rip_from_hostpc() already exists. */
+void ios_mono_bridge_capture( uint64_t teb, uint64_t frame, uint64_t host_pc, uint64_t fault_addr )
+{
+    struct ios_mono_bridge *b = &g_ios_mono_bridge;
+    uint64_t block_begin, context = 0;
+    unsigned int i;
+
+    /* Key by PEB, not by process-globals: pseudo-processes share one address
+     * space, so a single slot would let one process's fault mark another's
+     * block. TEB->PEB is at +0x60. Safe-read it — x18 came from a faulting
+     * thread and is not trusted. */
+    if (!teb || ios_safe_read64( teb + 0x60, &context ) || !context) return;
+
+    /* Offsets unpublished => FEX has not initialised => capture disabled. The
+     * safe default: never guess a struct layout inside a fault handler. */
+    if (!b->off_inline_jit_block_header && !b->off_block_tail && !b->off_tail_rip) return;
+    if (!b->mono_base) { __atomic_add_fetch( &b->n_reject_unarmed, 1, __ATOMIC_RELAXED ); return; }
+    if (!frame)        { __atomic_add_fetch( &b->n_reject_no_frame, 1, __ATOMIC_RELAXED ); return; }
+
+    /* frame + off = InlineJITBlockHeader. Read defensively; this pointer comes
+     * from a register in a faulting thread and is not trusted. */
+    if (ios_safe_read64( frame + b->off_inline_jit_block_header, &block_begin ) || !block_begin)
+    { __atomic_add_fetch( &b->n_reject_bad_block, 1, __ATOMIC_RELAXED ); return; }
+    /* Must look like a JIT block, or we would hand FEX a wild pointer. */
+    if (b->code_lo && (block_begin < b->code_lo || block_begin >= b->code_hi))
+    { __atomic_add_fetch( &b->n_reject_outside_code, 1, __ATOMIC_RELAXED ); return; }
+
+    for (i = 0; i < IOS_MONO_MAX_CONTEXTS; i++)
+    {
+        struct ios_mono_pending *p = &b->pending[i];
+        uint64_t owner = __atomic_load_n( &p->context, __ATOMIC_ACQUIRE );
+
+        if (owner != context)
+        {
+            if (owner) continue;
+            if (!__atomic_compare_exchange_n( &p->context, &owner, context, 0,
+                                              __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE )) continue;
+        }
+        /* One-shot per context: state 2 means FEX already activated. */
+        if (__atomic_load_n( &p->state, __ATOMIC_ACQUIRE )) return;
+
+        p->block_begin = block_begin;
+        p->host_pc     = host_pc;
+        p->fault_addr  = fault_addr;
+        __atomic_store_n( &p->state, 1, __ATOMIC_RELEASE );      /* publish last */
+        __atomic_add_fetch( &b->n_captured, 1, __ATOMIC_RELAXED );
+        return;
+    }
+}
+/* ========================== end ml648 MONO BRIDGE ========================= */
+
 int ios_jit_anon_alias_add(void *user_va, size_t size, void *jit_rw_alias)
 {
     int idx = -1, i;
@@ -2754,7 +2917,12 @@ int ios_jit_anon_alias_add(void *user_va, size_t size, void *jit_rw_alias)
     ios_jit_anon_aliases[idx].jit_rw_alias = (uintptr_t)jit_rw_alias;
     ios_jit_anon_aliases[idx].jit_rx_alias = 0;  /* set via _set_rx */
     __sync_synchronize();
+    /* ml648: retire the slot's previous occupant before it is overwritten, or a
+     * stale guest_rx would keep resolving to an RW alias that no longer backs it. */
+    if (ios_jit_anon_aliases[idx].user_va && ios_jit_anon_aliases[idx].user_va != (uintptr_t)user_va)
+        ios_mono_alias_retire( ios_jit_anon_aliases[idx].user_va );
     ios_jit_anon_aliases[idx].user_va = (uintptr_t)user_va;
+    ios_mono_alias_publish( (uintptr_t)user_va, (uintptr_t)jit_rw_alias, size );
     if (idx == ios_jit_anon_alias_count) ios_jit_anon_alias_count = idx + 1;
     else ios_jit_anon_alias_tombstones++;   /* reclaimed a retired slot */
     if (++ios_jit_anon_alias_live > ios_jit_anon_alias_hiwater)
@@ -5873,6 +6041,7 @@ void ios_jit_reclaim_process( void *peb )
             {
                 ios_jit_anon_aliases[j].user_va_end = 0;
                 __sync_synchronize();
+                ios_mono_alias_retire( ios_jit_anon_aliases[j].user_va );  /* ml648: unmap/teardown */
                 ios_jit_anon_aliases[j].user_va = 0;
                 aliases_killed++;
             }

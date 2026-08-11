@@ -132,8 +132,15 @@ enum StikJITHelper {
         //   pool code there hangs the first pool call silently (black
         //   screen / wallpaper-only desktop).
         // Reject bad placements and re-roll: a bad region is freed when the
-        // kernel allows, otherwise kept alive as a pin — either way the next
-        // jit26 pick must land elsewhere.
+        // kernel allows, otherwise kept alive as a pin.
+        // ⚠️ ml596: the old claim that the next pick "must land elsewhere" is FALSE.
+        // ml595 freed and re-requested three times and the kernel handed back the
+        // SAME 0x7000000000 hole each time, so the retry loop is not a strategy —
+        // it is three identical attempts. Failure is therefore deterministic within
+        // a launch and the caller must abort rather than run without a pool. A real
+        // fix needs explicit placement (hinted allocation / reserve-and-carve),
+        // not a re-roll; simply pinning the bad region to force a different address
+        // costs another 896MB against the 4096MB jetsam ceiling.
         let goodLow = 0x119000000
         let guestLo = 0x7000000000
         let guestHi = 0x8000000000

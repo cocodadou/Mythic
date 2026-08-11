@@ -1355,6 +1355,8 @@ static NTSTATUS ios_wrap_unix_call(int index, void *args, unixlib_entry_t real_f
 }
 
 extern NTSTATUS unixcall_ios_push_jit_aliases(void *args);  /* virtual_ios.c */
+extern NTSTATUS unixcall_ios_register_hold_release(void *args);  /* ml618, virtual_ios.c */
+extern NTSTATUS unixcall_ios_jit_alias_probe(void *args);        /* ml631, virtual_ios.c */
 
 static NTSTATUS ios_wrap_0(void *a) { return ios_wrap_unix_call(0, a, load_so_dll); }
 static NTSTATUS ios_wrap_1(void *a) { return ios_wrap_unix_call(1, a, unwind_builtin_dll); }
@@ -1365,12 +1367,14 @@ static NTSTATUS ios_wrap_5(void *a) { return ios_wrap_unix_call(5, a, unixcall_w
 static NTSTATUS ios_wrap_6(void *a) { return ios_wrap_unix_call(6, a, unixcall_wine_spawnvp); }
 static NTSTATUS ios_wrap_7(void *a) { return ios_wrap_unix_call(7, a, system_time_precise); }
 static NTSTATUS ios_wrap_8(void *a) { return ios_wrap_unix_call(8, a, unixcall_ios_push_jit_aliases); }
+static NTSTATUS ios_wrap_9(void *a) { return ios_wrap_unix_call(9, a, unixcall_ios_register_hold_release); }
+static NTSTATUS ios_wrap_10(void *a) { return ios_wrap_unix_call(10, a, unixcall_ios_jit_alias_probe); }
 
 static const unixlib_entry_t unix_call_funcs[] =
 {
     ios_wrap_0, ios_wrap_1, ios_wrap_2, ios_wrap_3,
     ios_wrap_4, ios_wrap_5, ios_wrap_6, ios_wrap_7,
-    ios_wrap_8,
+    ios_wrap_8, ios_wrap_9, ios_wrap_10,
 };
 #else
 static const unixlib_entry_t unix_call_funcs[] =
@@ -1384,6 +1388,8 @@ static const unixlib_entry_t unix_call_funcs[] =
     unixcall_wine_spawnvp,
     system_time_precise,
     unixcall_ios_push_jit_aliases,
+    unixcall_ios_register_hold_release,
+    unixcall_ios_jit_alias_probe,
 };
 #endif
 
@@ -1403,7 +1409,9 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     wow64_wine_server_handle_to_fd,
     wow64_wine_spawnvp,
     system_time_precise,
-    unixcall_ios_push_jit_aliases,  /* iOS only — wow64 case unreachable */
+    unixcall_ios_push_jit_aliases,       /* iOS only — wow64 case unreachable */
+    unixcall_ios_register_hold_release,  /* iOS only — wow64 case unreachable */
+    unixcall_ios_jit_alias_probe,        /* ml631 — keep table lengths in step */
 };
 
 #endif  /* _WIN64 */

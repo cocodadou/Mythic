@@ -141,8 +141,27 @@ static void my_on_main_thread(dispatch_block_t b) {
 }
 
 // --- Exported symbols (dlsym RTLD_DEFAULT finds these in the main binary) ---
+//
+// `used` is LOAD-BEARING, not decoration. Nothing in this program references
+// these by name: DXMT's winemetal_unix.c reaches them only through
+// dlsym(RTLD_DEFAULT, "macdrv_functions"), which the linker cannot see. Under a
+// Release link (-dead_strip) they are therefore unreferenced and get removed,
+// visibility("default") notwithstanding -- visibility governs whether a symbol
+// that SURVIVES is exported, not whether it survives. `used` emits .no_dead_strip
+// so the linker keeps them.
+//
+// That is exactly how Thumper broke on 2026-08-08: the host app was rebuilt
+// Release instead of Debug, these six symbols vanished from the binary, DXMT's
+// lookup returned NULL and d3d11_swapchain aborted with "your Wine has no
+// exported symbols needed by DXMT" -> exit code 3 -> white screen.
+//
+// `used` alone proved sufficient: after adding it, all six land in the export
+// trie of a Release build, so no -u roots or -export_dynamic are needed. Do not
+// assume that stays true -- VERIFY BY CONTENT after any build or link change:
+//   xcrun dyld_info -exports Mythic.app/Mythic | grep macdrv_functions
+// If that prints nothing, Thumper will exit 3 with a white screen.
 
-__attribute__((visibility("default")))
+__attribute__((used, visibility("default")))
 struct macdrv_functions_t macdrv_functions = {
     .macdrv_init_display_devices    = NULL,
     .get_win_data                   = my_get_win_data,
@@ -157,23 +176,23 @@ struct macdrv_functions_t macdrv_functions = {
 };
 
 // Also export individual symbols as a fallback (DXMT checks both paths).
-__attribute__((visibility("default")))
+__attribute__((used, visibility("default")))
 struct macdrv_win_data *get_win_data(HWND hwnd) { return my_get_win_data(hwnd); }
 
-__attribute__((visibility("default")))
+__attribute__((used, visibility("default")))
 void release_win_data(struct macdrv_win_data *data) { my_release_win_data(data); }
 
-__attribute__((visibility("default")))
+__attribute__((used, visibility("default")))
 macdrv_metal_view macdrv_view_create_metal_view(macdrv_view v, macdrv_metal_device d) {
     return my_view_create_metal_view(v, d);
 }
 
-__attribute__((visibility("default")))
+__attribute__((used, visibility("default")))
 macdrv_metal_layer macdrv_view_get_metal_layer(macdrv_metal_view v) {
     return my_view_get_metal_layer(v);
 }
 
-__attribute__((visibility("default")))
+__attribute__((used, visibility("default")))
 void macdrv_view_release_metal_view(macdrv_metal_view v) {
     my_view_release_metal_view(v);
 }

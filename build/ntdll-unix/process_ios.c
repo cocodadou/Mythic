@@ -917,8 +917,39 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
      * to reach or use the login UI, and tolerates a failed spawn exactly like
      * gldriverquery. Refusing it is strictly better than letting it fault. */
     {
+        /* ml601: hardwareupdater joins the gate. Steam spawns
+         *   bin\hardwareupdater\hardwareupdater.exe --check-for-updates
+         * at ~t+94s. It is a PyInstaller binary: it unpacks _MEI6362 and drags in
+         * python314.dll plus a COM init, which cost JIT-pool space (712MB/896MB
+         * live when combase mapped) and pulled combase in and out of the address
+         * space. Nothing about reaching or using Steam's UI needs a hardware
+         * survey update check, and Steam tolerates a refused spawn exactly like
+         * gldriverquery. (The db 7244 crash that this coincided with was OUR
+         * ec-recheck probe reading combase's IAT after it unloaded — fixed
+         * separately in loader.c; gating this simply removes the churn and the
+         * pool pressure from the consistency baseline.) */
+        /* iOS-Mythic ml628: UnityCrashHandler64.exe — same class as steamerrorreporter.
+         *
+         * It is Unity's OPTIONAL crash-reporting helper; the game runs fine without it.
+         * In the ml627 run it started failing, called NtTerminateProcess(0xfffffc85), and
+         * its dying primary thread (tid 0084) then entered FEX with a FEX host-arena
+         * address (0x7d200006e0, band [0x7c,0x80)) as its supposed x64 target. FEX tried
+         * to compile that ~786 MILLION times (real_compiles=785,940,296, cache_hits=184,
+         * hit_rate 0%), pinning a core forever.
+         *
+         * ⚠️ That spin was in the HELPER, not the game: ULTRAKILL's own process (007c)
+         * kept going and reached d3d11.dll + DXGI.DLL afterwards. So gating the helper
+         * removes a broken, non-essential process that is protecting nothing, and leaves
+         * the game untouched.
+         *
+         * ⛔ This is containment, NOT the fix for the host-RIP leak. A host address
+         * reaching CompileBlock is a real defect (see [iOS-bogusrip] / tasks #42, #69) and
+         * "EnterEC wrote it" does NOT name the origin — Core.cpp says so explicitly:
+         * EnterEC storing an x64 target in State.rip is its job. The upstream producer
+         * still needs finding via x9 at DispatchJump/RetToEntryThunk/ExitToX64. */
         static const char * const blocked_names[] = { "steamerrorreporter", "gldriverquery", "vulkandriverquery",
-                                                      "steamsysinfo" };
+                                                      "steamsysinfo", "hardwareupdater",
+                                                      "unitycrashhandler64" };
         const WCHAR *ip = params->ImagePathName.Buffer;
         int ip_len = params->ImagePathName.Length / sizeof(WCHAR);
         unsigned b;

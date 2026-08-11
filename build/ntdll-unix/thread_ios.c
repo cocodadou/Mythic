@@ -1141,6 +1141,80 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
      * crash (seen: every winhttp resolver-thread exit died in
      * objc_release+0x10 under pthread_exit). NULL values are skipped by
      * the cleanup loop, so clear the slot before exiting. */
+    /* iOS-Mythic ml614: DETECT the leaked FEX hold, but DO NOT CALL INTO FEX.
+     *
+     * ⛔⛔ ml613 CALLED BTCpu64IosReleaseThreadHolds FROM HERE AND CRASHED EVERY
+     * LAUNCH. That export is an **ARM64EC PE entry**, not a native Mach-O ARM64
+     * function — its first bytes are the x64 entry thunk. Calling it from this
+     * (native, Mach-O) code fetched those bytes as ARM64 instructions:
+     *
+     *   [xlate-exec]  pc=0x71f99c4040 -> 0x125528040       <- the resolved export
+     *   [av-detail]   hostpc=0x125528040 hinsn=0x48c48b48  <- x64 `48 8b c4 48`
+     *   [mach_exc]    lr=... pthread_exit_wrapper+0x10c    <- called from HERE
+     *   0068: NtTerminateProcess(... c0000005)
+     *
+     * ⚠️ I originally read those [av-detail] lines as "the probe fired harmlessly"
+     * because regs=0/carve=none. They were the probe photographing THIS bug.
+     *
+     * 🔑 RULE: never call a resolved ARM64EC PE export directly from native
+     * unix/Mach-O code — that includes the exact-RIP callback. Any such call needs
+     * either a genuinely native ARM64 C-ABI bridge on FEX's host side, or to run
+     * from code already executing inside the ARM64EC environment.
+     *
+     * So the release itself is DEFERRED (see below for where it belongs). What
+     * stays here is the detection, which costs nothing and is what named the ml611
+     * freeze in the first place. A leaked hold still wedges the process — this
+     * build reports it precisely instead of pretending to fix it.
+     *
+     * NEXT (not in this build): perform the release from the PE-side thread
+     * teardown path (pThreadTerm/ThreadTerm), before it takes FEX teardown locks,
+     * with a dedicated PE-side hook for abnormal exits that bypass it. The
+     * callback/context must also be PEB-keyed — ios_resolve_fex_exports latches
+     * the FIRST libarm64ecfex.dll mapping globally, but there are several
+     * pseudo-process instances in this one Mach task. */
+    if (NtCurrentTeb())
+    {
+        unsigned int tid = (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread;
+        unsigned long long pre_stamp =
+            *(volatile unsigned long long *)((char *)NtCurrentTeb() + 0x16f8);
+        unsigned int pre_depth =
+            *(volatile unsigned int *)((char *)NtCurrentTeb() + 0x16f0);
+        unsigned int rwx_read =
+            *(volatile unsigned char *)((char *)NtCurrentTeb() + 0x1700) ? 1u : 0u;
+
+        /* ml614: gate on actually holding something. ml613 ran this block on EVERY
+         * thread exit once the export resolved, even with pre_stamp == 0. */
+        if (pre_stamp || rwx_read)
+        {
+            /* ml618: RELEASE IT. The callback is the arm64ec_redirect_ptr()-resolved
+             * ARM64 alias registered by the PE side and self-tested there, so this
+             * native call is legal — unlike ml613, which bound base+RVA (the raw x64
+             * entry thunk) and died on every launch.
+             *
+             * PEB-keyed: pick the callback belonging to THIS pseudo-process, because
+             * each has its own FEX context and its own CodeInvalidationMutex.
+             * Runs while the TEB is still valid and before TSD 275 is cleared. */
+            extern unsigned int (*ios_hold_release_lookup(void *peb))(void *, unsigned long long *,
+                                                                      unsigned int *, unsigned int *);
+            void *peb = NtCurrentTeb()->Peb;
+            unsigned int (*cb)(void *, unsigned long long *, unsigned int *, unsigned int *) =
+                ios_hold_release_lookup( peb );
+            unsigned long long stamp = 0;
+            unsigned int depth = 0, flags = 0, r = 0;
+
+            if (cb) r = cb( NtCurrentTeb(), &stamp, &depth, &flags );
+
+            dprintf(2, "[exit-hold] ml618 tid=%04x peb=%p stamp=0x%llx depth=%u rwx_read=%u -> %s"
+                       "released=0x%x (%s%s%s%s)\n",
+                    tid, peb, pre_stamp, pre_depth, rwx_read,
+                    cb ? "" : "NO CALLBACK FOR THIS PEB — STILL LEAKED; ",
+                    r,
+                    (r & 1) ? "shared " : "",
+                    (r & 2) ? "rwx-exclusive " : "",
+                    (r & 4) ? "STAMP-FOREIGN-REFUSED " : "",
+                    (r & 8) ? "no-ctx " : "");
+        }
+    }
     {
         uintptr_t tsd_base;
         __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));

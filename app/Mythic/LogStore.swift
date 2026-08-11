@@ -61,7 +61,22 @@ final class LogStore: ObservableObject {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         logFileURL = docs.appendingPathComponent("mythic-log.txt")
 
-        // Clear log file on each launch (was the behavior before)
+        // ml601: ROTATE, don't destroy.
+        //
+        // This used to truncate unconditionally, so relaunching the app before
+        // pulling wiped the previous run. That cost us the first run in which
+        // Steam's Library view actually rendered content (2026-08-09) — a result
+        // we had never seen before and could not get back. Runs here are
+        // expensive and often not reproducible on demand, so the previous log is
+        // worth one file's worth of disk.
+        //
+        // Pull the previous run with the usual devicectl command, substituting
+        // Documents/mythic-log.prev.txt for Documents/mythic-log.txt.
+        let prevLogURL = docs.appendingPathComponent("mythic-log.prev.txt")
+        if FileManager.default.fileExists(atPath: logFileURL.path) {
+            try? FileManager.default.removeItem(at: prevLogURL)
+            try? FileManager.default.moveItem(at: logFileURL, to: prevLogURL)
+        }
         try? "".write(to: logFileURL, atomically: true, encoding: .utf8)
 
         // Start batch flush timer on main thread. Interval depends on uiPaused.

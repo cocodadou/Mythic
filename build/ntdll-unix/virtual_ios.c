@@ -1705,7 +1705,21 @@ static int ios_pool_range_execable(size_t off, size_t range_size,
  * (which is the only address that's actually executable on iOS TXM).
  * Declared above ios_pool_alloc_range so the allocator can purge stale
  * entries when it recycles a pool range. */
-#define IOS_JIT_MAX_ANON_ALIASES 32
+/* iOS-Mythic ml630: 32 -> 4096.
+ *
+ * ULTRAKILL/Mono ran the table dry: `[jit-pool] anon alias table FULL (32 slots)
+ * -- writes to 0x705f9d0000 will NOT route!`. The new Mono code buffer then had NO
+ * RW alias, so `stur q1,[x6,#-0x40]` into it could not be routed, became an
+ * unhandled 0x80000002, and wine's unwinder then read the half-written unwind
+ * metadata out of that same unpatched buffer and looped ~15.8M times until the
+ * main thread's 8MB stack was gone. tid 007c exited and every Unity/DXMT worker
+ * was orphaned -- all downstream of ONE exhausted 32-entry array.
+ *
+ * 4096 entries is ~128KB, still a flat array safe for the lock-free reader in the
+ * signal handler. 64 would have been far too marginal: Mono keeps many buffers
+ * live at once. ⛔ Do NOT "fix" this class by enlarging the guest stack -- that
+ * only lets a runaway unwind run longer. */
+#define IOS_JIT_MAX_ANON_ALIASES 4096
 struct ios_jit_anon_alias {
     uintptr_t user_va;
     uintptr_t user_va_end;
@@ -1714,6 +1728,46 @@ struct ios_jit_anon_alias {
 };
 static struct ios_jit_anon_alias ios_jit_anon_aliases[IOS_JIT_MAX_ANON_ALIASES];
 static volatile int ios_jit_anon_alias_count = 0;
+/* ml630: census — live entries, tombstones (reclaimed slots) and the high-water
+ * mark, so "how close are we to the ceiling" is answerable from any run. */
+static volatile int ios_jit_anon_alias_live = 0;
+static volatile int ios_jit_anon_alias_hiwater = 0;
+static volatile int ios_jit_anon_alias_tombstones = 0;
+/* iOS-Mythic ml635: per-alias write telemetry.
+ *
+ * The iOS Mach write path emulates a store through the RW alias and then simply
+ * advances PC — it NEVER invalidates FEX's cached translation, unlike the normal
+ * ARM64EC path (Module.cpp HandleRWXAccessViolation). So FEX can translate a page
+ * while it is still zeros, Mono can then fill it through millions of emulated
+ * writes, and execution keeps following the STALE zero translation until it runs
+ * off the end of the mapping. These counters decide that outright:
+ *   write_gen  — bumped on every emulated write into this alias
+ *   written    — bit per 16KB chunk that has EVER been written (first 32 chunks) */
+static volatile unsigned int ios_alias_write_gen[IOS_JIT_MAX_ANON_ALIASES];
+static volatile unsigned int ios_alias_written[IOS_JIT_MAX_ANON_ALIASES];
+static volatile unsigned long long ios_alias_highest[IOS_JIT_MAX_ANON_ALIASES];
+
+void ios_jit_anon_alias_note_write( unsigned long long addr )
+{
+    int n = ios_jit_anon_alias_count, i;
+    for (i = 0; i < n; i++)
+    {
+        uintptr_t b = ios_jit_anon_aliases[i].user_va;
+        if (!b || addr < b || addr >= ios_jit_anon_aliases[i].user_va_end) continue;
+        __sync_add_and_fetch( &ios_alias_write_gen[i], 1 );
+        {
+            unsigned chunk = (unsigned)((addr - b) >> 14);   /* 16KB chunks */
+            if (chunk < 32) __sync_or_and_fetch( &ios_alias_written[i], 1u << chunk );
+            {   /* ml636: highest byte ever written — the tail question needs finer
+                 * resolution than a 16KB bitmap. Monotonic CAS, no lock. */
+                unsigned long long off = (addr - b) + 1, cur;
+                do { cur = ios_alias_highest[i]; if (off <= cur) break; }
+                while (!__sync_bool_compare_and_swap( &ios_alias_highest[i], cur, off ));
+            }
+        }
+        return;
+    }
+}
 
 /* Allocate a page-aligned range from the pool head: free list first
  * (grace-expired first-fit; remainder returned to the list), bump second.
@@ -2128,6 +2182,51 @@ static int ios_tail_carve_occupied( const void *base, size_t size )
 static unsigned ios_tail_carve_n;
 static pthread_mutex_t ios_tail_carve_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* iOS-Mythic ml613: WHICH TAIL CARVE DOES THIS HOST PC LIVE IN, AND IS IT FREE?
+ *
+ * ml612's crash faulted at host pc 0x15361d6d0, which is +0x496d0 into the 16MB
+ * carve 0x1535d4000 — a carve that had been FREEd and REUSEd THREE times in the
+ * preceding ~400 log lines, the last reuse two lines before the fault. That is
+ * the tail-recycling race (#74 family) with a much shorter fuse than a single
+ * reuse would suggest, and the existing ios_tail_carve_occupied() guard cannot
+ * see it: it samples only threads whose PC is inside the carve at the instant of
+ * the free, so dormant return addresses, linked blocks, dispatch-cache entries
+ * and threads that enter the old code LATER all slip through.
+ *
+ * ⚠️ TRYLOCK ONLY. This is called from the Mach exception path; blocking on
+ * ios_tail_carve_lock there would deadlock against whichever thread is mid-carve
+ * and holding it — exactly the thread most likely to be involved. A busy lock
+ * returns -1 and the caller reports "lock busy" rather than lying or hanging.
+ *
+ * Returns 1 found, 0 not-in-any-carve, -1 lock busy. */
+int ios_tail_carve_lookup_trylock( unsigned long long rx_addr, unsigned *idx_out,
+                                   unsigned long long *base_out, unsigned long long *size_out,
+                                   int *free_out )
+{
+    uintptr_t rx_base = (uintptr_t)ios_jit_rx_base_global;
+    unsigned i;
+    int found = 0;
+
+    if (!rx_base || rx_addr < rx_base) return 0;
+    if (pthread_mutex_trylock( &ios_tail_carve_lock ) != 0) return -1;
+    for (i = 0; i < ios_tail_carve_n; i++)
+    {
+        uintptr_t lo = rx_base + ios_tail_carves[i].off;
+        uintptr_t hi = lo + ios_tail_carves[i].size;
+        if (rx_addr >= lo && rx_addr < hi)
+        {
+            if (idx_out)  *idx_out  = i;
+            if (base_out) *base_out = (unsigned long long)lo;
+            if (size_out) *size_out = (unsigned long long)ios_tail_carves[i].size;
+            if (free_out) *free_out = ios_tail_carves[i].free;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock( &ios_tail_carve_lock );
+    return found;
+}
+
 /* Exported JIT pool addresses for use by SIGBUS handler in signal_arm64_ios.c */
 /* ml251: does anything MUNMAP/MMAP inside the JIT pool's VA?
  *
@@ -2346,16 +2445,34 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
  * BTCpu64IosAddAliasMapping. Stores the callback, then pushes all
  * currently-registered iOS JIT aliases through it. Future ios_jit_add_mapping
  * calls also push through the stored callback (see above). */
+/* iOS-Mythic ml613: THIS MUST MATCH struct ios_push_jit_aliases_params IN
+ * wine/dlls/ntdll/unixlib.h EXACTLY — ONE FIELD.
+ *
+ * ml549 added a second `rip_from_hostpc` member here but never added it to the
+ * PE-side declaration, so `a->rip_from_hostpc` read a pointer-sized field PAST
+ * the end of the caller's one-pointer struct and installed whatever happened to
+ * follow it as a function pointer. Live undefined behaviour; it survived only
+ * because every consumer is additionally gated on ios_fex_rip_resolved.
+ *
+ * ⛔ DO NOT "extend and version" this struct in place. An old one-field caller
+ * gives the callee no way to discover whether bytes beyond it exist, so any
+ * size/version field would itself be read out of bounds. If a richer ABI is
+ * ever needed, add a NEW unix-call ordinal carrying its own size/version.
+ *
+ * Both FEX exports are now resolved by walking the already-mapped emulator
+ * module at the end of this call instead of being passed in (see
+ * ios_resolve_fex_exports). */
 struct ios_push_jit_aliases_args {
     void (*callback)(unsigned long long, unsigned long long, unsigned long long);
-    /* ml549: xtajit64's exact host-PC -> guest-RIP lookup, pushed on the same call. */
-    unsigned long long (*rip_from_hostpc)(unsigned long long, unsigned long long);
 };
 
 /* ml549: consumed by the fault probes (srcwatch et al) so they can report the
  * instruction that actually executed instead of the block-granular RIP stored in
  * CpuStateFrame+0x18. NULL until xtajit64 binds, and on non-iOS/native paths. */
 unsigned long long (*ios_fex_rip_from_hostpc_cb)(unsigned long long, unsigned long long) = NULL;
+/* iOS-Mythic ml612: FEX's thread-exit lock-release hook (BTCpu64IosReleaseThreadHolds).
+ * Resolved in ios_resolve_fex_exports alongside the exact-RIP export. */
+unsigned int (*ios_fex_release_holds_cb)(unsigned long long *, unsigned int *, unsigned int *) = NULL;
 /* ml551: set ONLY by a successful resolve. Never infer "resolved" from the pointer
  * being non-NULL -- ml550 found this global holding 0x6c6c642e65736162, i.e. the
  * ASCII "base.dll", so a non-NULL test both skipped the resolve AND let the fault
@@ -2401,56 +2518,152 @@ static void *ios_pe_find_export( const unsigned char *base, const char *want )
     return NULL;
 }
 
-void ios_resolve_fex_rip_lookup( void )
+/* iOS-Mythic ml613: resolve BOTH FEX exports by walking the already-mapped
+ * emulator module. Called at the END of unixcall_ios_push_jit_aliases — the
+ * guaranteed initialization path — and RETRYABLE until it succeeds.
+ *
+ * ml612 hung the release-hook resolution off ios_resolve_fex_rip_lookup(), which
+ * is only reached from a diagnostic path that did not run: ml612 shipped with
+ * ios_fex_release_holds_cb permanently NULL, so its whole containment was inert
+ * (verified — the run had zero [exact-rip] lines). Two rules come out of that:
+ *
+ *  1. Resolve on the path that ALWAYS runs, not on a probe's path.
+ *  2. NEVER latch a failure. The old `static int tried` meant one early call
+ *     before the module was mapped disabled resolution for the entire process
+ *     lifetime. Now only success latches.
+ *
+ * Callbacks are published only after both lookups complete, and the resolved
+ * flag is set LAST, so a concurrent reader either sees the old state or a fully
+ * populated one — never a half-installed pair. */
+void ios_resolve_fex_exports( void )
 {
-    static int tried;
     int i;
 
-    /* ml550: announce ENTRY before any logic. ml549 printed NOTHING from this
-     * function even though its caller's very next line (the srcwatch ARMED ERR)
-     * did print -- so either this was never called or it died inside. An
-     * unconditional entry line makes those two cases distinguishable instead of
-     * leaving silence to interpret. */
-    {
-        unsigned long long raw = (unsigned long long)(uintptr_t)ios_fex_rip_from_hostpc_cb;
-        char asc[9]; int k;
-        for (k = 0; k < 8; k++)
-        { unsigned char c = (unsigned char)(raw >> (8 * k)); asc[k] = (c >= 32 && c < 127) ? c : '.'; }
-        asc[8] = 0;
-        dprintf( 2, "[exact-rip] enter tried=%d resolved=%d cb=0x%llx ascii=\"%s\" mappings=%d rev=ml551\n",
-                 tried, ios_fex_rip_resolved, raw, asc, ios_jit_mapping_count );
-    }
-    if (tried || ios_fex_rip_resolved) return;
-    tried = 1;
-    ios_fex_rip_from_hostpc_cb = NULL;   /* discard whatever was sitting there */
+    /* ml614: latch on the POINTERS, not on ios_fex_rip_resolved — that flag is
+     * deliberately never set now (see below), so keying the early-out on it would
+     * re-parse the PE export table on every call, and one caller is a fault path. */
+    if (ios_fex_rip_from_hostpc_cb && ios_fex_release_holds_cb) return;  /* fully done */
+
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
+        void *rip_cb, *rel_cb;
         const char *nm = ios_pe_module_name( ios_jit_mappings[i].pe_base,
                                              ios_jit_mappings[i].size );
         if (!nm) continue;
         if (!strstr( nm, "xtajit64" ) && !strstr( nm, "arm64ecfex" )) continue;
-        dprintf( 2, "[exact-rip] candidate=%s base=%p size=0x%lx -- parsing exports rev=ml550\n",
-                 nm, ios_jit_mappings[i].pe_base, (unsigned long)ios_jit_mappings[i].size );
-        ios_fex_rip_from_hostpc_cb = ios_pe_find_export( ios_jit_mappings[i].pe_base,
-                                                         "BTCpu64IosRipFromHostPC" );
-        if (ios_fex_rip_from_hostpc_cb) ios_fex_rip_resolved = 1;
-        dprintf( 2, "[exact-rip] module=%s base=%p export=%p %s rev=ml551\n",
-                 nm, ios_jit_mappings[i].pe_base, (void *)ios_fex_rip_from_hostpc_cb,
-                 ios_fex_rip_resolved ? "RESOLVED" : "NOT FOUND (old xtajit64?)" );
+
+        rip_cb = ios_pe_find_export( ios_jit_mappings[i].pe_base, "BTCpu64IosRipFromHostPC" );
+        rel_cb = ios_pe_find_export( ios_jit_mappings[i].pe_base, "BTCpu64IosReleaseThreadHolds" );
+
+        /* Record the addresses for diagnostics. */
+        if (rip_cb) ios_fex_rip_from_hostpc_cb = (void *)rip_cb;
+        if (rel_cb) ios_fex_release_holds_cb = (void *)rel_cb;
+        __sync_synchronize();
+
+        /* ⛔⛔ ml614: DO NOT ARM ios_fex_rip_resolved.
+         *
+         * These are ARM64EC **PE** exports. They are NOT callable from this
+         * (native Mach-O) code — their first bytes are the x64 entry thunk, which
+         * a native `blr` fetches as ARM64 instructions. ml613 armed them and
+         * crashed every single launch:
+         *
+         *   [xlate-exec] pc=0x71f99c4040 -> 0x125528040
+         *   [av-detail]  hostpc=0x125528040 hinsn=0x48c48b48   (x64 `48 8b c4 48`)
+         *   -> c0000005 in pthread_exit_wrapper, then c000001d
+         *
+         * ios_fex_rip_resolved gates the exact-RIP call in signal_arm64_ios.c.
+         * That path had NEVER executed before ml613 (the old resolver was reached
+         * only from a diagnostic entry point that never ran, and before that the
+         * pointer came from an out-of-bounds struct read), so arming it was a new
+         * live call, not a restoration.
+         *
+         * Re-arming requires EITHER a genuinely native ARM64 C-ABI bridge on FEX's
+         * host side, OR making the call from code already running inside the
+         * ARM64EC environment. Also PEB-key it first: this resolver latches the
+         * FIRST libarm64ecfex.dll mapping globally, and there are several
+         * pseudo-process instances in one Mach task. */
+        dprintf( 2, "[fex-exports] ml614 module=%s base=%p rip_from_hostpc=%p release_holds=%p "
+                    "(%s) -- RECORDED BUT NOT ARMED: EC PE exports are not callable "
+                    "from native code (ml613 regression)\n",
+                 nm, ios_jit_mappings[i].pe_base, rip_cb, rel_cb,
+                 (rip_cb && rel_cb) ? "both found"
+                                    : (rel_cb ? "release-only" : (rip_cb ? "rip-only" : "neither — will retry")) );
         return;
     }
-    dprintf( 2, "[exact-rip] emulator module not in ios_jit_mappings (%d entries) -- "
-                "exact RIP unavailable rev=ml549\n", ios_jit_mapping_count );
+    dprintf( 2, "[fex-exports] ml613 emulator module not in ios_jit_mappings (%d entries) "
+                "-- will retry on the next alias push\n", ios_jit_mapping_count );
+}
+
+/* iOS-Mythic ml618: per-pseudo-process leaked-hold release callback.
+ *
+ * The pointer stored here MUST have come from the PE side's GET_PTR path
+ * (arm64ec_redirect_ptr -> xlate_ios_jit), which yields an executable ARM64
+ * alias in the JIT pool. ml613 stored a base+RVA pointer instead — the raw x64
+ * entry thunk — and every launch died executing `48 8b c4 48...` as ARM64.
+ * The PE side self-tests the pointer before registering it.
+ *
+ * PEB-keyed: several pseudo-processes share this Mach task, each with its own
+ * FEX context and its own CodeInvalidationMutex. Using one global callback
+ * would release against the wrong context. */
+#define IOS_HOLD_RELEASE_MAX 32
+static struct { void *peb; unsigned int (*cb)(void *, unsigned long long *, unsigned int *, unsigned int *); }
+    ios_hold_release[IOS_HOLD_RELEASE_MAX];
+static int ios_hold_release_n;
+
+unsigned int (*ios_hold_release_lookup(void *peb))(void *, unsigned long long *, unsigned int *, unsigned int *)
+{
+    int i;
+    for (i = 0; i < ios_hold_release_n; i++)
+        if (ios_hold_release[i].peb == peb) return ios_hold_release[i].cb;
+    return NULL;
+}
+
+struct ios_register_hold_release_args
+{
+    unsigned int size;
+    unsigned int version;
+    void *peb;
+    void *callback;
+};
+
+NTSTATUS unixcall_ios_register_hold_release(void *args)
+{
+    struct ios_register_hold_release_args *p = args;
+    int i;
+
+    if (!p || p->size != sizeof(*p) || p->version != 1 || !p->peb || !p->callback)
+    {
+        dprintf(2, "[hold-release] ml618 REJECTED registration (size=%u want=%u version=%u peb=%p cb=%p)\n",
+                p ? p->size : 0, (unsigned)sizeof(*p), p ? p->version : 0,
+                p ? p->peb : NULL, p ? p->callback : NULL);
+        return STATUS_INVALID_PARAMETER;
+    }
+    for (i = 0; i < ios_hold_release_n; i++)
+        if (ios_hold_release[i].peb == p->peb)
+        {
+            ios_hold_release[i].cb = p->callback;
+            dprintf(2, "[hold-release] ml618 re-registered peb=%p cb=%p slot=%d\n", p->peb, p->callback, i);
+            return STATUS_SUCCESS;
+        }
+    if (ios_hold_release_n >= IOS_HOLD_RELEASE_MAX)
+    {
+        dprintf(2, "[hold-release] ml618 TABLE FULL (%d) — peb=%p will leak holds\n",
+                ios_hold_release_n, p->peb);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    ios_hold_release[ios_hold_release_n].peb = p->peb;
+    ios_hold_release[ios_hold_release_n].cb  = p->callback;
+    ios_hold_release_n++;
+    dprintf(2, "[hold-release] ml618 registered peb=%p cb=%p (%d live)\n",
+            p->peb, p->callback, ios_hold_release_n);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS unixcall_ios_push_jit_aliases(void *args)
 {
-    /* ml549: stash the exact-RIP lookup before anything can early-return. */
-    {
-        const struct ios_push_jit_aliases_args *a = args;
-        if (a) ios_fex_rip_from_hostpc_cb = a->rip_from_hostpc;
-    }
-
+    /* ml613: the ml549 stash that used to live here read a->rip_from_hostpc, a
+     * field the PE-side struct never declared — an out-of-bounds read. Deleted;
+     * both exports are resolved from the mapped module at the end of this call. */
     struct ios_push_jit_aliases_args *params = args;
     int i;
     if (!params || !params->callback) return STATUS_INVALID_PARAMETER;
@@ -2466,12 +2679,21 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
                          (unsigned long long)(uintptr_t)ios_jit_mappings[i].jit_base,
                          (unsigned long long)ios_jit_mappings[i].size);
     }
+    /* ml613: the guaranteed init path — resolve both FEX exports here, where the
+     * emulator module is certainly mapped, instead of from a diagnostic probe
+     * (ml612's mistake) or from a dying thread inside pthread_exit (needlessly
+     * risky: parsing exports while the thread holds FEX locks). */
+    ios_resolve_fex_exports();
     ERR("unixcall_ios_push_jit_aliases: registered callback + drained %d mappings\n",
         ios_jit_mapping_count);
     return STATUS_SUCCESS;
 }
 
-void ios_jit_anon_alias_add(void *user_va, size_t size, void *jit_rw_alias)
+/* ml630: returns 1 on success, 0 if no slot could be claimed. A caller that maps
+ * new executable memory MUST NOT report success when this fails -- writes to that
+ * range would then silently not route, which is exactly how the ULTRAKILL main
+ * thread died. */
+int ios_jit_anon_alias_add(void *user_va, size_t size, void *jit_rw_alias)
 {
     int idx = -1, i;
 
@@ -2480,16 +2702,51 @@ void ios_jit_anon_alias_add(void *user_va, size_t size, void *jit_rw_alias)
      * Serialized by the pool lock (adds are rare: CodeBuffer allocations).
      * Write user_va LAST — it's the match key for the lock-free readers. */
     pthread_mutex_lock( &ios_pool_lock );
+
+    /* iOS-Mythic ml625: AN OVERLAPPING LIVE ENTRY IS STALE BY CONSTRUCTION.
+     *
+     * Two live mappings cannot own the same guest VA, but this table used to
+     * APPEND duplicates and ios_jit_anon_alias_lookup() returns the FIRST match
+     * -- i.e. the OLDEST, now-dead backing. In the ml624 ULTRAKILL run Mono's
+     * code buffer 0x7040220000 was remapped three times onto fresh 16KB pool
+     * slots (0xa574000/0xa578000/0xa57c000) while the live code and its
+     * UNWIND_INFO sat in the original 0xa0dc000 slot. The table kept handing out
+     * the original while the guest VA had been overwritten with zeroed pages, so
+     * RtlVirtualUnwind2 read unwind version 0 and looped ~15.8M times until the
+     * 8MB guest stack was gone.
+     *
+     * Replace the slot in place so the table can never describe two backings for
+     * one VA. (The real fix is upstream -- the remap is now idempotent -- but this
+     * keeps the invariant true even if some other path ever re-registers.) */
     for (i = 0; i < ios_jit_anon_alias_count; i++)
-        if (!ios_jit_anon_aliases[i].user_va) { idx = i; break; }
+    {
+        if (!ios_jit_anon_aliases[i].user_va) continue;
+        if ((uintptr_t)user_va < ios_jit_anon_aliases[i].user_va_end &&
+            ios_jit_anon_aliases[i].user_va < (uintptr_t)user_va + size)
+        {
+            dprintf(2, "[jit-alias] ml625 REPLACE overlapping entry %d: old %p..%p rw=%p -> new %p+0x%lx rw=%p\n",
+                    i, (void *)ios_jit_anon_aliases[i].user_va,
+                    (void *)ios_jit_anon_aliases[i].user_va_end,
+                    (void *)ios_jit_anon_aliases[i].jit_rw_alias,
+                    user_va, (unsigned long)size, jit_rw_alias);
+            idx = i;
+            break;
+        }
+    }
+
+    if (idx < 0)
+        for (i = 0; i < ios_jit_anon_alias_count; i++)
+            if (!ios_jit_anon_aliases[i].user_va) { idx = i; break; }
     if (idx < 0)
     {
         if (ios_jit_anon_alias_count >= IOS_JIT_MAX_ANON_ALIASES) {
             pthread_mutex_unlock( &ios_pool_lock );
             ERR("iOS JIT: anon alias table full (%d)\n", ios_jit_anon_alias_count);
-            dprintf(2, "[jit-pool] anon alias table FULL (%d slots) — writes to %p will NOT route!\n",
-                    IOS_JIT_MAX_ANON_ALIASES, user_va);
-            return;
+            dprintf(2, "[jit-pool] anon alias table FULL (%d slots) — writes to %p will NOT route! "
+                       "live=%d tombstones=%d hiwater=%d rev=ml630\n",
+                    IOS_JIT_MAX_ANON_ALIASES, user_va, ios_jit_anon_alias_live,
+                    ios_jit_anon_alias_tombstones, ios_jit_anon_alias_hiwater);
+            return 0;
         }
         idx = ios_jit_anon_alias_count;
     }
@@ -2499,7 +2756,133 @@ void ios_jit_anon_alias_add(void *user_va, size_t size, void *jit_rw_alias)
     __sync_synchronize();
     ios_jit_anon_aliases[idx].user_va = (uintptr_t)user_va;
     if (idx == ios_jit_anon_alias_count) ios_jit_anon_alias_count = idx + 1;
+    else ios_jit_anon_alias_tombstones++;   /* reclaimed a retired slot */
+    if (++ios_jit_anon_alias_live > ios_jit_anon_alias_hiwater)
+        ios_jit_anon_alias_hiwater = ios_jit_anon_alias_live;
+    {
+        /* Periodic census so the ceiling is never a surprise again. */
+        static int census_n;
+        if (ios_jit_anon_alias_live == 1 || (ios_jit_anon_alias_live % 64) == 0 || census_n < 4) {
+            census_n++;
+            dprintf(2, "[jit-alias] ml630 census live=%d used_slots=%d cap=%d hiwater=%d tombstones=%d\n",
+                    ios_jit_anon_alias_live, ios_jit_anon_alias_count,
+                    IOS_JIT_MAX_ANON_ALIASES, ios_jit_anon_alias_hiwater,
+                    ios_jit_anon_alias_tombstones);
+        }
+    }
     pthread_mutex_unlock( &ios_pool_lock );
+    return 1;
+}
+
+/* iOS-Mythic ml625: is [user_va, user_va+size) ALREADY backed by a live anon
+ * alias? Used to make the anonymous-RWX remap idempotent -- see the call site in
+ * the mprotect(PROT_EXEC) path. Returns 1 and fills the aliases (offset-adjusted
+ * for the requested base) when an existing entry fully covers the request. */
+/* iOS-Mythic ml631: read-only alias probe for the PE-side fault reporter.
+ * Pure lookup — takes no locks, mutates nothing, safe to call from a fault path. */
+NTSTATUS unixcall_ios_jit_alias_probe( void *args )
+{
+    struct ios_jit_alias_probe_params *p = args;
+    int n, i;
+
+    if (!p || p->size < sizeof(*p)) return STATUS_INVALID_PARAMETER;
+    p->rw = p->base = p->end = 0;
+
+    n = ios_jit_anon_alias_count;
+    for (i = 0; i < n; i++)
+    {
+        uintptr_t b = ios_jit_anon_aliases[i].user_va;
+        if (!b) continue;
+        if (p->addr < b || p->addr >= ios_jit_anon_aliases[i].user_va_end) continue;
+        p->rw   = (unsigned long long)(ios_jit_anon_aliases[i].jit_rw_alias + (p->addr - b));
+        p->base = (unsigned long long)b;
+        p->end  = (unsigned long long)ios_jit_anon_aliases[i].user_va_end;
+        p->write_gen = ios_alias_write_gen[i];
+        p->written   = ios_alias_written[i];
+        p->highest   = ios_alias_highest[i];
+        p->rw_base   = (unsigned long long)ios_jit_anon_aliases[i].jit_rw_alias;
+        p->rx_base   = (unsigned long long)ios_jit_anon_aliases[i].jit_rx_alias;
+        p->slot      = (unsigned)i;
+        break;
+    }
+    /* ml636: NOTHING CONTAINS addr — try an alias that ENDS exactly there.
+     *
+     * The ULTRAKILL fatal RIP is one-past a 64KB Mono buffer (twice consecutively,
+     * relocated), so "the alias containing RIP" is empty BY CONSTRUCTION and the
+     * ml635 telemetry could never fire for it. The interesting alias is the one
+     * that ENDS there. */
+    if (!p->base)
+    {
+        n = ios_jit_anon_alias_count;
+        for (i = 0; i < n; i++)
+        {
+            if (!ios_jit_anon_aliases[i].user_va) continue;
+            if (ios_jit_anon_aliases[i].user_va_end != p->addr) continue;
+            p->base      = (unsigned long long)ios_jit_anon_aliases[i].user_va;
+            p->end       = (unsigned long long)ios_jit_anon_aliases[i].user_va_end;
+            p->rw        = (unsigned long long)ios_jit_anon_aliases[i].jit_rw_alias;
+            p->write_gen = ios_alias_write_gen[i];
+            p->written   = ios_alias_written[i];
+            p->highest   = ios_alias_highest[i];
+            p->rw_base   = (unsigned long long)ios_jit_anon_aliases[i].jit_rw_alias;
+            p->rx_base   = (unsigned long long)ios_jit_anon_aliases[i].jit_rx_alias;
+            p->slot      = (unsigned)i;
+            p->at_end    = 1;
+            break;
+        }
+    }
+    /* ml639: how many LIVE entries claim this same end? Retires the "maybe the probe
+     * matched a stale duplicate" hypothesis by measurement instead of by argument. */
+    if (p->base)
+    {
+        n = ios_jit_anon_alias_count;
+        for (i = 0; i < n; i++)
+            if (ios_jit_anon_aliases[i].user_va &&
+                ios_jit_anon_aliases[i].user_va_end == p->end) p->dup_end++;
+    }
+    return STATUS_SUCCESS;
+}
+
+/* iOS-Mythic ml632: does [user_va, +size) OVERLAP any live anon-JIT alias?
+ * find_cover() asks for full containment; the mixed-mapping bug is precisely a
+ * PARTIAL overlap, so it needs its own test. Returns 1 and reports the entry. */
+int ios_jit_anon_alias_overlaps(void *user_va, size_t size, uintptr_t *base_out, uintptr_t *end_out)
+{
+    uintptr_t lo = (uintptr_t)user_va, hi = lo + size;
+    int n = ios_jit_anon_alias_count, i;
+
+    for (i = 0; i < n; i++)
+    {
+        uintptr_t b = ios_jit_anon_aliases[i].user_va, e;
+        if (!b) continue;
+        e = ios_jit_anon_aliases[i].user_va_end;
+        if (lo < e && b < hi)
+        {
+            if (base_out) *base_out = b;
+            if (end_out)  *end_out  = e;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int ios_jit_anon_alias_find_cover(void *user_va, size_t size, void **rw_out, void **rx_out)
+{
+    uintptr_t lo = (uintptr_t)user_va, hi = lo + size;
+    int n = ios_jit_anon_alias_count;
+    int i;
+
+    for (i = 0; i < n; i++)
+    {
+        uintptr_t base = ios_jit_anon_aliases[i].user_va;
+        if (!base) continue;
+        if (lo < base || hi > ios_jit_anon_aliases[i].user_va_end) continue;
+        if (!ios_jit_anon_aliases[i].jit_rx_alias) continue; /* incomplete registration */
+        if (rw_out) *rw_out = (void *)(ios_jit_anon_aliases[i].jit_rw_alias + (lo - base));
+        if (rx_out) *rx_out = (void *)(ios_jit_anon_aliases[i].jit_rx_alias + (lo - base));
+        return 1;
+    }
+    return 0;
 }
 
 void ios_jit_anon_alias_set_rx(void *user_va, void *jit_rx_alias)
@@ -6932,6 +7315,63 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
             jit_pool_init_done = 1;
         }
 
+        /* iOS-Mythic ml640: AN OWNED ANON-JIT RANGE IS SETTLED — DECIDE IT FIRST.
+         *
+         * ROOT CAUSE, proven by the ml639 three-view hash:
+         *   guest  = 0x706F9B0000  HASH16K aa4f0ea29a4c7f5c
+         *   poolRX = 0x1268C8000   HASH16K 7a9fbb551062ff6b
+         *   poolRW = 0x7009EEC000  HASH16K 7a9fbb551062ff6b   (slot=71, dup_end=1)
+         *   => poolRX == poolRW, the GUEST vm_remap DETACHED.
+         * The pool's dual-map is perfect and every emulated write lands in it; the guest
+         * VA simply stops sharing those pages, so Mono writes valid code while FEX
+         * executes stale bytes and then zeros, running to alias_end and dying with a
+         * deterministic c0000005 (identical across four runs: write_gen=792,
+         * highest=0x33fd, RIP_off=0x10000).
+         *
+         * WHY: this function re-enters on every 4KB W<->X transition and, before ever
+         * asking whether a JIT already owns the range, it (a) calls plain mprotect()
+         * just below and (b) falls into nearest-image classification. A managed
+         * assembly Mono mapped as DATA sits immediately below Mono's buffer; its PE
+         * header declares SizeOfImage 0x24000 while only 0x1f000 is mapped, so the
+         * backward MZ scan claims [image, image+0x24000) — overlapping the first 16KB
+         * of the alias. That 16KB is exactly the chunk holding all 792 writes and the
+         * divergence. The anon-alias reuse check sits ~250 lines further down, far too
+         * late to prevent any of it.
+         *
+         * So decide ownership FIRST. If a live alias fully covers the request this is an
+         * ordinary JIT W<->X transition: the guest VA is already R+X via the pool
+         * dual-map, Wine has already recorded the requested LOGICAL protection in
+         * set_vprot(), and writes are meant to fault into the alias store emulator.
+         * Nothing further is needed — and critically, nothing may re-map or re-classify
+         * this range.
+         *
+         * ⛔ Only ordinary R/W/X transitions take this path. PROT_NONE, decommit,
+         * release and teardown must keep their normal behaviour, so they are excluded.
+         * ⛔ Do NOT "shrink" any image copy to dodge the overlap: the image path does not
+         * remap the guest VA at all (it copies into the pool and registers a logical
+         * translation), and truncating a genuine image would break relocations. The real
+         * defect is that this object was classified as a native image at all — the
+         * durable fix is Wine mapping identity / actual view bounds instead of trusting a
+         * nearby MZ header's SizeOfImage. */
+        if (unix_prot != PROT_NONE)
+        {
+            extern int ios_jit_anon_alias_find_cover(void *, size_t, void **, void **);
+            void *cov_rw = NULL, *cov_rx = NULL;
+            if (ios_jit_anon_alias_find_cover( base, size, &cov_rw, &cov_rx ))
+            {
+                static int own_n;
+                if (own_n < 32)
+                    dprintf(2, "[alias-own] ml640 #%d %p+0x%lx prot=%c%c%c OWNED by live anon JIT alias "
+                               "(rx=%p rw=%p) — keeping the pool dual-map, no mprotect, no image lookup\n",
+                            ++own_n, base, (unsigned long)size,
+                            (unix_prot & PROT_READ)  ? 'r' : '-',
+                            (unix_prot & PROT_WRITE) ? 'w' : '-',
+                            (unix_prot & PROT_EXEC)  ? 'x' : '-',
+                            cov_rx, cov_rw);
+                return 0;
+            }
+        }
+
         /* Try normal mprotect first (works on non-TXM devices). On iOS TXM,
          * mprotect with PROT_EXEC may *appear* to succeed (return 0) without
          * actually granting EXEC — pages stay RW only. Verify by querying the
@@ -7110,6 +7550,55 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         "(%s) — treating as anonymous RWX rev=ml348\n",
                         base, (unsigned long)size, image_base, (unsigned long)image_size,
                         ios_pe_module_name(image_base, image_size));
+
+                /* iOS-Mythic ml632: MIXED-MAPPING TRIPWIRE.
+                 *
+                 * This test is ALL-OR-NOTHING: if the request is not wholly inside the
+                 * image it is treated as anonymous in its entirety — even the part that
+                 * genuinely overlaps the image. Meanwhile ios_jit_sync_write's IAT sync
+                 * accepts SUBRANGES by numerical containment alone, so the overlapping
+                 * pages end up owned by BOTH registries.
+                 *
+                 * ULTRAKILL died on exactly that: anon alias [0x706e9b0000,0x706e9c0000)
+                 * vs "image" [0x706e990000,0x706e9b4000) — a 16KB overlap — and
+                 * `[iat-sync] region 0x706e9b3000+0x1000: translated 2 pointers` rewrote
+                 * the page holding the bad block's entry at +0x33e0. Control then ran off
+                 * into zero padding and died 0xc06 bytes later.
+                 *
+                 * Report the collision with both mappings' real Mach identity, so a
+                 * genuine PE mapping can be told from a stale/adjacent MZ hit. */
+                {
+                    uintptr_t o_lo = (uintptr_t)base > (uintptr_t)image_base
+                                   ? (uintptr_t)base : (uintptr_t)image_base;
+                    uintptr_t o_hi = ((uintptr_t)base + size) < ((uintptr_t)image_base + image_size)
+                                   ? ((uintptr_t)base + size) : ((uintptr_t)image_base + image_size);
+                    if (o_lo < o_hi)
+                    {
+                        static int mixed_n;
+                        if (mixed_n < 16)
+                        {
+                            mach_vm_address_t qa; mach_vm_size_t qs; 
+                            vm_region_basic_info_data_64_t qi; mach_msg_type_number_t qc;
+                            mach_port_t qo; kern_return_t qk;
+                            unsigned rp = 0, ip = 0;
+                            qa = (mach_vm_address_t)base; qs = 0; qc = VM_REGION_BASIC_INFO_COUNT_64;
+                            qk = mach_vm_region( mach_task_self(), &qa, &qs, VM_REGION_BASIC_INFO_64,
+                                                 (vm_region_info_t)&qi, &qc, &qo );
+                            if (qk == KERN_SUCCESS) rp = qi.protection;
+                            qa = (mach_vm_address_t)image_base; qs = 0; qc = VM_REGION_BASIC_INFO_COUNT_64;
+                            qk = mach_vm_region( mach_task_self(), &qa, &qs, VM_REGION_BASIC_INFO_64,
+                                                 (vm_region_info_t)&qi, &qc, &qo );
+                            if (qk == KERN_SUCCESS) ip = qi.protection;
+                            ++mixed_n;
+                            dprintf(2, "[mixed-map] ml632 #%d COLLISION: request %p+0x%lx (prot=%u) vs image %p+0x%lx "
+                                       "(prot=%u, %s) — OVERLAP [%p,%p) %lu KB claimed by BOTH registries\n",
+                                    mixed_n, base, (unsigned long)size, rp,
+                                    image_base, (unsigned long)image_size, ip,
+                                    ios_pe_module_name(image_base, image_size),
+                                    (void *)o_lo, (void *)o_hi, (unsigned long)((o_hi - o_lo) / 1024));
+                        }
+                    }
+                }
                 image_base = NULL;
                 image_size = 0;
             }
@@ -7127,6 +7616,96 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                  * FEX executes via user_VA → R+X works. */
                 size_t page_size = 0x4000;
                 size_t alloc_size = (size + page_size - 1) & ~(page_size - 1);
+
+                /* iOS-Mythic ml625: NEVER RE-BACK A GUEST VA THAT IS ALREADY LIVE.
+                 *
+                 * vm_remap below uses VM_FLAGS_OVERWRITE and does NOT preserve the
+                 * old contents, so re-running this path on a range that already holds
+                 * emitted guest code DESTROYS it. That is exactly how the ml624 run
+                 * died: Mono emitted x64 code + UNWIND_INFO into 0x7040220000, then
+                 * this path ran three more times for the same VA, each taking a fresh
+                 * zeroed 16KB pool slot. FEX kept executing its cached translation of
+                 * code that no longer existed, wine read unwind version 0 from the
+                 * zeroed metadata, and RtlVirtualUnwind2 spun ~15.8M times until the
+                 * 8MB guest stack was exhausted.
+                 *
+                 * A repeat request is a RE-PROTECT, not a new allocation: keep the
+                 * existing backing and just (re)assert R+X. */
+                {
+                    extern int ios_jit_anon_alias_find_cover(void *, size_t, void **, void **);
+                    void *ex_rw = NULL, *ex_rx = NULL;
+                    if (ios_jit_anon_alias_find_cover(base, alloc_size, &ex_rw, &ex_rx))
+                    {
+                        kern_return_t pkr = vm_protect(mach_task_self(),
+                            (vm_address_t)base, alloc_size, FALSE,
+                            VM_PROT_READ | VM_PROT_EXECUTE);
+                        TEB *cur_teb = NtCurrentTeb();
+
+                        /* ml626: OBSERVE the protection state, do NOT try to repair it.
+                         *
+                         * In the ml625 run the FIRST reuse returned kr=0 and every later
+                         * one kr=2 (KERN_PROTECTION_FAILURE) for the same VA, with the
+                         * 64KB region split and its first 16KB showing max=3 (RW, no
+                         * EXEC) -- vm_protect can never grant EXEC once max has been
+                         * lowered, so a "repair" via set_maximum=TRUE would not work
+                         * anyway. It is also quite possibly FALLOUT from the failed
+                         * SWPAL redelivery loop rather than a cause. Log cur/max so the
+                         * next run says which, and change nothing yet. */
+                        {
+                            static int reuse_prot_n;
+                            if (pkr != KERN_SUCCESS || reuse_prot_n < 16)
+                            {
+                                mach_vm_address_t q = (mach_vm_address_t)base;
+                                mach_vm_size_t qsz = 0;
+                                vm_region_basic_info_data_64_t qi;
+                                mach_msg_type_number_t qc = VM_REGION_BASIC_INFO_COUNT_64;
+                                mach_port_t qobj = MACH_PORT_NULL;
+                                kern_return_t qkr = mach_vm_region( mach_task_self(), &q, &qsz,
+                                        VM_REGION_BASIC_INFO_64, (vm_region_info_t)&qi, &qc, &qobj );
+                                ++reuse_prot_n;
+                                dprintf(2, "[jit-prot] ml626 #%d %p region=%p+0x%llx cur=%d max=%d "
+                                        "(region kr=%d) after vm_protect(R+X) kr=%d\n",
+                                        reuse_prot_n, base, (void *)(uintptr_t)q,
+                                        (unsigned long long)qsz,
+                                        qkr == KERN_SUCCESS ? qi.protection : -1,
+                                        qkr == KERN_SUCCESS ? qi.max_protection : -1,
+                                        (int)qkr, (int)pkr);
+                            }
+                        }
+
+                        dprintf(2, "[jit-pool] anon RWX %p size=0x%lx REUSE existing alias "
+                                "(rx=%p rw=%p) vm_protect kr=%d tid=%04x peb=%p rev=ml625\n",
+                                base, (unsigned long)alloc_size, ex_rx, ex_rw, (int)pkr,
+                                cur_teb ? (unsigned)(ULONG_PTR)cur_teb->ClientId.UniqueThread : 0u,
+                                cur_teb ? (void *)cur_teb->Peb : NULL);
+                        return 0;
+                    }
+                }
+
+                /* ml630: DO NOT BURN A POOL RANGE WE CANNOT REGISTER.
+                 *
+                 * The ml629 run consumed three further pool ranges while repeatedly
+                 * failing to register the SAME buffer, because the table check lived
+                 * downstream of the allocation. Check first; an unregisterable mapping
+                 * is worse than a refused one, since writes to it silently do not route. */
+                if (ios_jit_anon_alias_count >= IOS_JIT_MAX_ANON_ALIASES)
+                {
+                    int free_slot = 0, ci;
+                    for (ci = 0; ci < ios_jit_anon_alias_count; ci++)
+                        if (!ios_jit_anon_aliases[ci].user_va) { free_slot = 1; break; }
+                    if (!free_slot)
+                    {
+                        dprintf(2, "[jit-pool] anon RWX %p REFUSED: alias table full (%d, live=%d hiwater=%d) "
+                                   "— refusing the mapping rather than shipping one whose writes cannot route "
+                                   "rev=ml630\n",
+                                base, IOS_JIT_MAX_ANON_ALIASES, ios_jit_anon_alias_live,
+                                ios_jit_anon_alias_hiwater);
+                        mprotect( base, size, PROT_READ );
+                        errno = ENOMEM;
+                        return -1;
+                    }
+                }
+
                 size_t offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
                 if (offset == (size_t)-1)
                 {
@@ -7138,6 +7717,55 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     mprotect( base, size, PROT_READ );
                     errno = ENOMEM;
                     return -1;
+                }
+
+                /* iOS-Mythic ml634: PRESERVE THE GUEST'S EXISTING BYTES BEFORE REMAPPING.
+                 *
+                 * The vm_remap below uses VM_FLAGS_OVERWRITE to put a FRESH, ZERO-FILLED
+                 * pool slot on top of `base`. The PE-image path a few hundred lines down
+                 * memcpy()s the image into the pool first and invalidates the icache; this
+                 * anonymous path never copied anything. So the very FIRST RW->RX transition
+                 * of a Mono JIT buffer replaced everything Mono had already emitted with
+                 * zeros.
+                 *
+                 * That explains the whole ULTRAKILL signature: RX and RW MATCH afterwards
+                 * (both now view the same erased pool storage), FEX starts translating at
+                 * base+0x33e0, sees `00 00` = `add byte [rax], al` all the way, and dies at
+                 * +0x4006. ml625 only stopped destructive remapping on SUBSEQUENT
+                 * re-protects — it never protected the initial transition.
+                 *
+                 * ⚠️ The +0x4000 overlap with the "nearest image" is an ACCOUNTING ARTIFACT,
+                 * not the edge of real code: that image is a managed assembly Mono mapped as
+                 * DATA (mapped size 0x1f000) whose PE header declares SizeOfImage 0x24000,
+                 * and the backward MZ scan trusts the declared size. Do not read the
+                 * boundary as "generated code ends here". */
+                uint64_t ml634_pre_hash = 1469598103934665603ull;
+                size_t   ml634_nonzero = 0;
+                {
+                    char *rw_dst = (char *)jit_rw_base + offset;
+                    char *rx_dst = (char *)jit_rx_base + offset;
+                    const unsigned char *src = (const unsigned char *)base;
+                    size_t i;
+
+                    for (i = 0; i < size; i++)
+                    {
+                        ml634_pre_hash = (ml634_pre_hash ^ src[i]) * 1099511628211ull;
+                        if (src[i]) ml634_nonzero++;
+                    }
+
+                    memset( rw_dst, 0, alloc_size );
+                    memcpy( rw_dst, src, size );
+                    sys_icache_invalidate( rx_dst, alloc_size );
+
+                    {
+                        static int pre_n;
+                        if (ml634_nonzero || pre_n < 24)   /* ml635: nonzero is ALWAYS reported */
+                            dprintf(2, "[jit-copy] ml634 #%d PRE-REMAP %p+0x%lx: %lu/%lu bytes nonzero, fnv=%016llx "
+                                       "— copied into pool off=0x%lx\n",
+                                    ++pre_n, base, (unsigned long)size,
+                                    (unsigned long)ml634_nonzero, (unsigned long)size,
+                                    (unsigned long long)ml634_pre_hash, (unsigned long)offset);
+                    }
                 }
 
                 vm_address_t target = (vm_address_t)base;
@@ -7189,12 +7817,46 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     set_arm64ec_range(jit_base, alloc_size);
                 }
 
+                /* ml634: both views must now hash to what the guest had before the remap. */
+                {
+                    static int post_n;
+                    if (post_n < 24)
+                    {
+                        const unsigned char *rxv = (const unsigned char *)base;
+                        const unsigned char *rwv = (const unsigned char *)((char *)jit_rw_base + offset);
+                        uint64_t hx = 1469598103934665603ull, hw = 1469598103934665603ull;
+                        size_t i;
+                        for (i = 0; i < size; i++)
+                        {
+                            hx = (hx ^ rxv[i]) * 1099511628211ull;
+                            hw = (hw ^ rwv[i]) * 1099511628211ull;
+                        }
+                        ++post_n;
+                        dprintf(2, "[jit-copy] ml634 #%d POST-REMAP rx=%016llx rw=%016llx pre=%016llx => %s\n",
+                                post_n, (unsigned long long)hx, (unsigned long long)hw,
+                                (unsigned long long)ml634_pre_hash,
+                                (hx == ml634_pre_hash && hw == ml634_pre_hash)
+                                    ? "PRESERVED"
+                                    : "**CONTENT LOST** — the remap still erased the guest's bytes");
+                    }
+                }
+
                 /* Record secondary alias for STR fault emulator and exec PC redirect. */
-                extern void ios_jit_anon_alias_add(void *user_va, size_t size,
-                                                   void *jit_rw_alias);
+                extern int ios_jit_anon_alias_add(void *user_va, size_t size,
+                                                  void *jit_rw_alias);
                 extern void ios_jit_anon_alias_set_rx(void *user_va, void *jit_rx_alias);
-                ios_jit_anon_alias_add(base, alloc_size,
-                                       (char *)jit_rw_base + offset);
+                if (!ios_jit_anon_alias_add(base, alloc_size, (char *)jit_rw_base + offset))
+                {
+                    /* ml630: lost a race for the last slot. The remap already happened,
+                     * so the honest move is to fail loudly here rather than return an
+                     * executable mapping whose writes will not route. */
+                    dprintf(2, "[jit-pool] anon RWX %p FAILED to register alias after remap "
+                               "(pool off=0x%lx) — failing the request rev=ml630\n",
+                            base, (unsigned long)offset);
+                    mprotect( base, size, PROT_READ );
+                    errno = ENOMEM;
+                    return -1;
+                }
                 ios_jit_anon_alias_set_rx(base, (char *)jit_rx_base + offset);
 
                 ERR("iOS JIT: anon RWX %p+0x%lx → pool offset 0x%lx (rx=%p rw=%p)"
@@ -7202,9 +7864,15 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     base, (unsigned long)alloc_size, (unsigned long)offset,
                     (char *)jit_rx_base + offset, (char *)jit_rw_base + offset,
                     cur_prot, max_prot);
-                dprintf(2, "[jit-pool] anon RWX %p size=0x%lx → used=0x%lx/0x%lx\n",
-                        base, (unsigned long)alloc_size,
-                        (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size);
+                {
+                    TEB *cur_teb = NtCurrentTeb();
+                    dprintf(2, "[jit-pool] anon RWX %p size=0x%lx → used=0x%lx/0x%lx NEW off=0x%lx tid=%04x peb=%p rev=ml625\n",
+                            base, (unsigned long)alloc_size,
+                            (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size,
+                            (unsigned long)offset,
+                            cur_teb ? (unsigned)(ULONG_PTR)cur_teb->ClientId.UniqueThread : 0u,
+                            cur_teb ? (void *)cur_teb->Peb : NULL);
+                }
                 return 0;
             }
 
@@ -8175,6 +8843,47 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
         return STATUS_ACCESS_DENIED;
     }
 
+    /* iOS-Mythic ml638 A/B: NEVER MAKE AN ANON-JIT-ALIASED PAGE PHYSICALLY WRITABLE.
+     *
+     * The ULTRAKILL alias [0x705bc80000,0x705bc90000) starts COHERENT — an emulated
+     * store at +0x1368 read back identically through RX and RW. By the crash the two
+     * views hold DIFFERENT Mono methods around +0x337d, and the only events in between
+     * are four NtProtectVirtualMemory transitions over the first 16KB — the same chunk
+     * that holds all 792 tracked writes and the divergence.
+     *
+     * Making the guest VA physically writable lets the kernel privatise / COW-split it
+     * from the pool RW alias: later guest writes land in the private copy while FEX
+     * translates and executes the ORIGINAL pool pages, which still hold the old bytes
+     * and zeros beyond. FEX then runs off the end of the buffer — the deterministic
+     * one-past-the-end c0000005 we keep hitting.
+     *
+     * So: keep Wine's LOGICAL protection exactly as the guest asked (set_vprot above
+     * already recorded it, so NtQueryVirtualMemory still answers correctly), but
+     * re-assert the PHYSICAL protection as R+X. Every guest write then keeps faulting
+     * into the alias store emulator and routing to the RW view, which is the design.
+     * Decommit / release / no-access are untouched — this only refuses to hand out
+     * physical write permission on memory a JIT alias owns.
+     *
+     * ⛔ If this fixes it, the durable form is to stop this page from ever being
+     * physically writable in the first place, not to re-protect after the fact. */
+    if ((vprot & VPROT_WRITE) && !(vprot & VPROT_GUARD))
+    {
+        uintptr_t ov_b = 0, ov_e = 0;
+        extern int ios_jit_anon_alias_overlaps(void *, size_t, uintptr_t *, uintptr_t *);
+        if (ios_jit_anon_alias_overlaps( base, size, &ov_b, &ov_e ))
+        {
+            int keep_exec = (vprot & VPROT_EXEC) || 1;   /* alias pages are executable by construction */
+            int pr = PROT_READ | (keep_exec ? PROT_EXEC : 0);
+            int rc = mprotect( base, size, pr );
+            static int ab_n;
+            if (ab_n < 24)
+                dprintf(2, "[alias-prot] ml638 #%d %p+0x%lx requested prot=0x%x (vprot=0x%x) — logical kept, "
+                           "PHYSICAL forced R%s (mprotect rc=%d) alias=[%p,%p)\n",
+                        ++ab_n, base, (unsigned long)size, (unsigned)protect, vprot,
+                        keep_exec ? "X" : "", rc, (void *)ov_b, (void *)ov_e);
+        }
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -9126,6 +9835,83 @@ static int ios_pool_live_overlap( uintptr_t rw_start, size_t size,
     return 0;
 }
 
+/* iOS-Mythic ml610 [dc-census]: HOW MUCH DOES A DECOMMIT ACTUALLY RETURN?
+ *
+ * Three builds have now argued about this from the memory curve instead of
+ * measuring it. ml608 assumed the full 16MB callret clear was WASTING memory;
+ * ml609 shrank it to 4MB and got ~388MB WORSE; the source then showed the clear
+ * is a reclaim (anon_mmap_fixed drops the physical pages), so the shrink had
+ * stranded the remainder. None of that is a measurement of bytes returned.
+ *
+ * This is. It runs at the reclaim site itself, which is also the only place the
+ * Mach APIs are reachable — FEX's ResetCallRetStack() lives in an arm64ec PE
+ * built by llvm-mingw, where __APPLE__ is undefined and mincore/mach_vm_region/
+ * task_info do not exist.
+ *
+ * Two independent instruments, because they fail differently:
+ *   - mincore() is EXACT for the byte range but only reports residency.
+ *   - the Mach region walk reports dirty + swapped-out (i.e. compressed, which
+ *     STILL counts toward the 4096MB jetsam limit — the thing mincore cannot
+ *     see) but is REGION-granular, so it can over-count when a region extends
+ *     past the range. `span` is logged so that over-count is visible rather
+ *     than silent: span >> size means the counts include a neighbour.
+ * phys_footprint is sampled too, and will contain unrelated noise from other
+ * threads — it is a sanity check on the other two, not the primary number.
+ */
+struct ios_dc_census
+{
+    unsigned long long resident, dirty, swapped, span, mincore_res, footprint;
+};
+
+static void ios_dc_census_take( const void *addr, size_t len, struct ios_dc_census *out )
+{
+    mach_vm_address_t start = (mach_vm_address_t)(uintptr_t)addr;
+    mach_vm_address_t end = start + len;
+    mach_vm_address_t ra = start;
+    natural_t depth = 0;
+    int guard = 0;
+
+    memset( out, 0, sizeof(*out) );
+
+    while (ra < end && guard++ < 4096)
+    {
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t icnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+        mach_vm_size_t rs = 0;
+        if (mach_vm_region_recurse( mach_task_self(), &ra, &rs, &depth,
+                                    (vm_region_recurse_info_t)&info, &icnt ) != KERN_SUCCESS) break;
+        if (ra >= end) break;
+        if (info.is_submap) { depth++; continue; }
+        out->resident += (unsigned long long)info.pages_resident    << 14;
+        out->dirty    += (unsigned long long)info.pages_dirtied     << 14;
+        out->swapped  += (unsigned long long)info.pages_swapped_out << 14;
+        out->span     += (unsigned long long)rs;
+        ra += rs;
+        depth = 0;
+    }
+
+    {
+        /* Stack-local so concurrent samples cannot corrupt each other's count.
+         * 1024 entries covers 16MB at 16KB pages — exactly the callret stack. */
+        char vec[1024];
+        size_t ps = (size_t)host_page_mask + 1;
+        size_t npages = ps ? len / ps : 0;
+        if (npages && npages <= sizeof(vec) && !mincore( (void *)(uintptr_t)start, len, vec ))
+        {
+            size_t i;
+            for (i = 0; i < npages; i++)
+                if (vec[i] & MINCORE_INCORE) out->mincore_res += ps;
+        }
+    }
+
+    {
+        task_vm_info_data_t vmi;
+        mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+        if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &c ) == KERN_SUCCESS)
+            out->footprint = (unsigned long long)vmi.phys_footprint;
+    }
+}
+
 static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size )
 {
     char *host_end, *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
@@ -9133,6 +9919,10 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
     const char *dc_branch = "none";
     const void *dc_verify = NULL;
     size_t      dc_vsize  = 0;
+    /* ml610 [dc-census] sample state. */
+    struct ios_dc_census dc_before, dc_after;
+    struct timeval dc_t0, dc_t1, dc_t2, dc_t3;
+    int dc_sampled = 0;
 
     if (!size)
     {
@@ -9140,6 +9930,29 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
         host_end = host_start + view->size;
     }
     else host_end = ROUND_ADDR( base + size, host_page_mask );
+
+    /* ml610 [dc-census] BEFORE sample. Large ranges only (the 16MB callret
+     * stacks and the LookupCache clears — the small-decommit flood would drown
+     * the signal and cost far more than it measures). Hard-capped: this runs
+     * with virtual_mutex held, and for callret resets it runs on the SWEEPER
+     * with the code-buffer migration gate active, so an uncapped probe would
+     * perturb exactly what it is measuring. The cost is logged per sample so
+     * that judgement is checkable rather than asserted. */
+    {
+        static unsigned long dc_big_seen, dc_samples;
+        if (size >= (4u << 20))
+        {
+            unsigned long n = ++dc_big_seen;
+            if (dc_samples < 16 && (n <= 8 || (n % 512) == 0))
+            {
+                dc_samples++;
+                dc_sampled = 1;
+                gettimeofday( &dc_t0, NULL );
+                ios_dc_census_take( base, size, &dc_before );
+                gettimeofday( &dc_t1, NULL );
+            }
+        }
+    }
 
     /* iOS-Mythic (task #22 real root cause, 2026-07-10): FEX's Windows
      * VirtualDontNeed() = MEM_DECOMMIT (often WITHOUT recommit — LookupCache
@@ -9274,6 +10087,45 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
             }
         }
     }
+    /* ml610 [dc-census] AFTER sample + report. `returned` is the number three
+     * builds have argued about without ever measuring it: dirty+swapped before
+     * minus after, i.e. what this decommit actually handed back to the system.
+     * A near-zero `returned` on a 16MB callret clear would mean the clear is
+     * NOT a reclaim and ml609's premise was right after all — so this can
+     * refute the change it ships with, which is the point. */
+    if (dc_sampled)
+    {
+        long census_us, work_us;
+        unsigned long long charged_before, charged_after;
+
+        gettimeofday( &dc_t2, NULL );
+        ios_dc_census_take( base, size, &dc_after );
+        gettimeofday( &dc_t3, NULL );
+
+        census_us = (long)((dc_t1.tv_sec - dc_t0.tv_sec) * 1000000 + (dc_t1.tv_usec - dc_t0.tv_usec))
+                  + (long)((dc_t3.tv_sec - dc_t2.tv_sec) * 1000000 + (dc_t3.tv_usec - dc_t2.tv_usec));
+        work_us   = (long)((dc_t2.tv_sec - dc_t1.tv_sec) * 1000000 + (dc_t2.tv_usec - dc_t1.tv_usec));
+
+        charged_before = dc_before.dirty + dc_before.swapped;
+        charged_after  = dc_after.dirty + dc_after.swapped;
+
+        dprintf( 2, "[dc-census] ml610 base=%p size=%luKB branch=%s "
+                 "dirty %lluKB->%lluKB swapped %lluKB->%lluKB charged %lluKB->%lluKB "
+                 "returned=%lldKB | mincore_res %lluKB->%lluKB resident %lluKB->%lluKB "
+                 "span=%lluKB(%s) fp %lluMB->%lluMB decommit_us=%ld census_us=%ld\n",
+                 base, (unsigned long)(size >> 10), dc_branch,
+                 dc_before.dirty >> 10, dc_after.dirty >> 10,
+                 dc_before.swapped >> 10, dc_after.swapped >> 10,
+                 charged_before >> 10, charged_after >> 10,
+                 ((long long)charged_before - (long long)charged_after) >> 10,
+                 dc_before.mincore_res >> 10, dc_after.mincore_res >> 10,
+                 dc_before.resident >> 10, dc_after.resident >> 10,
+                 dc_before.span >> 10,
+                 dc_before.span > (unsigned long long)size ? "OVER-COUNTS: region exceeds range" : "clean",
+                 dc_before.footprint >> 20, dc_after.footprint >> 20,
+                 work_us, census_us );
+    }
+
     set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
     if (host_start < host_end) kernel_writewatch_register_range( view, host_start, host_end - host_start );
     return STATUS_SUCCESS;
@@ -14431,6 +15283,27 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
 
                 if (rgn_start >= pe_start && rgn_end <= pe_end)
                 {
+                    /* iOS-Mythic ml632 A/B: DO NOT IAT-SYNC MEMORY OWNED BY AN ANON JIT ALIAS.
+                     *
+                     * Containment against the PE image is not sufficient ownership: the
+                     * anon-RWX classifier above is all-or-nothing, so pages can be inside a
+                     * PE image AND inside a live anonymous JIT alias. Writing the pool copy
+                     * of the image over them clobbers whatever the guest JIT put there.
+                     * The alias table is the stronger claim — it means a JIT actually took
+                     * this memory — so it wins. */
+                    uintptr_t ov_b = 0, ov_e = 0;
+                    extern int ios_jit_anon_alias_overlaps(void *, size_t, uintptr_t *, uintptr_t *);
+                    if (ios_jit_anon_alias_overlaps( base, size, &ov_b, &ov_e ))
+                    {
+                        static int skip_n;
+                        if (skip_n < 16)
+                            dprintf(2, "[mixed-map] ml632 SKIP iat-sync #%d region %p+0x%lx — owned by anon JIT alias "
+                                       "[%p,%p) (image %p+0x%lx)\n",
+                                    ++skip_n, base, (unsigned long)size, (void *)ov_b, (void *)ov_e,
+                                    (void *)pe_start, (unsigned long)(pe_end - pe_start));
+                        break;
+                    }
+
                     /* Region is within this JIT-mapped PE image — sync to JIT pool.
                      * IMPORTANT: skip any overlap with .text (code) section to avoid
                      * overwriting JIT-relocated code with the original unix mapping copy. */

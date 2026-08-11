@@ -22,6 +22,7 @@ research/*.md
 # Build artifacts
 app/build/
 app/DerivedData/
+build/DerivedData/
 build/xcode-derived/
 FEX/build-ios/
 build/ntdll-unix/obj/

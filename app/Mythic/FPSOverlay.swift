@@ -56,6 +56,37 @@ struct FPSOverlay: View {
     /// Ring buffer of (timestamp, count) pairs, 100ms cadence, 5s window.
     @State private var samples: [(t: CFAbsoluteTime, c: UInt64)] = []
     private let bufferCapacity = 50  // 5s @ 100ms
+    /// ml606: live phys_footprint in MB, refreshed on the 250ms display tick.
+    @State private var memMB: Int = 0
+
+    /// iOS jetsams this app at EXACTLY 4096MB of phys_footprint (memory:
+    /// "Jetsam = EXACTLY 4096MB"). task_info(TASK_VM_INFO) reports the very
+    /// same counter the kernel judges us on, so this is the real number and
+    /// not an approximation from resident size.
+    private static let jetsamLimitMB = 4096
+
+    private func readFootprintMB() -> Int {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return 0 }
+        return Int(info.phys_footprint / (1024 * 1024))
+    }
+
+    /// Headroom-based, because the absolute number means nothing without the
+    /// ceiling: green >768MB free, yellow >384MB, orange >128MB, red below.
+    private var memColor: Color {
+        let free = Self.jetsamLimitMB - memMB
+        if memMB == 0 { return .secondary }
+        if free > 768 { return .green }
+        if free > 384 { return .yellow }
+        if free > 128 { return .orange }
+        return .red
+    }
 
     var body: some View {
         Group {
@@ -71,6 +102,15 @@ struct FPSOverlay: View {
                 .cornerRadius(6)
             } else if visible {
                 HStack(spacing: 8) {
+                    // ml606: live phys_footprint — the SAME number jetsam kills on.
+                    // ml605 died at 4080MB against a 4096MB limit with no warning
+                    // of any kind in the log, so having it on screen turns "it
+                    // vanished" into "we watched it climb".
+                    Text("\(memMB)MB")
+                        .foregroundColor(memColor)
+                        .frame(width: 56, alignment: .trailing)
+                    Text("|")
+                        .foregroundColor(.secondary)
                     Text("Present:")
                         .foregroundColor(.secondary)
                     Text("\(presentCount)")
@@ -164,8 +204,12 @@ struct FPSOverlay: View {
         }
 
         // 250ms display refresh — computes adaptive-window FPS
+        memMB = readFootprintMB()
         displayTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
             fps = computeAdaptiveFPS()
+            // ml606: piggybacks on the existing tick, so it costs one extra
+            // task_info per 250ms and no additional SwiftUI invalidation.
+            memMB = readFootprintMB()
         }
     }
 

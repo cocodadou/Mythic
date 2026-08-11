@@ -936,6 +936,122 @@ struct ContentView: View {
                     // WILL try to self-update through our GnuTLS stack — that
                     // attempt is itself an informative S0 re-test.
                     let deskW = 1024, deskH = 768
+                    // ml589: find Steam and (re)write the launch batch. Returns
+                    // false — having logged why — when there is nothing to run.
+                    guard prepareSteamLaunch() else { return }
+                    // ml590 STEP 1 (one-run phase check, NOT a timing measurement):
+                    // arm the ml578 sock-wire probe. It answers exactly one
+                    // question — does today's ~1s CM failure reach the same TLS
+                    // phase ml578 did (ServerHello -> client Finished -> server
+                    // encrypted records), or does it die earlier?
+                    //
+                    // Its numbers are NOT trustworthy as timings: no monotonic
+                    // clock, a getpeername() before EVERY send/recv even after the
+                    // 12-line budget is spent, and synchronous dprintf() on a path
+                    // whose whole ping budget is 1000ms — it perturbs what it
+                    // measures, which is why ml579 gated it off. Step 2 replaces it
+                    // with a per-socket timeline (cached peer, generation counter,
+                    // one line at close) that can be trusted for timing.
+                    //
+                    // COLD LAUNCH REQUIRED: ios_sock_wire() latches this env into a
+                    // static on its FIRST call (socket.c:842), so if any earlier
+                    // Wine session in this app process already touched a socket the
+                    // flag is stuck off. Force-quit, launch, press this first.
+                    // ml591: the phase question is ANSWERED, so the per-event
+                    // probe goes back off — it distorts the very budget step 2
+                    // measures. [sock-tl] replaces it and needs no env var.
+                    unsetenv("MYTHIC_SOCK_WIRE")
+                    // ml594 A/B: post-login hang = FEX optimizer NONTERMINATION.
+                    // Chrome_InProcRendererThread (wtid 0208) sampled 9x at
+                    // 97-100% CPU (cpu=277 -> 918, run=1) inside
+                    // DeadFlagCalculationEliminination::ProcessBlock while EVERY
+                    // other thread sat at cpu=0 and Steam presented ZERO further
+                    // frames. One CompileBlock entered that pass and never came
+                    // back, and the thread holds a fexlock read ref, so it can
+                    // stall other FEX threads too. NOT a network/cryptnet/wineserver
+                    // wait — our new guards never fired.
+                    //
+                    // FEX_O0 disables the default x87 + dead-flag passes
+                    // (FEXCore/Source/Interface/IR/PassManager.cpp:70). Slower, but
+                    // if the hang disappears the pass is convicted and the next step
+                    // is disabling ONLY CreateDeadFlagCalculationEliminination().
+                    // ml596: FEX_O0 has NEVER ACTUALLY BEEN TESTED, and my earlier
+                    // comment here blaming it for an execute fault was WRONG.
+                    // ml595 died because the JIT pool never existed: all three
+                    // placement attempts returned 0x7000000000 (the forbidden guest
+                    // 64G window), we logged "continuing without it", and Wine then
+                    // ran with `pool not initialised` -- so LdrInitializeThunk stayed
+                    // at its PE address 0x71ffd77654 instead of being redirected into
+                    // the pool (a healthy run logs `redirected PC 0x71ffd77654 ->
+                    // 0x12078f654`). The execute fault was the guaranteed consequence
+                    // of launching without the execution substrate, and pool placement
+                    // happens HERE in Swift before FEX reads any env var -- FEX_O0
+                    // cannot influence it. (Caught by Sol.)
+                    //
+                    // Convict the dead-flag pass with a targeted FEX build that
+                    // disables ONLY CreateDeadFlagCalculationEliminination(); broad O0
+                    // also drops the x87 pass and proves less. unsetenv keeps a stale
+                    // value from a previous launch out of play.
+                    unsetenv("FEX_O0")
+                    // ml597 A/B: remove ONLY DeadFlagCalculationEliminination, the pass
+                    // the renderer thread was pinned inside during the ml594 hang.
+                    // Everything else in the pipeline (incl. x87) stays exactly as in a
+                    // known-good run, so a result here implicates or clears this one pass.
+                    // The [dfe-guard] bounds ship active in BOTH arms — if the pass is
+                    // exonerated and the hang recurs, they still name the failure mode.
+                    // ml598 ISOLATION RUN: gate OFF, same rebuilt FEX.
+                    // ml597 crashed with c000001d (ILLEGAL INSTRUCTION) after the
+                    // desktop came up, but that run changed TWO things at once: my
+                    // DFE gate AND ~107 lines of FEX source committed today that had
+                    // never been built — the shipped xtajit64.dll dated Aug 6 while
+                    // Core.cpp/IosJitAlias.cpp/TSOHandlerConfig.h and a net rewrite of
+                    // WinAPI/IO.cpp were newer. Any of those can produce a
+                    // miscompilation-shaped fault, so ml597 convicts nothing.
+                    //   crashes again -> the REBUILD is at fault, DFE still untested
+                    //   runs fine     -> disabling DFE is what breaks it
+                    unsetenv("MYTHIC_NO_DFE")
+                    // ml599: name the pass that corrupts the IR list.
+                    //
+                    // ml598 settled the mechanism: FEX hangs walking a block
+                    // BACKWARDS because the intrusive Previous chain never reaches
+                    // CodeBegin. Two passes make that assumption —
+                    // DeadFlagCalculationEliminination::ProcessBlock and
+                    // ConstrainedRAPass::Run — and the store-page freeze was the
+                    // second one (PC pinned inside libarm64ecfex.dll RVA
+                    // 0x100b0c-0x100cdc, all within ConstrainedRAPass::Run, for
+                    // minutes at ~100% CPU while frames stayed at 4,114).
+                    //
+                    // Both now validate the block BEFORE touching it and repair the
+                    // Previous chain from the forward chain when that is intact, so
+                    // the hang should be gone either way. This var adds the sweep
+                    // that reports WHICH pass first breaks the list, so the run also
+                    // produces the root cause and not just the containment.
+                    // ml601: SWEEP OFF. Two runs checked 118M and 47M blocks and found
+                    // corruption exactly once (block 260, ml599b) — the after-every-pass
+                    // sweep is not earning its cost, and it taxes every large compile.
+                    // The unconditional parts STAY ON regardless of this variable: the
+                    // cheap backward check at DFE and RA entry, the repair, and the
+                    // bounded-walk guards. Only the attribution sweep is disabled.
+                    // Set it again for a run that is specifically hunting the corrupter.
+                    unsetenv("MYTHIC_IR_TOPO")
+                    // ml623: TARGETED IR/RA CAPTURE for the ULTRAKILL Mono wall.
+                    //
+                    // FEX miscompiles ONE instruction in Mono's x86-64 emitter:
+                    //   mono-2.0-bdwgc.dll+0x4db25b   mov byte ptr [rcx+2], al
+                    // With RCX=0x7040140010 (valid, a fresh RWX code buffer) and AL=0x4c,
+                    // it emitted `movz w6,#0x44 ; orr x8,x8,x6 ; dmb ish ; strb w8,[x6,xzr]`
+                    // -- the address register still held the IMMEDIATE because the
+                    // `add x6, x0, #2` that BOTH sibling branches emit was never generated,
+                    // so the store landed on 0x44.
+                    //
+                    // This prints that instruction's IR after the frontend and after every
+                    // pass, plus the emitted host bytes. The last stage at which the address
+                    // computation still exists names the culprit: frontend/decoder, a named
+                    // pass, RA liveness, or the ARM emitter.
+                    //
+                    // Compile-time only, capped at 4 captures. Unset it for a normal run.
+                    setenv("MYTHIC_IRCAP_RVA", "0x4db25b", 1)
+                    setenv("MYTHIC_IRCAP_MODULE", "mono-2.0-bdwgc.dll", 1)
                     setenv("MYTHIC_EXE", "explorer.exe", 1)
                     setenv("MYTHIC_ARGS",
                            "/desktop=shell,\(deskW)x\(deskH) cmd /c C:\\steam-launch.bat", 1)
@@ -1474,7 +1590,18 @@ struct ContentView: View {
                 setenv("WINE_IOS_JIT_RW", String(format: "%lx", Int(bitPattern: pool.rw)), 1)
                 setenv("WINE_IOS_JIT_SIZE", String(format: "%lx", pool.size), 1)
             } else {
-                logStore.log("JIT pool allocation failed, continuing without it", level: .error)
+                // ml596: ABORT. "Continuing without it" produced ml595 — a run that
+                // looked like an ARM64EC/optimizer regression but was only Wine
+                // executing with no JIT pool, and it cost a diagnostic cycle plus a
+                // wrong conclusion I wrote into the source. A run without the pool can
+                // only manufacture misleading secondary crashes, so refuse to start one.
+                logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
+                logStore.log("  All placements landed in the forbidden guest 64G window.", level: .info)
+                logStore.log("  Force-quit and relaunch: placement is chosen by the kernel", level: .info)
+                logStore.log("  and depends on current memory layout, so a fresh process", level: .info)
+                logStore.log("  usually lands somewhere valid.", level: .info)
+                logStore.uiPaused = false
+                return
             }
 
             // Step 1b (ml524, #67): DETACH THE DEBUGGER NOW, while the VM map is small.
@@ -1607,6 +1734,62 @@ struct ContentView: View {
 
             DispatchQueue.main.async { heartbeat.invalidate() }
         }
+    }
+
+    /// ml589: locate an installed Steam inside the prefix and (re)generate
+    /// C:\steam-launch.bat to match. Returns false, having logged the reason,
+    /// when there is nothing runnable.
+    ///
+    /// Generating the batch here fixes a gap that only showed on FRESH prefixes:
+    /// steam-launch.bat was never part of prefix-template.tar.gz, it had only
+    /// ever been hand-pushed to the dev device, so a new install ran
+    /// `cmd /c C:\steam-launch.bat` against a file that did not exist.
+    ///
+    /// The generated batch launches steam.exe DIRECTLY rather than through
+    /// start.exe. That wrapper's teardown is what killed services.exe's RPC
+    /// listener in every broken run (ml579/580/584/585) and took the Start menu
+    /// with it; launching directly also keeps cmd+conhost alive for the session.
+    private func prepareSteamLaunch() -> Bool {
+        let fm = FileManager.default
+        let prefix = fm.urls(for: .documentDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("wine").path
+
+        // (windows dir, unix dir) — Steam installs to Program Files (x86) by
+        // default, but honour a 64-bit-tree install too.
+        let candidates = [
+            ("C:\\Program Files (x86)\\Steam", "\(prefix)/drive_c/Program Files (x86)/Steam"),
+            ("C:\\Program Files\\Steam",       "\(prefix)/drive_c/Program Files/Steam"),
+        ]
+
+        guard let (winDir, _) = candidates.first(where: {
+            fm.fileExists(atPath: "\($0.1)/steam.exe")
+        }) else {
+            logStore.log("Steam is not installed in this prefix.", level: .error)
+            logStore.log("  Searched: Program Files (x86)\\Steam and Program Files\\Steam", level: .info)
+            logStore.log("  Valve's SteamSetup.exe cannot be used to install it here: the", level: .info)
+            logStore.log("  installer AND the Steam.exe it lays down are 32-bit x86, and this", level: .info)
+            logStore.log("  build runs x86-64 only (ARM64EC + FEX, no 32-bit emulator).", level: .info)
+            logStore.log("  Copy an existing 64-bit Steam folder into the prefix instead.", level: .info)
+            return false
+        }
+
+        let bat = """
+        @echo off\r
+        rem Generated by Mythic (ml589) — do not hand-edit; rewritten every launch.\r
+        start "" "C:\\windows\\system32\\services.exe"\r
+        cd /d "\(winDir)"\r
+        "\(winDir)\\steam.exe" -no-cef-sandbox -cef-disable-gpu -console -nocrashmonitor -cef-disable-features=SegmentationPlatform,OptimizationTargetPrediction,OptimizationHints\r
+        """
+
+        let batPath = "\(prefix)/drive_c/steam-launch.bat"
+        do {
+            try bat.write(toFile: batPath, atomically: true, encoding: .utf8)
+        } catch {
+            logStore.log("Could not write steam-launch.bat: \(error.localizedDescription)", level: .error)
+            return false
+        }
+        logStore.log("Steam found at \(winDir)", level: .success)
+        return true
     }
 
     private func startWineserver() {

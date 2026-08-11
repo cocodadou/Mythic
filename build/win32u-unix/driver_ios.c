@@ -102,18 +102,54 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
 void winios_drv_post_key(unsigned short vk, unsigned int flags)
 {
     INPUT input = {0};
+    NTSTATUS st;
+    UINT scan;
+
+    /* ml647: DERIVE THE SCAN CODE. This used to hardcode wScan = 0 while the
+     * comment above claimed it was "derived via the default layout" — the
+     * comment described an intent the code never implemented.
+     *
+     * Nothing downstream fills it in for us. wineserver passes our value
+     * straight through, twice:
+     *     rawkeyboard_init(): RAWKEYBOARD.MakeCode = scan      (queue_ios.c:2093)
+     *     queue_keyboard_message(): lparam = scan << 16        (queue_ios.c:2356)
+     * so with 0 every synthetic key arrived with MakeCode 0 and an empty
+     * scan-code field in WM_KEYDOWN's lParam. No real keyboard can do that.
+     *
+     * Wine's own UI never noticed, because dialogs read the VK out of wParam.
+     * A GAME does notice: Unity reads the keyboard through raw input and
+     * DirectInput identifies keys by scan code (DIK_W is 0x11, not 'W'), so
+     * W/A/S/D were delivered, accepted with STATUS_SUCCESS, and then discarded
+     * as unidentifiable. That is why the on-screen stick moved nothing.
+     *
+     * MAPVK_VK_TO_VSC_EX returns 0xE0xx for the extended keys — arrows, the nav
+     * cluster, right ctrl/alt, numpad enter and divide. Those MUST carry
+     * KEYEVENTF_EXTENDEDKEY, or a scan-code reader sees the numpad twin
+     * instead: without E0, "up arrow" is numpad 8. */
+    scan = NtUserMapVirtualKeyEx( vk, MAPVK_VK_TO_VSC_EX, NtUserGetKeyboardLayout(0) );
+    if (scan & 0xe000) flags |= KEYEVENTF_EXTENDEDKEY;
+
     input.type           = INPUT_KEYBOARD;
     input.ki.wVk         = vk;
-    input.ki.wScan       = 0;
+    input.ki.wScan       = scan & 0xff;
     input.ki.dwFlags     = flags;
     input.ki.time        = 0;
     input.ki.dwExtraInfo = 0;
 
-    NTSTATUS st = send_hardware_message( NULL, 0, &input, 0 );
+    st = send_hardware_message( NULL, 0, &input, 0 );
     {
-        static unsigned cnt;
-        if (cnt++ < 40)
-            dprintf(2, "[winios] drv_post_key vk=0x%x flags=0x%x -> status=0x%x\n", vk, flags, (unsigned)st);
+        /* ml647: COUNT EVENTS, and never let a cap masquerade as absence. The
+         * old "first 40 lines" cap was exhausted by arrow keys early in the
+         * session, so the WASD presses that prompted this fix left no trace at
+         * all and the log looked like they were never sent. Log the first few,
+         * then one line per 256 with a running total that is always truthful. */
+        static unsigned cnt, bad;
+        if (st) bad++;
+        cnt++;
+        if (cnt <= 8 || (cnt & 0xff) == 0)
+            dprintf(2, "[winios] ml647 drv_post_key #%u vk=0x%x scan=0x%x flags=0x%x "
+                       "-> status=0x%x (failures=%u)\n",
+                    cnt, vk, scan, flags, (unsigned)st, bad);
     }
 }
 

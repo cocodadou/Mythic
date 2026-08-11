@@ -1295,7 +1295,12 @@ void winios_cursor_show(int show) {
  * engine owns the cursor position. */
 void winios_pointer(int x, int y, unsigned int flags, unsigned int data) {
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, flags, data);
-    if (flags & MOUSEEVENTF_MOVE) winios_cursor_move(x, y);
+    /* ml641: ONLY an ABSOLUTE move carries a position. A relative move carries a
+     * DELTA, so handing it to the cursor layer would fling the drawn arrow to the
+     * top-left corner on every event. Relative mode is mouse-look, where the game
+     * has hidden the cursor anyway — there is nothing to draw, and skipping this
+     * also drops a dispatch_async to the main queue per touch sample. */
+    if ((flags & MOUSEEVENTF_MOVE) && (flags & MOUSEEVENTF_ABSOLUTE)) winios_cursor_move(x, y);
 }
 
 /* ============================================================ *

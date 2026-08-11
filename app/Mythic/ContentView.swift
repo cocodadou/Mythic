@@ -196,6 +196,12 @@ final class MetalBackedView: UIView {
     private var twoFingerStartTime: TimeInterval = 0
     private var lastTwoFingerY: CGFloat = 0
     private var scrollAccum: CGFloat = 0
+    // ml641: relative motion is scaled by a float sensitivity, so the integer
+    // delta we hand to wine loses a fraction every event. At low sensitivity
+    // that truncation is the whole signal — carry the remainder or slow drags
+    // simply do nothing.
+    private var relCarryX: CGFloat = 0
+    private var relCarryY: CGFloat = 0
 
     private let F_MOVE: UInt32 = 0x1, F_LDOWN: UInt32 = 0x2, F_LUP: UInt32 = 0x4
     private let F_RDOWN: UInt32 = 0x8, F_RUP: UInt32 = 0x10
@@ -247,13 +253,17 @@ final class MetalBackedView: UIView {
         lastPanPoint = p
         touchStartTime = now
         movedBeyondSlop = false
+        relCarryX = 0; relCarryY = 0   // ml641: never carry motion across a lift
         // long-press → drag: hold still for 0.5s, haptic confirms, then move
         // the window; release drops. (Replaced double-tap-hold — it raced
         // Windows' double-click detection: wine saw WM_LBUTTONDBLCLK.)
         let gen = touchGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self, self.touchGeneration == gen, !self.dragActive,
-                  !self.movedBeyondSlop, !self.twoFingerActive else { return }
+                  !self.movedBeyondSlop, !self.twoFingerActive,
+                  // ml643: in mouse-look the finger is the CAMERA, not a pointer.
+                  // Holding still to line up a shot must not press the mouse.
+                  !InputSettings.shared.relative else { return }
             self.dragActive = true
             self.dragTouch = t
             self.postPointer(self.F_LDOWN)
@@ -277,9 +287,11 @@ final class MetalBackedView: UIView {
             lastTwoFingerY = avg.y
             if abs(dy) > 2 { twoFingerMoved = true }
             scrollAccum += dy
-            // 14pt of finger travel = one wheel notch; fingers up = wheel up
-            while scrollAccum <= -14 { scrollAccum += 14; postPointer(F_WHEEL, data: 120) }
-            while scrollAccum >= 14 { scrollAccum -= 14; postPointer(F_WHEEL, data: -120) }
+            // 14pt of finger travel = one wheel notch. ml641 flipped the sign:
+            // on a touchscreen the content follows the finger, so dragging UP
+            // scrolls DOWN through the document. It was mouse-wheel sense before.
+            while scrollAccum <= -14 { scrollAccum += 14; postPointer(F_WHEEL, data: -120) }
+            while scrollAccum >= 14 { scrollAccum -= 14; postPointer(F_WHEEL, data: 120) }
             return
         }
         let t: UITouch
@@ -294,7 +306,41 @@ final class MetalBackedView: UIView {
         let dx = p.x - lastPanPoint.x, dy = p.y - lastPanPoint.y
         lastPanPoint = p
         if hypot(p.x - touchStartPoint.x, p.y - touchStartPoint.y) > 10 { movedBeyondSlop = true }
-        let sens: CGFloat = 2.0   // desktop px per view pt
+
+        /* ml641 RELATIVE (mouse-look) MODE.
+         *
+         * Absolute input is what made the camera spin. We post a POSITION; wine
+         * turns it into the delta the game reads as
+         *     x - desktop_shm->cursor.x            (queue_ios.c:2290)
+         * A game that locks the cursor calls ClipCursor, and update_desktop_cursor_pos
+         * then CLAMPS desktop_shm->cursor into that rect, pinning it. Our own
+         * Self.cursor keeps wandering across the full 1024x768, so the subtraction
+         * yields (wandering - pinned): a huge delta that never converges and is
+         * re-sent on every event. Spin rate depends on WHERE the finger is, not how
+         * fast it moves.
+         *
+         * Posting device motion instead makes that impossible to reproduce: wine
+         * computes cursor.x + dx, so the delta is exactly dx no matter what the
+         * game does to the cursor. No F_ABS, and Self.cursor is deliberately not
+         * touched — in this mode it has no meaning.
+         *
+         * Sign follows PUBG/Fortnite: drag right -> view turns right -> the world
+         * slides left, so a target to the RIGHT of the crosshair is pulled onto it
+         * by dragging RIGHT. That is the same sign as a mouse. Negate both terms
+         * for content-drag (finger-follows-world) feel. */
+        if InputSettings.shared.relative {
+            let sens = CGFloat(InputSettings.shared.sensRel)
+            relCarryX += dx * sens
+            relCarryY += dy * sens
+            let ix = Int32(max(-30000, min(30000, relCarryX)))
+            let iy = Int32(max(-30000, min(30000, relCarryY)))
+            relCarryX -= CGFloat(ix)
+            relCarryY -= CGFloat(iy)
+            if ix != 0 || iy != 0 { winios_pointer(ix, iy, F_MOVE, 0) }
+            return
+        }
+
+        let sens = CGFloat(InputSettings.shared.sensAbs)   // desktop px per view pt
         let maxX = CGFloat(envInt("MYTHIC_SCREEN_W", 1024) - 1)
         let maxY = CGFloat(envInt("MYTHIC_SCREEN_H", 768) - 1)
         Self.cursor.x = min(max(Self.cursor.x + dx * sens, 0), maxX)
@@ -312,7 +358,8 @@ final class MetalBackedView: UIView {
         let now = Date().timeIntervalSinceReferenceDate
         if twoFingerActive {
             if activeTouches(event).isEmpty {
-                if !twoFingerMoved && now - twoFingerStartTime < 0.40 {
+                if !twoFingerMoved && now - twoFingerStartTime < 0.40
+                    && !InputSettings.shared.relative {   // ml643: see touchesBegan
                     postPointer(F_RDOWN)
                     postPointer(F_RUP)
                 }
@@ -332,8 +379,10 @@ final class MetalBackedView: UIView {
             dragTouch = nil
             return
         }
-        // stationary release before the 0.5s drag threshold = click
-        if !movedBeyondSlop && now - touchStartTime < 0.5 {
+        // stationary release before the 0.5s drag threshold = click.
+        // ml643: NOT in relative mode — every small aim adjustment would fire the
+        // weapon. Left/right click are on-screen buttons there instead.
+        if !movedBeyondSlop && now - touchStartTime < 0.5 && !InputSettings.shared.relative {
             fputs("[trackpad] ended: click\n", stderr)
             postPointer(F_LDOWN)
             postPointer(F_LUP)
@@ -399,6 +448,11 @@ final class JoystickPadState: ObservableObject {
     @Published var held = false
     @Published var dir: Int = -1
     @Published var center: CGPoint = .zero      // window coordinates
+    /// ml641: driven by the pointer panel. The pad is NOT a sibling of the key
+    /// row — it lives in its own UIWindow one level up (that is the whole point
+    /// of this class), so the row's .transition(.opacity) cannot reach it and it
+    /// stayed visible while every other button faded. It has to fade itself.
+    @Published var hidden = false
 }
 
 /// Window-level host for the pad. Transparent and non-interactive: the
@@ -475,6 +529,8 @@ struct JoystickPadOverlay: View {
         // sit under the game strip instead of centred on the button.
         .ignoresSafeArea()
         .allowsHitTesting(false)
+        .opacity(s.hidden ? 0 : 1)
+        .animation(.easeInOut(duration: 0.28), value: s.hidden)
         .animation(.spring(response: 0.32, dampingFraction: 0.62), value: s.held)
         .animation(.spring(response: 0.22, dampingFraction: 0.58), value: s.dir)
     }
@@ -485,6 +541,13 @@ struct JoystickPadOverlay: View {
 struct JoystickFace: View {
     var held: Bool
     var dir: Int
+    /// ml646: the portrait pad grows out of a key-sized ring when you hold it.
+    /// An overlay stick is a PERMANENT control — it must be full size at rest
+    /// with only the knob moving, so size is decoupled from press here rather
+    /// than faked by passing held:true (which would also kill the knob travel
+    /// and the press styling).
+    var alwaysExpanded = false
+    private var expanded: Bool { held || alwaysExpanded }
 
     static let idleDiameter: CGFloat = 22
     static let padRadius: CGFloat = 58
@@ -501,17 +564,17 @@ struct JoystickFace: View {
     }
 
     private func knobOffset(_ d: CGFloat) -> CGSize {
-        guard dir >= 0, held else { return .zero }
+        guard dir >= 0, expanded else { return .zero }
         let travel = d * knobTravelRatio
         let a = Double(dir) * 45.0 * .pi / 180.0
         return CGSize(width: travel * CGFloat(sin(a)), height: -travel * CGFloat(cos(a)))
     }
 
     var body: some View {
-        let d = held ? padRadius * 2 : idleDiameter
+        let d = expanded ? padRadius * 2 : idleDiameter
         return ZStack {
             interior
-            Circle().strokeBorder(Color.white.opacity(0.55), lineWidth: held ? 2 : 1.5)
+            Circle().strokeBorder(Color.white.opacity(0.55), lineWidth: expanded ? 2 : 1.5)
             Circle()
                 .fill(Color.white)
                 .frame(width: d * 0.42, height: d * 0.42)
@@ -524,7 +587,7 @@ struct JoystickFace: View {
                         .stroke(Color.black.opacity(0.38),
                                 style: StrokeStyle(lineWidth: 1.4, lineCap: .round))
                         .padding(d * 0.075)
-                        .opacity(held ? 0 : 1)
+                        .opacity(expanded ? 0 : 1)
                 )
                 .offset(knobOffset(d))
         }
@@ -707,6 +770,56 @@ extension MetalBackedView: UIKeyInput {
     var spellCheckingType: UITextSpellCheckingType { get { .no } set {} }
 }
 
+/// Pointer settings, persisted to the app container.
+///
+/// ml641. Two independent sensitivities, because the two modes mean different
+/// things and a single slider would fight itself:
+///   • absolute  — trackpad gain, desktop px per view pt. This IS the old
+///     hardcoded `sens = 2.0`, so the default reproduces today's desktop feel
+///     exactly.
+///   • relative  — mouse counts per view pt for mouse-look. What the right value
+///     is depends on the GAME's own sensitivity and FOV, which we cannot see, so
+///     it has to be calibrated by hand once. See the comment in touchesMoved.
+///
+/// Stored as JSON in Documents/ rather than UserDefaults: that is the container
+/// we already know survives reinstall (verified), and it can be pulled and
+/// edited with the same devicectl command we use for the log.
+final class InputSettings: ObservableObject {
+    static let shared = InputSettings()
+
+    @Published var relative: Bool  = false { didSet { save() } }
+    @Published var sensAbs:  Double = 2.0  { didSet { save() } }
+    @Published var sensRel:  Double = 2.0  { didSet { save() } }
+
+    /// didSet fires for assignments made in init() because the properties are
+    /// already initialised by then; without this the first launch would write
+    /// the defaults back over a file it had only half-read.
+    private var loading = false
+
+    private static var url: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("mythic-input.json")
+    }
+
+    private init() {
+        loading = true
+        if let d = try? Data(contentsOf: Self.url),
+           let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
+            relative = j["relative"] as? Bool   ?? false
+            sensAbs  = j["sensAbs"]  as? Double ?? 2.0
+            sensRel  = j["sensRel"]  as? Double ?? 2.0
+        }
+        loading = false
+    }
+
+    private func save() {
+        guard !loading else { return }
+        let j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel]
+        guard let d = try? JSONSerialization.data(withJSONObject: j) else { return }
+        try? d.write(to: Self.url, options: .atomic)
+    }
+}
+
 struct MythicMetalView: UIViewRepresentable {
     func makeUIView(context: Context) -> MetalBackedView {
         return MetalBackedView(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
@@ -719,6 +832,9 @@ struct ContentView: View {
     @State private var jitStatus: JITStatus = .unknown
     @State private var entitlements: EntitlementStatus?
     @State private var debuggerAttached = isDebuggerAttached()
+    @ObservedObject private var input = InputSettings.shared
+    @State private var pointerPanel = false
+    @Namespace private var pointerNS
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
     @Environment(\.verticalSizeClass) private var vSizeClass
 
@@ -779,18 +895,35 @@ struct ContentView: View {
             MythicMetalView()
                 .frame(height: 240)
                 .background(Color.black)
-            HStack(spacing: 6) {
-                keyButton("⏎", vk: 0x0D)   // VK_RETURN
-                keyButton("␣", vk: 0x20)   // VK_SPACE
-                keyButton("Esc", vk: 0x1B) // VK_ESCAPE
-                Button { MetalBackedView.toggleKeyboard() } label: {
-                    Text("⌨").font(.system(size: 20))
-                        .frame(minWidth: 40, minHeight: 32)
-                        .background(Color.secondary.opacity(0.25))
-                        .cornerRadius(6)
+                .onAppear { TouchControlsHost.attach() }
+                .onReceive(NotificationCenter.default.publisher(
+                    for: UIDevice.orientationDidChangeNotification)) { _ in
+                    TouchControlsHost.attach()   // re-frame to the new bounds
                 }
-                JoystickKeyView()
-                Spacer()
+            HStack(spacing: 6) {
+                if pointerPanel {
+                    // The cursor button has slid to the leftmost slot and become
+                    // the close control; matchedGeometryEffect animates the slide.
+                    pointerToggleButton
+                    pointerModeToggle
+                    pointerSensSlider
+                } else {
+                    Group {
+                        keyButton("⏎", vk: 0x0D)   // VK_RETURN
+                        keyButton("␣", vk: 0x20)   // VK_SPACE
+                        keyButton("Esc", vk: 0x1B) // VK_ESCAPE
+                        Button { MetalBackedView.toggleKeyboard() } label: {
+                            Text("⌨").font(.system(size: 20))
+                                .frame(minWidth: 40, minHeight: 32)
+                                .background(Color.secondary.opacity(0.25))
+                                .cornerRadius(6)
+                        }
+                        JoystickKeyView()
+                    }
+                    .transition(.opacity)
+                    pointerToggleButton
+                    Spacer()
+                }
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
@@ -841,6 +974,50 @@ struct ContentView: View {
 
     /// Small on-screen key: posts VK down, then up 60ms later, through the
     /// winios input queue (same path as touch→mouse).
+    // ml641 pointer panel ------------------------------------------------
+    private var pointerToggleButton: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.28)) { pointerPanel.toggle() }
+            // The window-level pad fades itself; see JoystickPadState.hidden.
+            JoystickPadState.shared.hidden = pointerPanel
+        } label: {
+            Image(systemName: pointerPanel ? "xmark" : "cursorarrow")
+                .font(.system(size: 17, weight: .medium))
+                .frame(minWidth: 40, minHeight: 32)
+                .background(Color.secondary.opacity(0.25))
+                .cornerRadius(6)
+        }
+        .matchedGeometryEffect(id: "pointerBtn", in: pointerNS)
+    }
+
+    private var pointerModeToggle: some View {
+        Button {
+            input.relative.toggle()
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        } label: {
+            Text(input.relative ? "Relative" : "Absolute")
+                .font(.system(size: 13, weight: .semibold))
+                .frame(minWidth: 82, minHeight: 32)
+                .background((input.relative ? Color.accentColor : Color.secondary).opacity(0.28))
+                .cornerRadius(6)
+        }
+        .transition(.opacity)
+    }
+
+    /// One slider bound to whichever mode is live, so the two values are edited
+    /// independently and both persist.
+    private var pointerSensSlider: some View {
+        HStack(spacing: 8) {
+            Slider(value: input.relative ? $input.sensRel : $input.sensAbs, in: 0.10...8.0)
+            Text(String(format: "%.2f", input.relative ? input.sensRel : input.sensAbs))
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundColor(.secondary)
+                .frame(width: 38, alignment: .trailing)
+        }
+        .frame(maxWidth: .infinity)
+        .transition(.opacity)
+    }
+
     private func keyButton(_ label: String, vk: Int32) -> some View {
         Button(action: {
             winios_post_key(vk, 1)
@@ -1948,5 +2125,625 @@ struct SetupGuideView: View {
                 .font(.subheadline)
         }
         .padding(.vertical, 2)
+    }
+}
+
+// ============================================================================
+// ml643 — LANDSCAPE TOUCH CONTROLS (pass 1: overlay, editor, persistence)
+//
+// This is the L2 layer from reference_swiftui_liquid_glass_ux_layers.md: glass
+// elements composited over the game canvas, repositionable.
+//
+// 🔑 Everything here MUST live in its own UIWindow. MetalHostView is a raw
+// window-level UIView above the whole SwiftUI hierarchy, so a control drawn in
+// the normal content tree gets sliced off wherever it overlaps the game surface
+// — and zIndex cannot fix that, because zIndex only orders siblings *within*
+// SwiftUI. Same reason JoystickPadHost exists; see its comment.
+// ============================================================================
+
+/// What a control does when pressed. Codable with associated values so the
+/// whole layout round-trips through JSON.
+enum ControlAction: Codable, Equatable, Hashable {
+    case none
+    case key(Int32)          // Windows virtual-key code
+    case mouseLeft
+    case mouseRight
+    case joystickWASD        // renders as a stick, posts W/A/S/D
+    case joystickArrows      // renders as a stick, posts the arrow keys
+    case keyboardToggle      // raises the iOS keyboard, as in portrait
+    case pad(String)         // ml645: Xbox button. NOT WIRED — see the panel.
+
+    /// The four keys a stick drives, up/right/down/left. nil for non-sticks.
+    var stickKeys: [Int32]? {
+        switch self {
+        case .joystickWASD:   return [0x57, 0x44, 0x53, 0x41]   // W D S A
+        case .joystickArrows: return [0x26, 0x27, 0x28, 0x25]   // up right down left
+        default: return nil
+        }
+    }
+    var isPad: Bool { if case .pad = self { return true }; return false }
+
+    var label: String {
+        switch self {
+        case .none:            return "—"
+        case .mouseLeft:       return "L"
+        case .mouseRight:      return "R"
+        case .keyboardToggle:  return "⌨"
+        case .joystickWASD:    return "WASD"
+        case .joystickArrows:  return "↕"
+        case .pad(let n):      return n
+        case .key(let vk):     return ControlAction.keyLabel(vk)
+        }
+    }
+
+    /// Minimal for pass 1 — the full VK table arrives with the mapping panel.
+    static func keyLabel(_ vk: Int32) -> String {
+        switch vk {
+        case 0x0D: return "⏎"
+        case 0x20: return "␣"
+        case 0x1B: return "Esc"
+        case 0x09: return "⇥"
+        case 0x10: return "⇧"
+        case 0x11: return "Ctl"
+        case 0x12: return "Alt"
+        case 0x25: return "←"
+        case 0x26: return "↑"
+        case 0x27: return "→"
+        case 0x28: return "↓"
+        default:
+            if vk >= 0x30, vk <= 0x5A, let u = UnicodeScalar(UInt32(vk)) {
+                return String(Character(u))
+            }
+            return String(format: "%02X", vk)
+        }
+    }
+}
+
+/// One on-screen control.
+///
+/// Position is NORMALISED (0–1 of the screen), never points: the device gets
+/// rotated and the logical surface can change size, and a layout stored in
+/// absolute coordinates scatters the first time either happens.
+struct TouchControl: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var nx: Double = 0.5
+    var ny: Double = 0.5
+    var scale: Double = 1.0
+    var action: ControlAction = .mouseLeft   // usable the moment it is created
+}
+
+final class TouchControlsModel: ObservableObject {
+    static let shared = TouchControlsModel()
+    static let baseDiameter: CGFloat = 64
+
+    @Published var controls: [TouchControl] = [] { didSet { save() } }
+    @Published var visible = true               { didSet { save() } }
+    @Published var editing = false              // transient, never persisted
+    @Published var selected: UUID?              // transient
+
+    private var loading = false
+    private static var url: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("mythic-controls.json")
+    }
+
+    private struct Saved: Codable { var controls: [TouchControl]; var visible: Bool }
+
+    private init() {
+        loading = true
+        if let d = try? Data(contentsOf: Self.url),
+           let s = try? JSONDecoder().decode(Saved.self, from: d) {
+            controls = s.controls
+            visible  = s.visible
+        }
+        loading = false
+    }
+
+    private func save() {
+        guard !loading else { return }
+        guard let d = try? JSONEncoder().encode(Saved(controls: controls, visible: visible))
+        else { return }
+        try? d.write(to: Self.url, options: .atomic)
+    }
+
+    func index(of id: UUID?) -> Int? {
+        guard let id else { return nil }
+        return controls.firstIndex { $0.id == id }
+    }
+
+    /// ml644: does this WINDOW point land on something interactive?
+    ///
+    /// Hit-test geometrically, never by walking the UIView hierarchy. SwiftUI
+    /// does not back each Button with its own UIView — the entire overlay is one
+    /// _UIHostingView and taps are routed by SwiftUI's own gesture machinery. So
+    /// `super.hitTest` returns that same hosting view for EVERY point, buttons
+    /// included, and ml643's "is it the root view?" test therefore rejected every
+    /// touch in the window. Nothing responded, and edit mode — whose branch
+    /// captured everything — could never be entered to mask it.
+    func hitsInteractive(_ p: CGPoint, in bounds: CGRect) -> Bool {
+        // Top bar: two 44pt buttons 10pt apart in play mode, centred, 10pt down.
+        // Padded generously; a few points of slop costs nothing and a missed tap
+        // costs a build.
+        let barW: CGFloat = 2 * 44 + 10
+        if CGRect(x: bounds.midX - barW / 2 - 10, y: 0,
+                  width: barW + 20, height: 68).contains(p) { return true }
+        guard visible else { return false }
+        for c in controls {
+            let r = Self.baseDiameter * CGFloat(c.scale) / 2
+            let cx = CGFloat(c.nx) * bounds.width
+            let cy = CGFloat(c.ny) * bounds.height
+            if hypot(p.x - cx, p.y - cy) <= r { return true }
+        }
+        return false
+    }
+}
+
+/// Click-through EXCEPT where a control actually is.
+///
+/// PassthroughWindow (the joystick pad's) returns nil unconditionally because it
+/// only ever draws. This one has to take input, so it discriminates: a hit that
+/// lands on the hosting root view means empty space, and empty space belongs to
+/// the game underneath — mouse-look must keep working between the buttons.
+final class ControlsWindow: UIWindow {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let m = TouchControlsModel.shared
+        // Edit mode owns the whole screen: drags and the scale pinch must not
+        // leak through and swing the camera while you are arranging buttons.
+        if m.editing { return super.hitTest(point, with: event) }
+        // Portrait draws nothing here, so it must consume nothing.
+        guard bounds.width > bounds.height else { return nil }
+        guard m.hitsInteractive(point, in: bounds) else { return nil }
+        return super.hitTest(point, with: event)
+    }
+}
+
+enum TouchControlsHost {
+    private static var window: ControlsWindow?
+
+    static func attach() {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        guard let scene = scenes.first(where: { $0.activationState == .foregroundActive })
+                        ?? scenes.first else { return }
+        if window == nil {
+            // ml644: orientationDidChangeNotification is NOT posted unless
+            // generation has been switched on, so without this the overlay would
+            // keep a portrait-sized frame after the first rotation.
+            UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+            let w = ControlsWindow(windowScene: scene)
+            // Above the joystick pad's +100. A higher windowLevel is the only
+            // ordering nothing inside the app window can undo.
+            w.windowLevel = .normal + 101
+            w.backgroundColor = .clear
+            w.isHidden = false        // deliberately never made key
+            let host = UIHostingController(rootView: TouchControlsOverlay())
+            host.view.backgroundColor = .clear
+            w.rootViewController = host
+            window = w
+        }
+        window?.frame = scene.coordinateSpace.bounds
+        fputs("[controls] ml644 overlay attached frame=\(window?.frame ?? .zero) " +
+              "controls=\(TouchControlsModel.shared.controls.count)\n", stderr)
+    }
+}
+
+struct TouchControlsOverlay: View {
+    @ObservedObject private var m = TouchControlsModel.shared
+    @State private var pinchBase: Double?
+
+    var body: some View {
+        GeometryReader { geo in
+            // Landscape only; portrait keeps the existing key row and joystick.
+            let landscape = geo.size.width > geo.size.height
+            ZStack(alignment: .top) {
+                if landscape {
+                    if m.visible || m.editing {
+                        ForEach(m.controls) { c in
+                            TouchControlButton(control: c, screen: geo.size)
+                        }
+                    }
+                    topBar
+                    if m.editing, let i = m.index(of: m.selected) {
+                        MappingPanel(control: m.controls[i], screen: geo.size)
+                    }
+                }
+            }
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
+            .contentShape(Rectangle())
+            .gesture(scalePinch)
+        }
+        .ignoresSafeArea()
+    }
+
+    private var topBar: some View {
+        HStack(spacing: 10) {
+            glassButton("gamecontroller", dim: !m.visible) { m.visible.toggle() }
+            glassButton(m.editing ? "checkmark" : "pencil") {
+                m.editing.toggle()
+                if !m.editing { m.selected = nil }
+            }
+            if m.editing {
+                glassButton("plus") {
+                    var c = TouchControl()
+                    // Stagger, so repeated adds do not stack invisibly.
+                    c.nx = 0.5 + Double(m.controls.count % 3) * 0.06
+                    c.ny = 0.5 + Double(m.controls.count % 2) * 0.06
+                    m.controls.append(c)
+                    m.selected = c.id
+                }
+                .transition(.opacity.combined(with: .scale))
+            }
+        }
+        .padding(.top, 10)
+        .animation(.easeInOut(duration: 0.22), value: m.editing)
+    }
+
+    /// Pinch anywhere scales the SELECTED control. With nothing selected it does
+    /// nothing rather than guessing which one you meant.
+    private var scalePinch: some Gesture {
+        MagnificationGesture()
+            .onChanged { v in
+                guard m.editing, let i = m.index(of: m.selected) else { return }
+                if pinchBase == nil { pinchBase = m.controls[i].scale }
+                m.controls[i].scale = min(max((pinchBase ?? 1) * Double(v), 0.5), 3.0)
+            }
+            .onEnded { _ in pinchBase = nil }
+    }
+
+    private func glassButton(_ system: String, dim: Bool = false,
+                             _ action: @escaping () -> Void) -> some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            withAnimation(.easeInOut(duration: 0.22)) { action() }
+        } label: {
+            // Stroke only — never a .fill variant.
+            Image(systemName: system)
+                .font(.system(size: 18, weight: .regular))
+                .foregroundStyle(.white.opacity(dim ? 0.35 : 1.0))
+                .frame(width: 44, height: 44)
+                .background(GlassShape(circle: true))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// Shared glass backing, with the pre-26 fallback the codebase already uses.
+struct GlassShape: View {
+    var circle = false
+    var body: some View {
+        if #available(iOS 26.0, *) {
+            if circle { Circle().fill(.clear).glassEffect(.regular, in: Circle()) }
+            else { RoundedRectangle(cornerRadius: 18).fill(.clear)
+                     .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18)) }
+        } else {
+            if circle { Circle().fill(.ultraThinMaterial) }
+            else { RoundedRectangle(cornerRadius: 18).fill(.ultraThinMaterial) }
+        }
+    }
+}
+
+struct TouchControlButton: View {
+    let control: TouchControl
+    let screen: CGSize
+    @ObservedObject private var m = TouchControlsModel.shared
+    @State private var isDown = false
+    @State private var dragBase: CGPoint?
+    @State private var stickDir: Int = -1
+
+    private var diameter: CGFloat { TouchControlsModel.baseDiameter * CGFloat(control.scale) }
+    private var isStick: Bool { control.action.stickKeys != nil }
+    private var isSelected: Bool { m.editing && m.selected == control.id }
+
+    var body: some View {
+        ZStack {
+            if control.action.stickKeys != nil {
+                // Reuse the portrait pad's face so both look and animate the
+                // same; scale it to whatever size this control was pinched to.
+                JoystickFace(held: isDown, dir: stickDir, alwaysExpanded: true)
+                    .frame(width: JoystickFace.padRadius * 2,
+                           height: JoystickFace.padRadius * 2)
+                    .scaleEffect(diameter / (JoystickFace.padRadius * 2))
+            } else {
+                GlassShape(circle: true)
+                Text(control.action.label)
+                    .font(.system(size: diameter * (control.action.label.count > 2 ? 0.22 : 0.34),
+                                  weight: .medium))
+                    .foregroundStyle(.white.opacity(control.action.isPad ? 0.45
+                                                    : (isDown ? 1.0 : 0.85)))
+            }
+        }
+        .frame(width: diameter, height: diameter)
+        .overlay(Circle().stroke(.white.opacity(isSelected ? 0.95
+                                                : (isStick ? 0 : 0.28)),
+                                 lineWidth: isSelected ? 2 : 1))
+        // A stick must not shrink under the thumb; only round buttons do that.
+        .scaleEffect(!isStick && isDown ? 0.92 : 1.0)
+        .animation(.easeOut(duration: 0.08), value: isDown)
+        // ml646: the springy knob, same curve as the portrait pad overlay.
+        .animation(.spring(response: 0.22, dampingFraction: 0.58), value: stickDir)
+        .overlay(alignment: .topTrailing) {
+            if isSelected {
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    m.controls.removeAll { $0.id == control.id }
+                    m.selected = nil
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 22, height: 22)
+                        .background(Circle().fill(.red.opacity(0.85)))
+                }
+                .buttonStyle(.plain)
+                .offset(x: 8, y: -8)
+            }
+        }
+        .position(x: CGFloat(control.nx) * screen.width,
+                  y: CGFloat(control.ny) * screen.height)
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { v in
+                    if m.editing {
+                        m.selected = control.id
+                        guard let i = m.index(of: control.id) else { return }
+                        if dragBase == nil { dragBase = CGPoint(x: control.nx, y: control.ny) }
+                        let b = dragBase ?? .zero
+                        m.controls[i].nx = min(max(b.x + Double(v.translation.width  / screen.width),  0.03), 0.97)
+                        m.controls[i].ny = min(max(b.y + Double(v.translation.height / screen.height), 0.03), 0.97)
+                    } else if let q = control.action.stickKeys {
+                        isDown = true
+                        applyStick(snap(v.translation), q)
+                    } else if !isDown {
+                        isDown = true
+                        press(true)
+                    }
+                }
+                .onEnded { _ in
+                    dragBase = nil
+                    if let q = control.action.stickKeys {
+                        applyStick(-1, q)          // release every held direction
+                        isDown = false
+                    } else if isDown {
+                        isDown = false
+                        press(false)
+                    }
+                }
+        )
+    }
+
+    /// 8-way snap. Screen y grows downward, so measure clockwise from "up".
+    private func snap(_ t: CGSize) -> Int {
+        let d = (t.width * t.width + t.height * t.height).squareRoot()
+        if d < diameter * 0.22 { return -1 }        // deadzone scales with the control
+        var a = atan2(t.width, -t.height) * 180 / .pi
+        if a < 0 { a += 360 }
+        return Int((a + 22.5) / 45.0) % 8
+    }
+
+    private func stickKeys(_ d: Int, _ q: [Int32]) -> [Int32] {
+        switch d {
+        case 0: return [q[0]]
+        case 1: return [q[0], q[1]]
+        case 2: return [q[1]]
+        case 3: return [q[2], q[1]]
+        case 4: return [q[2]]
+        case 5: return [q[2], q[3]]
+        case 6: return [q[3]]
+        case 7: return [q[0], q[3]]
+        default: return []
+        }
+    }
+
+    /// Release what is no longer held, press what newly is. A blanket
+    /// release/re-press would make a held direction stutter as the thumb
+    /// wanders inside one sector.
+    private func applyStick(_ next: Int, _ q: [Int32]) {
+        guard next != stickDir else { return }
+        let old = Set(stickKeys(stickDir, q)), new = Set(stickKeys(next, q))
+        for vk in old.subtracting(new) { winios_post_key(vk, 0) }
+        for vk in new.subtracting(old) { winios_post_key(vk, 1) }
+        if stickDir == -1, next != -1 { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
+        stickDir = next
+    }
+
+    /// Haptic on the DOWN edge only — a held movement key would otherwise buzz
+    /// continuously for as long as you walk.
+    private func press(_ down: Bool) {
+        if down { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
+        switch control.action {
+        case .key(let vk):
+            winios_post_key(vk, down ? 1 : 0)
+        case .mouseLeft:
+            winios_pointer(0, 0, down ? 0x0002 : 0x0004, 0)   // LEFTDOWN / LEFTUP
+        case .mouseRight:
+            winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)   // RIGHTDOWN / RIGHTUP
+        case .keyboardToggle:
+            if down { MetalBackedView.toggleKeyboard() }
+        case .none, .joystickWASD, .joystickArrows:
+            break                                              // sticks drive themselves
+        case .pad:
+            break     // ml645: no XInput yet — deliberately inert, and labelled so
+        }
+    }
+}
+
+/// ml645 — the mapping panel. Shown for the selected control in edit mode.
+struct MappingPanel: View {
+    let control: TouchControl
+    let screen: CGSize
+    @ObservedObject private var m = TouchControlsModel.shared
+    @State private var tab = 0                    // 0 keyboard, 1 controller
+
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                tabButton(0, "keyboard")
+                tabButton(1, "gamecontroller")
+            }
+            Rectangle().fill(.white.opacity(0.15)).frame(height: 1)
+            ScrollView {
+                (tab == 0 ? AnyView(keyboardTab) : AnyView(controllerTab))
+                    .padding(10)
+            }
+        }
+        .frame(width: layout.size.width, height: layout.size.height)
+        .background(GlassShape())
+        .clipShape(RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.18), lineWidth: 1))
+        .position(layout.center)
+    }
+
+    private struct Placement { var center: CGPoint; var size: CGSize }
+
+    /// ml646: the panel must NEVER sit under the control it is editing.
+    ///
+    /// The old version only tried below/above and then clamped, which on a
+    /// 390pt-tall landscape phone silently put the panel right on top of any
+    /// control near the middle: 240 of panel + 64 of control + gaps does not fit
+    /// in 390 either way, so the clamp was the only thing deciding placement.
+    ///
+    /// Try each side in turn, at shrinking sizes, and take the first that fits
+    /// on the screen along the axis it separates on. Clamping the OTHER axis is
+    /// then always safe — below/above are separated vertically, so no horizontal
+    /// clamp can reintroduce an overlap, and vice versa.
+    private var layout: Placement {
+        let cx = CGFloat(control.nx) * screen.width
+        let cy = CGFloat(control.ny) * screen.height
+        let r  = TouchControlsModel.baseDiameter * CGFloat(control.scale) / 2
+        let gap: CGFloat = 14, edge: CGFloat = 8
+
+        for size in [CGSize(width: 340, height: 236),
+                     CGSize(width: 300, height: 196),
+                     CGSize(width: 264, height: 164)] {
+            let clampX = min(max(cx, size.width  / 2 + edge), screen.width  - size.width  / 2 - edge)
+            let clampY = min(max(cy, size.height / 2 + edge), screen.height - size.height / 2 - edge)
+            if cy + r + gap + size.height <= screen.height - edge {
+                return Placement(center: CGPoint(x: clampX, y: cy + r + gap + size.height / 2), size: size)
+            }
+            if cy - r - gap - size.height >= edge {
+                return Placement(center: CGPoint(x: clampX, y: cy - r - gap - size.height / 2), size: size)
+            }
+            if cx + r + gap + size.width <= screen.width - edge {
+                return Placement(center: CGPoint(x: cx + r + gap + size.width / 2, y: clampY), size: size)
+            }
+            if cx - r - gap - size.width >= edge {
+                return Placement(center: CGPoint(x: cx - r - gap - size.width / 2, y: clampY), size: size)
+            }
+        }
+        // Nothing fits alongside — smallest panel, corner furthest from the
+        // control, so it still cannot cover it.
+        let size = CGSize(width: 264, height: 164)
+        return Placement(
+            center: CGPoint(x: cx < screen.width  / 2 ? screen.width  - size.width  / 2 - edge
+                                                      : size.width  / 2 + edge,
+                            y: cy < screen.height / 2 ? screen.height - size.height / 2 - edge
+                                                      : size.height / 2 + edge),
+            size: size)
+    }
+
+    private func tabButton(_ i: Int, _ icon: String) -> some View {
+        Button { tab = i } label: {
+            Image(systemName: icon)                       // stroke, not filled
+                .font(.system(size: 16, weight: .regular))
+                .foregroundStyle(.white.opacity(tab == i ? 1.0 : 0.38))
+                .frame(maxWidth: .infinity, minHeight: 36)
+        }
+        .buttonStyle(.plain)
+    }
+
+    // ---- catalogues ----
+    private var letters: [(String, ControlAction)] {
+        (0x41...0x5A).map { (String(UnicodeScalar(UInt8($0))), ControlAction.key(Int32($0))) }
+    }
+    private var digits: [(String, ControlAction)] {
+        (0x30...0x39).map { (String(UnicodeScalar(UInt8($0))), ControlAction.key(Int32($0))) }
+    }
+    private var fkeys: [(String, ControlAction)] {
+        (0...11).map { ("F\($0 + 1)", ControlAction.key(Int32(0x70 + $0))) }
+    }
+    private var numpad: [(String, ControlAction)] {
+        (0...9).map { ("N\($0)", ControlAction.key(Int32(0x60 + $0))) }
+        + [("N*", .key(0x6A)), ("N+", .key(0x6B)), ("N−", .key(0x6D)),
+           ("N.", .key(0x6E)), ("N/", .key(0x6F))]
+    }
+
+    private var keyboardTab: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            section("Pointer, sticks & special", [
+                ("L click", .mouseLeft), ("R click", .mouseRight),
+                ("WASD", .joystickWASD), ("Arrows", .joystickArrows),
+                ("Keyboard", .keyboardToggle), ("None", .none),
+            ])
+            section("Letters", letters)
+            section("Numbers", digits)
+            section("Function", fkeys)
+            section("Modifiers & editing", [
+                ("Esc", .key(0x1B)), ("Tab", .key(0x09)), ("Caps", .key(0x14)),
+                ("Shift", .key(0x10)), ("Ctrl", .key(0x11)), ("Alt", .key(0x12)),
+                ("Space", .key(0x20)), ("Enter", .key(0x0D)), ("Bksp", .key(0x08)),
+                ("Win", .key(0x5B)),
+            ])
+            section("Navigation", [
+                ("←", .key(0x25)), ("↑", .key(0x26)), ("→", .key(0x27)), ("↓", .key(0x28)),
+                ("Ins", .key(0x2D)), ("Del", .key(0x2E)), ("Home", .key(0x24)),
+                ("End", .key(0x23)), ("PgUp", .key(0x21)), ("PgDn", .key(0x22)),
+            ])
+            section("Symbols", [
+                ("-", .key(0xBD)), ("=", .key(0xBB)), ("[", .key(0xDB)), ("]", .key(0xDD)),
+                ("\\", .key(0xDC)), (";", .key(0xBA)), ("'", .key(0xDE)), (",", .key(0xBC)),
+                (".", .key(0xBE)), ("/", .key(0xBF)), ("`", .key(0xC0)),
+            ])
+            section("Numpad", numpad)
+        }
+    }
+
+    private var controllerTab: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("XInput isn't wired up yet. These save with your layout but do "
+                 + "nothing when pressed — controller support lands with the Wine HID stack.")
+                .font(.system(size: 11))
+                .foregroundStyle(.orange.opacity(0.95))
+                .fixedSize(horizontal: false, vertical: true)
+            section("Face", [("A", .pad("A")), ("B", .pad("B")), ("X", .pad("X")), ("Y", .pad("Y"))])
+            section("D-pad", [("D↑", .pad("D↑")), ("D↓", .pad("D↓")),
+                              ("D←", .pad("D←")), ("D→", .pad("D→"))])
+            section("Bumpers & triggers", [("LB", .pad("LB")), ("RB", .pad("RB")),
+                                           ("LT", .pad("LT")), ("RT", .pad("RT"))])
+            section("Sticks", [("LS", .pad("LS")), ("RS", .pad("RS")),
+                               ("L3", .pad("L3")), ("R3", .pad("R3"))])
+            section("System", [("Menu", .pad("Menu")), ("View", .pad("View")),
+                               ("Guide", .pad("Guide"))])
+        }
+    }
+
+    private func section(_ title: String, _ items: [(String, ControlAction)]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.45))
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 48), spacing: 6)], spacing: 6) {
+                ForEach(Array(items.enumerated()), id: \.offset) { _, it in
+                    chip(it.0, it.1)
+                }
+            }
+        }
+    }
+
+    private func chip(_ label: String, _ action: ControlAction) -> some View {
+        let on = control.action == action
+        return Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            if let i = m.index(of: control.id) { m.controls[i].action = action }
+        } label: {
+            Text(label)
+                .font(.system(size: 12, weight: .medium))
+                .lineLimit(1)
+                .minimumScaleFactor(0.55)
+                .foregroundStyle(.white.opacity(action.isPad ? 0.55 : 1.0))
+                .frame(maxWidth: .infinity, minHeight: 30)
+                .background(RoundedRectangle(cornerRadius: 7)
+                    .fill(.white.opacity(on ? 0.36 : 0.12)))
+        }
+        .buttonStyle(.plain)
     }
 }

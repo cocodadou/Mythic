@@ -65,3 +65,10 @@ void winios_cursor_move(int x, int y);
 #endif
 
 #endif
+
+/* ml649: runtime diagnostic switch (defined in ntdll-unix/virtual_ios.c, which
+ * links into the same Mach-O). Default OFF = quiet/fast. Toggling live lets
+ * loud and quiet be compared inside ONE run, same scene, same thermal state —
+ * something two separate builds can never give you. */
+void mythic_set_diag_enabled(int on);
+int  mythic_get_diag_enabled(void);

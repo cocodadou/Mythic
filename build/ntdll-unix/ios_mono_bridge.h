@@ -60,6 +60,7 @@ struct ios_mono_pending {
 
 struct ios_mono_bridge {
     uint32_t abi_version;
+    uint32_t diag_enabled;   /* ml649: runtime diagnostic switch, also read by FEX */
 
     /* Published by FEX so the native side never hardcodes a struct layout. A
      * silent CPUState reshuffle would otherwise turn the capture into a wild

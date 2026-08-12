@@ -86,6 +86,11 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
 #define NTDLL_DWARF_H_NO_UNWINDER
 #include "dwarf.h"
 
+/* ml649: runtime diagnostic switch, defined in virtual_ios.c. Default OFF.
+ * Gate the WORK, not the print — several probes do expensive reads first. */
+extern volatile int mythic_diag_enabled;
+
+
 /* ml648: defined in virtual_ios.c, called from the SWPAL emulation path. */
 void ios_mono_bridge_capture( unsigned long long teb, unsigned long long frame,
                               unsigned long long host_pc, unsigned long long fault_addr );
@@ -1073,7 +1078,10 @@ static void *ios_mach_exception_thread( void *arg )
          * in the menu phase (~all of the 1.4s frame time at ~33us each).
          * Sample every 4096th message: exception type + faulting PC + insn
          * so the trap source is nameable from one run. */
-        if ((ios_exc_msg_count & 0xFFF) == 0)
+        /* ml649: gate the WORK. This costs two Mach round-trips (thread_get_state
+         * + vm_read_overwrite) per sample, so checking the flag before them is the
+         * point — checking it before the dprintf would save nothing. */
+        if (mythic_diag_enabled && (ios_exc_msg_count & 0xFFF) == 0)
         {
             arm_thread_state64_t pstate;
             mach_msg_type_number_t pcount = ARM_THREAD_STATE64_COUNT;
@@ -2919,8 +2927,8 @@ static void *ios_mach_exception_thread( void *arg )
                         handled = 1;
                         static volatile int emul_count = 0;
                         int ec = __sync_add_and_fetch(&emul_count, 1);
-                        if (ec <= 5 || (ec % 1000) == 0)
-                        {
+                        if (mythic_diag_enabled && (ec <= 5 || (ec % 1000) == 0))
+                        {   /* ml649: the readback below touches both aliases */
                             /* Verify dual-map sharing: read back via the RX
                              * (original) address and compare to what we wrote
                              * via RW. If they match, the dual-map is working

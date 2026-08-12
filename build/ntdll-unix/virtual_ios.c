@@ -2710,7 +2710,29 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
  * non-executable mapping. Only MonoBackpatcherWrite reads this one. */
 #include "ios_mono_bridge.h"
 
-struct ios_mono_bridge g_ios_mono_bridge = { .abi_version = 1 };
+struct ios_mono_bridge g_ios_mono_bridge = { .abi_version = 2 };  /* ml649: struct grew */
+
+/* ml649: RUNTIME DIAGNOSTIC SWITCH.
+ *
+ * Default OFF (quiet/fast). The app toggles it live, which beats a separate
+ * quiet build for the reason that matters to benchmarking: loud and quiet can
+ * be compared inside ONE run, on the same scene at the same thermal state. Two
+ * builds cannot give you that.
+ *
+ * ⚠️ Gate the WORK, not the PRINT. Several probes do an expensive read (Mach
+ * calls, dual-map readback, hashing) and only then decide whether to format a
+ * line; wrapping just the dprintf would save nothing. */
+volatile int mythic_diag_enabled = 0;
+
+void mythic_set_diag_enabled( int on )
+{
+    __atomic_store_n( &mythic_diag_enabled, on ? 1 : 0, __ATOMIC_RELAXED );
+    /* Publish to FEX too — it is a separate PE and cannot see this global. */
+    __atomic_store_n( &g_ios_mono_bridge.diag_enabled, on ? 1u : 0u, __ATOMIC_RELAXED );
+    dprintf( 2, "[diag] ml649 diagnostics %s\n", on ? "ON" : "OFF (quiet)" );
+}
+
+int mythic_get_diag_enabled( void ) { return __atomic_load_n( &mythic_diag_enabled, __ATOMIC_RELAXED ); }
 
 /* Faulting-thread registers are not trusted, and a probe must never fault
  * inside a fault. Every dereference on the capture path goes through here —

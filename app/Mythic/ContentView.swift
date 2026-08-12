@@ -52,9 +52,21 @@ final class MetalHostView: UIView {
             metalLayer.perform(syncSel, with: NSNumber(value: false))
             LogStore.shared.log("MetalLayer: displaySyncEnabled=false (private API, MeloNX pattern)")
         }
+        /* ml651: was hardcoded 60, which contradicted everything around it —
+         * FPSOverlay asks the display link for CAFrameRateRange(preferred: 120)
+         * while this declared the surface a 60Hz one. Track the screen instead.
+         *
+         * ⚠️ HYPOTHESIS, NOT A DIAGNOSIS. displaySyncEnabled=false directly above
+         * takes our presents out of display-sync scheduling, so this nominal
+         * value may well be inert. It is one line and it removes a genuine
+         * contradiction; if the A/B shows nothing, the cap is elsewhere and we
+         * have eliminated it rather than argued about it. */
         let fpsSel = NSSelectorFromString("setNominalFramesPerSecond:")
         if metalLayer.responds(to: fpsSel) {
-            metalLayer.perform(fpsSel, with: 60 as NSNumber)
+            let hz = UIScreen.main.maximumFramesPerSecond
+            metalLayer.perform(fpsSel, with: hz as NSNumber)
+            LogStore.shared.log("MetalLayer: ml651 nominalFPS=\(hz) (was hardcoded 60; "
+                                + "display link asks preferred=120)")
         }
         UIApplication.shared.isIdleTimerDisabled = true
         // Set once so DXMT's swapchain setup never blocks on a zero-sized
@@ -790,6 +802,9 @@ final class InputSettings: ObservableObject {
     @Published var relative: Bool  = false { didSet { save() } }
     @Published var sensAbs:  Double = 2.0  { didSet { save() } }
     @Published var sensRel:  Double = 2.0  { didSet { save() } }
+    /// ml649: heavy diagnostics. Default OFF so the shipped default is the fast
+    /// path; flip it on only when a run needs to be explainable.
+    @Published var diagnostics = false { didSet { mythic_set_diag_enabled(diagnostics ? 1 : 0); save() } }
 
     /// didSet fires for assignments made in init() because the properties are
     /// already initialised by then; without this the first launch would write
@@ -808,13 +823,15 @@ final class InputSettings: ObservableObject {
             relative = j["relative"] as? Bool   ?? false
             sensAbs  = j["sensAbs"]  as? Double ?? 2.0
             sensRel  = j["sensRel"]  as? Double ?? 2.0
+            diagnostics = j["diagnostics"] as? Bool ?? false
         }
         loading = false
+        mythic_set_diag_enabled(diagnostics ? 1 : 0)   // push the restored value down
     }
 
     private func save() {
         guard !loading else { return }
-        let j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel]
+        let j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel, "diagnostics": diagnostics]
         guard let d = try? JSONSerialization.data(withJSONObject: j) else { return }
         try? d.write(to: Self.url, options: .atomic)
     }
@@ -922,6 +939,7 @@ struct ContentView: View {
                     }
                     .transition(.opacity)
                     pointerToggleButton
+                    diagToggleButton
                     Spacer()
                 }
             }
@@ -988,6 +1006,23 @@ struct ContentView: View {
                 .cornerRadius(6)
         }
         .matchedGeometryEffect(id: "pointerBtn", in: pointerNS)
+    }
+
+    /// ml649: heavy diagnostics on/off, live. Stroke icon, dimmed when quiet —
+    /// same visual language as the controls-visibility button.
+    private var diagToggleButton: some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            input.diagnostics.toggle()
+        } label: {
+            Image(systemName: "ladybug")
+                .font(.system(size: 17, weight: .regular))
+                .foregroundStyle(.white.opacity(input.diagnostics ? 1.0 : 0.35))
+                .frame(minWidth: 40, minHeight: 32)
+                .background(Color.secondary.opacity(0.25))
+                .cornerRadius(6)
+        }
+        .buttonStyle(.plain)
     }
 
     private var pointerModeToggle: some View {

@@ -795,6 +795,14 @@ static void *ios_pool_warmer_thread( void *arg )
             {
                 struct { unsigned long long base, size, dirty, res, swap; unsigned tag; } top[12];
                 unsigned long long dirty_by_tag[256];
+                /* ml677: DIRTY IS NOT RESIDENCY. The top[12] rows carry res/swap
+                 * but they are only the twelve dirtiest regions of the sweep, so
+                 * summing THOSE and comparing against the full dirty_by_tag[]
+                 * aggregate mixes a sample with a census -- which is exactly how
+                 * I concluded "tag 100 is 1380MB of pinned GPU memory" when the
+                 * true residency was never measured. Aggregate all three per tag,
+                 * over EVERY region, so the comparison is like-for-like. */
+                unsigned long long res_by_tag[256], swap_by_tag[256];
                 /* ml360 BAND TOTALS: ml360's walk showed the top-12 misses most
                  * of the spend (2154MB tag-0 spread over 116k regions) and the
                  * JIT pool showed up NOWHERE despite ~460MB written — either
@@ -817,6 +825,8 @@ static void *ios_pool_warmer_thread( void *arg )
                 unsigned long long total_dirty = 0;
                 memset( top, 0, sizeof(top) );
                 memset( dirty_by_tag, 0, sizeof(dirty_by_tag) );
+                memset( res_by_tag, 0, sizeof(res_by_tag) );
+                memset( swap_by_tag, 0, sizeof(swap_by_tag) );
                 memset( band_dirty, 0, sizeof(band_dirty) );
                 memset( band_res, 0, sizeof(band_res) );
                 for (;;)
@@ -841,6 +851,11 @@ static void *ios_pool_warmer_thread( void *arg )
                         else b = B_OTHER;
                         band_dirty[b] += d;
                         band_res[b] += (unsigned long long)info.pages_resident << 14;
+                    }
+                    if (info.user_tag < 256)
+                    {
+                        res_by_tag[info.user_tag]  += (unsigned long long)info.pages_resident << 14;
+                        swap_by_tag[info.user_tag] += (unsigned long long)info.pages_swapped_out << 14;
                     }
                     /* ml569: does the HOST MALLOC HEAP overlap memory we reserved?
                      *
@@ -909,8 +924,10 @@ static void *ios_pool_warmer_thread( void *arg )
                             top[ti].res >> 20, top[ti].swap >> 20, top[ti].tag);
                 }
                 for (ti = 0; ti < 256; ti++)
-                    if (dirty_by_tag[ti] >> 20 >= 32)
-                        dprintf(2, "[phys-map]   tag %u total dirty=%llu MB\n", ti, dirty_by_tag[ti] >> 20);
+                    if ((dirty_by_tag[ti] >> 20) >= 32 || (res_by_tag[ti] >> 20) >= 32 ||
+                        (swap_by_tag[ti] >> 20) >= 32)
+                        dprintf(2, "[phys-map]   tag %u totals rev=ml677 dirty=%llu MB res=%llu MB swap=%llu MB\n",
+                                ti, dirty_by_tag[ti] >> 20, res_by_tag[ti] >> 20, swap_by_tag[ti] >> 20);
                 dprintf(2, "[phys-map] bands rev=ml360 (dirty/res MB):");
                 for (ti = 0; ti < B_MAX; ti++)
                     dprintf(2, " %s=%llu/%llu", band_name[ti],

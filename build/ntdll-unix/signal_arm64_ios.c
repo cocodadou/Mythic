@@ -311,6 +311,14 @@ volatile int64_t ios_exc_x18_fixes = 0;
 volatile int64_t ios_exc_usd_fixes = 0;
 volatile int ios_exc_thread_alive = 0;
 volatile int ios_exc_msg_count = 0;
+/* ml680: cost of a fault, measured rather than assumed. A 2026-07-03 note in
+ * the receive loop already put the round trip at ~33us; this makes it a live
+ * number for THIS workload so the W^X change has a before/after to beat.
+ * t0 is stamped at message receipt and consumed by the store emulator. */
+volatile unsigned long long ios_store_fault_t0 = 0;
+volatile unsigned long long ios_store_fault_ticks = 0;
+volatile unsigned long long ios_store_fault_n = 0;
+volatile unsigned long long ios_store_fault_dropped = 0;   /* ml685 */
 /* Last thread that took an exec fault at a PE VA (i.e. made a native call
  * through the redirect path) — the game thread in practice. The [PROF]
  * sampler in server_ios.c follows this so it profiles the presenting
@@ -1099,6 +1107,7 @@ static void *ios_mach_exception_thread( void *arg )
 
         ios_exc_request_t *req = &msg.typed;
         ios_exc_msg_count++;
+        ios_store_fault_t0 = mach_absolute_time();          /* ml680 */
 
         thread_t thread = req->thread.name;
         int handled = 0;
@@ -1110,6 +1119,24 @@ static void *ios_mach_exception_thread( void *arg )
         /* ml649: gate the WORK. This costs two Mach round-trips (thread_get_state
          * + vm_read_overwrite) per sample, so checking the flag before them is the
          * point — checking it before the dprintf would save nothing. */
+        if ((ios_exc_msg_count % 200000) == 0 && ios_store_fault_n)
+        {   /* ml680: mach_timebase converts ticks to ns once. ONE handler thread
+             * serves every Wine thread, so this total is a hard serialised
+             * ceiling on the whole app, not a per-thread cost. */
+            /* mach_timebase_info_data_t is not visible in this TU's header set;
+             * the struct is two uint32s and the call takes it by pointer. */
+            struct { unsigned int numer, denom; } tb = {0, 0};
+            extern int mach_timebase_info(void *);
+            unsigned long long n = ios_store_fault_n, tk = ios_store_fault_ticks;
+            mach_timebase_info(&tb);
+            {
+                unsigned long long ns = tb.denom ? (tk * tb.numer) / tb.denom : tk;
+                dprintf(STDERR_FILENO,
+                    "[fault-cost] ml685 emulated-store faults=%llu total=%llu ms avg=%llu ns "
+                    "dropped=%llu (one handler thread serves all threads)\n",
+                    n, ns / 1000000ull, ns / n, ios_store_fault_dropped);
+            }
+        }
         if (mythic_diag_enabled && (ios_exc_msg_count & 0xFFF) == 0)
         {
             arm_thread_state64_t pstate;
@@ -2958,6 +2985,129 @@ static void *ios_mach_exception_thread( void *arg )
                         handled = 1;
                         static volatile int emul_count = 0;
                         int ec = __sync_add_and_fetch(&emul_count, 1);
+
+                        /* ============ ml680 WHAT DOES A FAULT ACTUALLY COST? ==
+                         *
+                         * I have twice asserted "37,000 Mach round trips/sec at
+                         * ~20us each = most of a core" without ever measuring
+                         * the round trip. If it is really 20us the storm is the
+                         * frame rate; if it is 2us it costs ~7% of one core and
+                         * the W^X rebuild would be aimed at the wrong target.
+                         *
+                         * ios_store_fault_t0 is stamped at handler ENTRY (see
+                         * the exception entry point), so this covers the whole
+                         * kernel->handler->emulate path, not just the store. */
+                        {
+                            extern volatile unsigned long long ios_store_fault_t0;
+                            extern volatile unsigned long long ios_store_fault_ticks;
+                            extern volatile unsigned long long ios_store_fault_n;
+                            extern volatile unsigned long long ios_store_fault_dropped;
+                            /* ml685: the ml680 version was WRONG and its late totals
+                             * (6.1e12 ms) must not be used. t0 is a single plain
+                             * global; when the store is emulated on a different
+                             * thread than the one that stamped it, `now - t0` can
+                             * UNDERFLOW an unsigned 64-bit and add ~2^64 ticks. One
+                             * race poisons the accumulator permanently, which is why
+                             * the early samples (~3.3us) were sane and everything
+                             * after was garbage.
+                             *
+                             * Take the sample only when it is self-evidently valid,
+                             * and drop implausible ones into a separate counter so a
+                             * discarded sample is visible rather than silent. */
+                            {
+                                unsigned long long t0 = ios_store_fault_t0;
+                                unsigned long long now = mach_absolute_time();
+                                ios_store_fault_t0 = 0;
+                                if (t0 && now > t0)
+                                {
+                                    unsigned long long dt = now - t0;
+                                    /* 24M ticks ~= 1s at the 24MHz timebase: any
+                                     * store taking longer than that is a stale
+                                     * pairing, not a measurement. */
+                                    if (dt < 24000000ull)
+                                    {
+                                        __sync_add_and_fetch(&ios_store_fault_ticks, dt);
+                                        __sync_add_and_fetch(&ios_store_fault_n, 1);
+                                    }
+                                    else
+                                        __sync_add_and_fetch(&ios_store_fault_dropped, 1);
+                                }
+                                else if (t0)
+                                    __sync_add_and_fetch(&ios_store_fault_dropped, 1);
+                            }
+                        }
+
+                        /* ============ ml678 FAULT CLASSIFIER ==================
+                         *
+                         * ml677 sampled 13,299 of 13.3M faults as LOG LINES and
+                         * I then matched their instruction ENCODING against the
+                         * spinning worker's block and declared them the same
+                         * code. They are not: 0 of 13,299 fault pcs and 0 of
+                         * 3,248 EXC_SAMPLE pcs fall inside that block. c89ffcc1
+                         * is FEX's TSO lowering of an ordinary store and occurs
+                         * all over translated code, so encoding proves nothing.
+                         *
+                         * Aggregate IN-PROBE by host pc instead -- real event
+                         * counts, not sampled lines -- and carry the facts that
+                         * identify the emitter: the block-granular guest RIP
+                         * from FEX's ThreadState (x28+0x18, a plain load: NEVER
+                         * call an EC export from a fault path, ml613), the
+                         * target page, and how many distinct pages that pc hits
+                         * (one page = a hot data structure, many = a memcpy-like
+                         * sweep). */
+                        {
+                            enum { FC_SLOTS = 24 };
+                            static struct {
+                                unsigned long long pc, rip, page, page2;
+                                unsigned long long hits; unsigned pages_seen;
+                            } fc[FC_SLOTS];
+                            static volatile int fc_lock;
+                            unsigned long long fpage = (unsigned long long)fault_addr & ~0x3fffull;
+                            unsigned long long grip = 0;
+                            /* x28 = FEX ThreadState; +0x18 = State.rip for this block */
+                            if (state.__x[28] > 0x10000)
+                            {
+                                mach_vm_size_t g = 0;
+                                if (mach_vm_read_overwrite(mach_task_self(),
+                                        (mach_vm_address_t)(state.__x[28] + 0x18), 8,
+                                        (mach_vm_address_t)&grip, &g) != KERN_SUCCESS || g != 8)
+                                    grip = 0;
+                            }
+                            if (!__sync_lock_test_and_set(&fc_lock, 1))
+                            {
+                                int fi, victim = 0;
+                                for (fi = 0; fi < FC_SLOTS; fi++)
+                                {
+                                    if (fc[fi].pc == (unsigned long long)fault_pc) break;
+                                    if (!fc[fi].pc) { victim = fi; break; }
+                                    if (fc[fi].hits < fc[victim].hits) victim = fi;
+                                }
+                                if (fi == FC_SLOTS) fi = victim;
+                                if (fc[fi].pc != (unsigned long long)fault_pc)
+                                {
+                                    fc[fi].pc = (unsigned long long)fault_pc;
+                                    fc[fi].rip = grip; fc[fi].page = fpage;
+                                    fc[fi].page2 = 0; fc[fi].hits = 0; fc[fi].pages_seen = 1;
+                                }
+                                fc[fi].hits++;
+                                if (fpage != fc[fi].page && fpage != fc[fi].page2)
+                                { fc[fi].page2 = fpage; fc[fi].pages_seen++; }
+                                if ((ec % 200000) == 0)
+                                {
+                                    int k;
+                                    dprintf(STDERR_FILENO,
+                                        "[fault-class] ml678 ==== %d emulated stores so far ====\n", ec);
+                                    for (k = 0; k < FC_SLOTS; k++)
+                                        if (fc[k].hits)
+                                            dprintf(STDERR_FILENO,
+                                                "[fault-class]   pc=0x%llx guestRIP=0x%llx hits=%llu "
+                                                "page=0x%llx distinct_pages>=%u\n",
+                                                fc[k].pc, fc[k].rip, fc[k].hits,
+                                                fc[k].page, fc[k].pages_seen);
+                                }
+                                __sync_lock_release(&fc_lock);
+                            }
+                        }
                         if (mythic_diag_enabled && (ec <= 5 || (ec % 1000) == 0))
                         {   /* ml649: the readback below touches both aliases */
                             /* Verify dual-map sharing: read back via the RX
@@ -10886,6 +11036,217 @@ void ios_dump_all_thread_stacks(void)
                     bi.run_state, bi.suspend_count, bi.cpu_usage,
                     (unsigned long long)st.__x[8], (unsigned long long)st.__x[18],
                     (unsigned long long)arm_thread_state64_get_sp(st), tebstate);
+
+            /* ================= ml677 SPIN SNAPSHOT =========================
+             *
+             * ml676 sampled "Background Job.Worker 1" 43 times out of 44 at
+             * cpu 989-1000 with its pc confined to a 256-byte window
+             * (0x133a9c7b4-0x133a9c8b4) and x8 invariant at 0x70340c2ce8 --
+             * from cycle 104 (phys 1350MB) right through to cycle 2577
+             * (4026MB). It spins the ENTIRE run and starts long before memory
+             * gets tight, so memory pressure cannot be the cause. A pc alone
+             * cannot say what the loop is; the instructions can.
+             *
+             * Fires once per thread, only after the SAME 4KB pc window has
+             * been seen at high cpu MIN_HITS times, so a merely busy thread
+             * never trips it and the cost is paid once.
+             *
+             * DISCIPLINE (ml613 died on exactly this): do NOT call any
+             * ARM64EC PE export from here -- no RIP-reconstruction helper, no
+             * FEX entry point. Capture NATIVE facts only, every read through
+             * mach_vm_read_overwrite so a bad pointer cannot nest-fault this
+             * handler thread. FEX keeps the guest CPU state pointer in x28,
+             * so BlockBegin (x28+0) and State.rip (x28+0x18) are plain loads
+             * we can validate before trusting. */
+            if (bi.cpu_usage >= 900 && bi.run_state == TH_STATE_RUNNING)
+            {
+                enum { SPIN_SLOTS = 8, MIN_HITS = 4 };
+                static struct { unsigned port; uint64_t page; unsigned hits; unsigned done; } spin[SPIN_SLOTS];
+                uint64_t page = st.__pc & ~0xfffull;
+                int si, slot = -1, free_slot = -1;
+                for (si = 0; si < SPIN_SLOTS; si++)
+                {
+                    if (spin[si].port == threads[i]) { slot = si; break; }
+                    if (!spin[si].port && free_slot < 0) free_slot = si;
+                }
+                if (slot < 0 && free_slot >= 0)
+                {
+                    slot = free_slot;
+                    spin[slot].port = threads[i];
+                    spin[slot].page = page;
+                    spin[slot].hits = 0;
+                }
+                if (slot >= 0)
+                {
+                    if (spin[slot].page != page) { spin[slot].page = page; spin[slot].hits = 1; }
+                    else spin[slot].hits++;
+
+                    if (spin[slot].hits >= MIN_HITS && !spin[slot].done)
+                    {
+                        uint32_t insn[128];          /* pc-256 .. pc+256 */
+                        mach_vm_size_t got = 0;
+                        uint64_t lo = st.__pc - 256;
+                        int k;
+                        spin[slot].done = 1;
+
+                        fprintf(stderr, "[spin] ml677 THREAD \"%s\" port=0x%x SPINNING cpu=%d "
+                                        "pc=0x%llx sp=0x%llx lr=0x%llx fp=0x%llx (hits=%u in one 4KB window)\n",
+                                tname, threads[i], bi.cpu_usage,
+                                (unsigned long long)st.__pc,
+                                (unsigned long long)arm_thread_state64_get_sp(st),
+                                (unsigned long long)st.__lr, (unsigned long long)st.__fp,
+                                spin[slot].hits);
+
+                        /* every GP register -- x8/x28 matter most, but an
+                         * invariant register anywhere names the loop's input */
+                        for (k = 0; k < 29; k += 4)
+                            fprintf(stderr, "[spin]   x%-2d=0x%016llx x%-2d=0x%016llx x%-2d=0x%016llx x%-2d=0x%016llx\n",
+                                    k,   (unsigned long long)st.__x[k],
+                                    k+1, (unsigned long long)(k+1 < 29 ? st.__x[k+1] : 0),
+                                    k+2, (unsigned long long)(k+2 < 29 ? st.__x[k+2] : 0),
+                                    k+3, (unsigned long long)(k+3 < 29 ? st.__x[k+3] : 0));
+
+                        /* FEX guest state via x28 -- validated, never trusted raw */
+                        if (st.__x[28] > 0x10000)
+                        {
+                            uint64_t blockbegin = 0, griprip = 0;
+                            mach_vm_size_t g1 = 0, g2 = 0;
+                            int ok1 = (mach_vm_read_overwrite(mach_task_self(),
+                                        (mach_vm_address_t)st.__x[28], 8,
+                                        (mach_vm_address_t)&blockbegin, &g1) == KERN_SUCCESS && g1 == 8);
+                            int ok2 = (mach_vm_read_overwrite(mach_task_self(),
+                                        (mach_vm_address_t)(st.__x[28] + 0x18), 8,
+                                        (mach_vm_address_t)&griprip, &g2) == KERN_SUCCESS && g2 == 8);
+                            /* ml684: State.rip is only synced at BLOCK boundaries, so
+                             * it names the calling block, not the spinning
+                             * instruction -- ml683's value disassembled to the
+                             * instruction after a GetTickCount64 call, nowhere near
+                             * the captured atomic loop. Reconstruct the EXACT RIP
+                             * from (BlockBegin, host PC) through the pointer
+                             * xtajit64 pushes down; gate on the RESOLVED FLAG, never
+                             * on the pointer (ml551 blacked out the window by calling
+                             * it while it still held ASCII), and never link the EC
+                             * export directly (ml613). */
+                            {
+                                extern unsigned long long (*ios_fex_rip_from_hostpc_cb)( unsigned long long, unsigned long long );
+                                extern volatile int ios_fex_rip_resolved;
+                                uint64_t exact = 0;
+                                if (ios_fex_rip_resolved && ios_fex_rip_from_hostpc_cb && ok1 && blockbegin)
+                                    exact = ios_fex_rip_from_hostpc_cb(blockbegin, st.__pc);
+                                fprintf(stderr, "[spin]   EXACT guest RIP=%s0x%llx  (State.rip=0x%llx is block-granular)\n",
+                                        exact ? "" : "UNRESOLVED:", (unsigned long long)exact,
+                                        (unsigned long long)griprip);
+                                if (exact)
+                                {   /* the guest bytes at the real RIP name the loop */
+                                    uint8_t gb[32];
+                                    mach_vm_size_t gg = 0;
+                                    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)exact,
+                                            sizeof(gb), (mach_vm_address_t)gb, &gg) == KERN_SUCCESS &&
+                                        gg == sizeof(gb))
+                                    {
+                                        char hex[100]; int q;
+                                        for (q = 0; q < 32; q++)
+                                            snprintf(hex + q * 3, 4, "%02x ", gb[q]);
+                                        fprintf(stderr, "[spin]   guest bytes @0x%llx: %s\n",
+                                                (unsigned long long)exact, hex);
+                                    }
+                                }
+                            }
+                            fprintf(stderr, "[spin]   x28=0x%llx BlockBegin=%s0x%llx State.rip=%s0x%llx\n",
+                                    (unsigned long long)st.__x[28],
+                                    ok1 ? "" : "UNREADABLE:", (unsigned long long)blockbegin,
+                                    ok2 ? "" : "UNREADABLE:", (unsigned long long)griprip);
+                            /* ml678: dump the ThreadState head rather than guess where
+                             * the guest register file starts. RSP/RBP/the caller chain
+                             * are all in here; decoding is free offline, and a wrong
+                             * layout guess made on-device costs a whole run. */
+                            {
+                                uint64_t ts[64];
+                                mach_vm_size_t g3 = 0;
+                                if (mach_vm_read_overwrite(mach_task_self(),
+                                        (mach_vm_address_t)st.__x[28], sizeof(ts),
+                                        (mach_vm_address_t)ts, &g3) == KERN_SUCCESS && g3 == sizeof(ts))
+                                {
+                                    int q;
+                                    for (q = 0; q < 64; q += 4)
+                                        fprintf(stderr, "[spin]   TS+0x%03x: %016llx %016llx %016llx %016llx\n",
+                                                q * 8,
+                                                (unsigned long long)ts[q],   (unsigned long long)ts[q+1],
+                                                (unsigned long long)ts[q+2], (unsigned long long)ts[q+3]);
+                                }
+                            }
+                        }
+                        else
+                            fprintf(stderr, "[spin]   x28=0x%llx -- not a plausible CPU-state pointer\n",
+                                    (unsigned long long)st.__x[28]);
+
+                        /* ============ ml681 IS THE LOOP MAKING PROGRESS? =====
+                         *
+                         * ml677 showed six registers all holding one address
+                         * (0x70330c40f8-family). Whether that word CHANGES is
+                         * the difference between "contended lock, someone is
+                         * winning" and "nobody owns it and this thread will
+                         * spin forever". Sample it twice with a gap and diff.
+                         * Also dump the 64 bytes around it -- a lock word's
+                         * neighbours usually name the object. */
+                        {
+                            uint64_t cand[4] = { st.__x[8], st.__x[1], st.__x[2], st.__x[27] };
+                            for (int c = 0; c < 4; c++)
+                            {
+                                uint64_t a = cand[c], v0 = 0, v1 = 0;
+                                mach_vm_size_t g = 0;
+                                if (a < 0x10000 || (a & 7)) continue;
+                                if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)a,
+                                        8, (mach_vm_address_t)&v0, &g) != KERN_SUCCESS || g != 8)
+                                    continue;
+                                usleep(50000);   /* 50ms: many spin iterations */
+                                mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)a,
+                                        8, (mach_vm_address_t)&v1, &g);
+                                fprintf(stderr, "[spin]   watch x%d addr=0x%llx  t0=%016llx t1=%016llx  %s\n",
+                                        c == 0 ? 8 : (c == 1 ? 1 : (c == 2 ? 2 : 27)),
+                                        (unsigned long long)a,
+                                        (unsigned long long)v0, (unsigned long long)v1,
+                                        v0 == v1 ? "UNCHANGED over 50ms -- no progress"
+                                                 : "CHANGED -- lock is turning over");
+                                {
+                                    uint64_t nb[8];
+                                    mach_vm_size_t g2 = 0;
+                                    uint64_t base = a & ~63ull;
+                                    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)base,
+                                            sizeof(nb), (mach_vm_address_t)nb, &g2) == KERN_SUCCESS &&
+                                        g2 == sizeof(nb))
+                                        fprintf(stderr, "[spin]     0x%llx: %016llx %016llx %016llx %016llx "
+                                                        "%016llx %016llx %016llx %016llx\n",
+                                                (unsigned long long)base,
+                                                (unsigned long long)nb[0], (unsigned long long)nb[1],
+                                                (unsigned long long)nb[2], (unsigned long long)nb[3],
+                                                (unsigned long long)nb[4], (unsigned long long)nb[5],
+                                                (unsigned long long)nb[6], (unsigned long long)nb[7]);
+                                }
+                                break;   /* one candidate is enough */
+                            }
+                        }
+
+                        /* the loop body itself: 512 bytes centred on pc */
+                        if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)lo,
+                                                   sizeof(insn), (mach_vm_address_t)insn,
+                                                   &got) == KERN_SUCCESS && got == sizeof(insn))
+                        {
+                            for (k = 0; k < 128; k += 8)
+                            {
+                                fprintf(stderr, "[spin]   %c0x%llx: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                        (lo + k*4 <= st.__pc && st.__pc < lo + k*4 + 32) ? '>' : ' ',
+                                        (unsigned long long)(lo + (uint64_t)k*4),
+                                        insn[k], insn[k+1], insn[k+2], insn[k+3],
+                                        insn[k+4], insn[k+5], insn[k+6], insn[k+7]);
+                            }
+                        }
+                        else
+                            fprintf(stderr, "[spin]   instruction window at 0x%llx UNREADABLE\n",
+                                    (unsigned long long)lo);
+                    }
+                }
+            }
         }
         {
             extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );

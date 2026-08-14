@@ -864,7 +864,14 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationView {
+        /* ml658: was NavigationView, which is deprecated and — the reason this
+         * matters — defaults to a SPLIT VIEW on iPad. TARGETED_DEVICE_FAMILY is
+         * "1,2", so iPad is a shipping target, and the whole UI was being forced
+         * into a sidebar/detail arrangement it was never laid out for.
+         * NavigationStack is single-column on every device. Safe here: there are
+         * no NavigationLinks anywhere in the app, so nothing depended on the
+         * two-column selection behaviour. */
+        NavigationStack {
             Group {
                 if vSizeClass == .compact {
                     landscapeBody
@@ -1787,7 +1794,26 @@ struct ContentView: View {
             // substrate — steam.exe died in seconds. Do not try a third time.
             // The remaining levers are USE-side: the 276MB of duplicate copies
             // (.text sharing) and the 214MB tail of EC code buffers.
-            let poolSizeMB = 896
+            // ml668: RUNTIME-SELECTABLE. 896 stays the default and the only
+            // value proven for Steam/CEF. 384 is the direct-game experiment:
+            // the last good Book of the Dead run used ~139MB of head + ~48MB
+            // of tail, so 384 leaves ~197MB of observed slack while returning
+            // ~512MB of footprint -- and the pool is dirty from birth, so its
+            // SIZE is the cost, not its usage. The VA floor is no longer a
+            // hand-paired constant (ml668 derives it from the pool actually
+            // allocated), so changing this is now a one-line change.
+            // Override lives in Documents/mythic-pool.txt (a bare number of MB)
+            // so it can be swapped between runs without a rebuild, and deleting
+            // the file reverts to the proven default. Clamped to sane values --
+            // a typo here would otherwise move the VA floor with it.
+            var poolSizeMB = 896
+            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+               let txt = try? String(contentsOf: d.appendingPathComponent("mythic-pool.txt"), encoding: .utf8),
+               let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)),
+               mb >= 256, mb <= 1152 {
+                poolSizeMB = mb
+                logStore.log("JIT pool overridden to \(mb)MB via mythic-pool.txt")
+            }
             winios_phase("pool-alloc-begin")
             logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
             let t0 = CFAbsoluteTimeGetCurrent()
@@ -2091,7 +2117,7 @@ struct SetupGuideView: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        NavigationView {
+        NavigationStack {   /* ml658: see the note on the main body */
             List {
                 Section("Requirements") {
                     guideRow(

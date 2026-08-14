@@ -570,6 +570,11 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
         dprintf(2, "[window]   tag%-4d %llu MB\n", tagid[i], (unsigned long long)(tagb[i] >> 20));
 }
 
+/* ml668: published by the footprint sampler below and read by its own cadence
+ * logic; defined further down alongside ios_jit_pool_size_global. */
+extern unsigned long long ios_last_footprint_mb;
+extern int ios_fast_footprint;
+
 static void *ios_pool_warmer_thread( void *arg )
 {
     unsigned cycle = 0;
@@ -719,6 +724,7 @@ static void *ios_pool_warmer_thread( void *arg )
                     static unsigned long long peak_mb;
                     unsigned long long fp_mb = (unsigned long long)vmi.phys_footprint >> 20;
                     if (fp_mb > peak_mb) peak_mb = fp_mb;
+                    ios_last_footprint_mb = fp_mb;      /* ml668: drives the sampler cadence */
                     dprintf(2, "[footprint] rev=ml358 phys=%llu MB (peak %llu) internal=%llu MB "
                             "compressed=%llu MB external=%llu MB reusable=%llu MB (cycle=%u)\n",
                             fp_mb, peak_mb,
@@ -912,7 +918,18 @@ static void *ios_pool_warmer_thread( void *arg )
                 dprintf(2, "\n");
             }
         }
-        usleep( 2000000 );
+        /* ml668: ADAPTIVE CADENCE. At a flat 2s the run kept ending BETWEEN
+         * samples during texture upload, so every "peak" we quoted was a stale
+         * lower bound -- ml664 reported 2733MB when loading was still climbing.
+         * Once the footprint is within ~1.2GB of the 4096MB jetsam limit, drop
+         * to 250ms so the terminal burst is actually captured. The expensive
+         * region/band accounting above stays on the slow cycle; only the cheap
+         * task_info() footprint line runs at the fast rate. */
+        {
+            extern unsigned long long ios_last_footprint_mb;
+            extern int ios_fast_footprint;
+            usleep( (ios_fast_footprint || ios_last_footprint_mb >= 2400) ? 250000 : 2000000 );
+        }
     }
     return NULL;
 }
@@ -2275,6 +2292,8 @@ void ios_pool_va_warn( const char *who, const void *addr, size_t size )
 void *ios_jit_rx_base_global = NULL;
 void *ios_jit_rw_base_global = NULL;
 size_t ios_jit_pool_size_global = 0;
+unsigned long long ios_last_footprint_mb = 0;   /* ml668: latest phys_footprint MB (decl above) */
+int ios_fast_footprint = 0;                    /* ml670: set when d3d11 loads */
 
 /* TEB restore trampoline in JIT pool.
  * iOS sigreturn does NOT restore x18 from the ucontext — it always zeroes
@@ -4228,7 +4247,18 @@ static int ios_va_pressure;
  * is a kernel-pick with this scan clamp). Pool grew 896MB→1152MB after ml363
  * died on pool exhaustion (bump 858/896MB, freelist 0) at MSM depth, so the
  * floor moves 0x7038000000 → 0x7048000000 in lockstep. */
-static const ULONG_PTR ios_usable_va_floor = 0x7038000000;   /* ml423: paired with poolSizeMB=896 (formula: 0x7000000000 + pool bytes; 1024 tried ml421-422, jetsam'd) */
+/* ml668: the floor is DERIVED now. It was a hardcoded constant that had to be
+ * hand-paired with poolSizeMB (the comment above says so in bold), which makes
+ * any pool-size experiment a two-edit change with a silent, ugly failure if you
+ * forget the second one. Computing it from the pool the app actually allocated
+ * removes that trap entirely. Falls back to the 896MB pairing until the pool
+ * size is published, which is before any use site runs. */
+static inline ULONG_PTR ios_usable_va_floor_get(void)
+{
+    size_t sz = ios_jit_pool_size_global;
+    return (ULONG_PTR)0x7000000000ULL + (ULONG_PTR)(sz ? sz : (896ULL << 20));
+}
+#define ios_usable_va_floor (ios_usable_va_floor_get())
 
 /* ml132 SPILL CAP — makes the 3-pool experiment SAFE to run.
  *
@@ -8141,6 +8171,17 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 image_base, (unsigned long)image_size, (char *)jit_rx_base + offset,
                 (unsigned long)offset,
                 (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size);
+            /* ml670: PHASE trigger for the fast sampler. ml668 only sped up
+             * once a sample READ >=2800MB, which is unreachable here -- the last
+             * observed value was 2481MB and the burst reached jetsam inside one
+             * 2s window, so fast mode never engaged and we still have no real
+             * terminal peak. Texture upload begins right after d3d11 loads, so
+             * switch on the phase instead of on a level. */
+            {
+                const char *mn = ios_pe_module_name( image_base, image_size );
+                if (mn && (strstr(mn, "d3d11") || strstr(mn, "D3D11")))
+                    ios_fast_footprint = 1;
+            }
             dprintf(2, "[jit-pool] image %p+0x%lx (%s) → pool %p used=0x%lx/0x%lx tramp+0x%lx\n",
                     image_base, (unsigned long)image_size,
                     ios_pe_module_name( image_base, image_size ), (char *)jit_rx_base + offset,

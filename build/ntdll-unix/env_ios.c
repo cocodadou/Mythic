@@ -2273,6 +2273,13 @@ void unix_init_startup_info(void)
     params->hStdInput       = wine_server_ptr_handle( info->hstdin );
     params->hStdOutput      = wine_server_ptr_handle( info->hstdout );
     params->hStdError       = wine_server_ptr_handle( info->hstderr );
+    {   /* ml662: name the standard handles this pseudo-process is born with. */
+        extern void ios_dump_std_handles_ex( const char *when, void *peb, HANDLE hin, HANDLE hout,
+                                             HANDLE herr, HANDLE console );
+        ios_dump_std_handles_ex( "at-create", NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL,
+                                 params->hStdInput, params->hStdOutput,
+                                 params->hStdError, params->ConsoleHandle );
+    }
     params->dwX             = info->x;
     params->dwY             = info->y;
     params->dwXSize         = info->xsize;
@@ -2303,6 +2310,10 @@ void unix_init_startup_info(void)
         /* runtime info isn't a real string */
         params->RuntimeInfo.MaximumLength = params->RuntimeInfo.Length = info->runtime_len;
         params->RuntimeInfo.Buffer = dst;
+        {   /* ml663 */
+            extern void ios_dump_runtime_info( const char *when, const void *buf, unsigned int len );
+            ios_dump_runtime_info( "child-after-rebuild", dst, info->runtime_len );
+        }
         memcpy( dst, src, info->runtime_len );
         src += (info->runtime_len + 1) / sizeof(WCHAR);
         dst += (info->runtime_len + 1) / sizeof(WCHAR);
@@ -2394,6 +2405,11 @@ void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
     info->title_len = append_string( &ptr, params, &params->WindowTitle );
     info->desktop_len = append_string( &ptr, params, &params->Desktop );
     info->shellinfo_len = append_string( &ptr, params, &params->ShellInfo );
+    {   /* ml663: log the blob the PARENT is about to serialise, before it moves. */
+        extern void ios_dump_runtime_info( const char *when, const void *buf, unsigned int len );
+        ios_dump_runtime_info( "parent-pre-serialise", params->RuntimeInfo.Buffer,
+                               params->RuntimeInfo.Length );
+    }
     info->runtime_len = append_string( &ptr, params, &params->RuntimeInfo );
     return info;
 }

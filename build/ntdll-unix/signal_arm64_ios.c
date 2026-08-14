@@ -39,6 +39,35 @@
 #ifdef WINE_IOS
 #include <dlfcn.h>
 #include <mach/mach.h>
+
+/* iOS-Mythic ml674: XZR/WZR AS A STORE SOURCE MUST READ ZERO.
+ *
+ * arm_thread_state64_t is  __uint64_t __x[29]  followed by __fp, __lr, __sp --
+ * so state.__x[31] is not out of bounds by accident, it lands EXACTLY on __sp.
+ *
+ * That makes register 31 behave correctly in one role and catastrophically in
+ * the other:
+ *   - as a BASE register (Rn), 31 means SP, and __x[31] IS __sp  -> correct
+ *   - as a SOURCE register (Rt/Rt2/Rs), 31 means ZR              -> must be 0,
+ *     but reads the stack pointer instead
+ *
+ * Because the base-register half works, the decoder reads as correct and this
+ * survived a long time. What it actually did: every fault-emulated `str xzr` /
+ * `stur xzr` / `stp xzr,xzr` into an alias-backed page wrote a STACK ADDRESS
+ * where the guest asked for zero.
+ *
+ * Book of the Dead showed it precisely. RtlInitializeCriticalSectionEx emits
+ *     stur xzr, [x19,#0x0c]      ; RecursionCount + half of OwningThread
+ *     stur xzr, [x19,#0x14]      ; rest of OwningThread + half of LockSemaphore
+ *     str  wzr, [x19,#0x1c]      ; rest of LockSemaphore
+ * so a section on a Mono anon-RWX page was born holding SP fragments:
+ *     RecursionCount = 0x23bbf660, LockSemaphore = 0x23bbf660_00000070
+ * and the first NtReleaseSemaphore on it returned STATUS_INVALID_HANDLE.
+ *
+ * Scope is much wider than one crash: any zero-store into an alias-backed page
+ * was corrupting memory this way. */
+#define IOS_STORE_SRC(r) ((r) == 31 ? 0ULL : state.__x[r])
+
 #include <mach/mach_vm.h>
 #include <mach/thread_act.h>
 #include <pthread/pthread.h>
@@ -2499,28 +2528,28 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xffc00000) == 0xf9000000)
                     {
                         int rt = insn & 0x1f;
-                        *(uint64_t *)rw_addr = state.__x[rt];
+                        *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
                         emulated = 1;
                     }
                     /* STR (immediate, unsigned offset, 32-bit): 1011 1001 00 imm12 Rn Rt */
                     else if ((insn & 0xffc00000) == 0xb9000000)
                     {
                         int rt = insn & 0x1f;
-                        *(uint32_t *)rw_addr = (uint32_t)state.__x[rt];
+                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
                         emulated = 1;
                     }
                     /* STRB (immediate, unsigned offset, 8-bit): 0011 1001 00 imm12 Rn Rt */
                     else if ((insn & 0xffc00000) == 0x39000000)
                     {
                         int rt = insn & 0x1f;
-                        *(uint8_t *)rw_addr = (uint8_t)state.__x[rt];
+                        *(uint8_t *)rw_addr = (uint8_t)IOS_STORE_SRC(rt);
                         emulated = 1;
                     }
                     /* STRH (immediate, unsigned offset, 16-bit): 0111 1001 00 imm12 Rn Rt */
                     else if ((insn & 0xffc00000) == 0x79000000)
                     {
                         int rt = insn & 0x1f;
-                        *(uint16_t *)rw_addr = (uint16_t)state.__x[rt];
+                        *(uint16_t *)rw_addr = (uint16_t)IOS_STORE_SRC(rt);
                         emulated = 1;
                     }
                     /* STP (signed offset, 64-bit): 10101001 00 imm7 Rt2 Rn Rt */
@@ -2528,8 +2557,8 @@ static void *ios_mach_exception_thread( void *arg )
                     {
                         int rt = insn & 0x1f;
                         int rt2 = (insn >> 10) & 0x1f;
-                        *(uint64_t *)rw_addr = state.__x[rt];
-                        *(uint64_t *)(rw_addr + 8) = state.__x[rt2];
+                        *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
+                        *(uint64_t *)(rw_addr + 8) = IOS_STORE_SRC(rt2);
                         emulated = 1;
                     }
                     /* STP (signed offset, 32-bit): 00101001 00 imm7 Rt2 Rn Rt */
@@ -2537,15 +2566,15 @@ static void *ios_mach_exception_thread( void *arg )
                     {
                         int rt = insn & 0x1f;
                         int rt2 = (insn >> 10) & 0x1f;
-                        *(uint32_t *)rw_addr = (uint32_t)state.__x[rt];
-                        *(uint32_t *)(rw_addr + 4) = (uint32_t)state.__x[rt2];
+                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
+                        *(uint32_t *)(rw_addr + 4) = (uint32_t)IOS_STORE_SRC(rt2);
                         emulated = 1;
                     }
                     /* STR (register, 64-bit): 1111 1000 001 Rm option S 10 Rn Rt */
                     else if ((insn & 0xffe00c00) == 0xf8200800)
                     {
                         int rt = insn & 0x1f;
-                        *(uint64_t *)rw_addr = state.__x[rt];
+                        *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
                         emulated = 1;
                     }
                     /* STLR (Store-Release Register, 64-bit):
@@ -2557,7 +2586,7 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xfffffc00) == 0xc89ffc00)
                     {
                         int rt = insn & 0x1f;
-                        __atomic_store_n((uint64_t *)rw_addr, state.__x[rt], __ATOMIC_RELEASE);
+                        __atomic_store_n((uint64_t *)rw_addr, IOS_STORE_SRC(rt), __ATOMIC_RELEASE);
                         emulated = 1;
                     }
                     /* STLR (Store-Release Register, 32-bit):
@@ -2566,7 +2595,7 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xfffffc00) == 0x889ffc00)
                     {
                         int rt = insn & 0x1f;
-                        __atomic_store_n((uint32_t *)rw_addr, (uint32_t)state.__x[rt], __ATOMIC_RELEASE);
+                        __atomic_store_n((uint32_t *)rw_addr, (uint32_t)IOS_STORE_SRC(rt), __ATOMIC_RELEASE);
                         emulated = 1;
                     }
                     /* STLRH (Store-Release 16-bit):
@@ -2574,7 +2603,7 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xfffffc00) == 0x489ffc00)
                     {
                         int rt = insn & 0x1f;
-                        __atomic_store_n((uint16_t *)rw_addr, (uint16_t)state.__x[rt], __ATOMIC_RELEASE);
+                        __atomic_store_n((uint16_t *)rw_addr, (uint16_t)IOS_STORE_SRC(rt), __ATOMIC_RELEASE);
                         emulated = 1;
                     }
                     /* STLRB (Store-Release 8-bit):
@@ -2582,21 +2611,21 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xfffffc00) == 0x089ffc00)
                     {
                         int rt = insn & 0x1f;
-                        __atomic_store_n((uint8_t *)rw_addr, (uint8_t)state.__x[rt], __ATOMIC_RELEASE);
+                        __atomic_store_n((uint8_t *)rw_addr, (uint8_t)IOS_STORE_SRC(rt), __ATOMIC_RELEASE);
                         emulated = 1;
                     }
                     /* STR (register, 32-bit): 1011 1000 001 Rm option S 10 Rn Rt */
                     else if ((insn & 0xffe00c00) == 0xb8200800)
                     {
                         int rt = insn & 0x1f;
-                        *(uint32_t *)rw_addr = (uint32_t)state.__x[rt];
+                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
                         emulated = 1;
                     }
                     /* STR (immediate, post/pre-index, 64-bit): 1111 1000 00 0imm9 0[10]1 Rn Rt */
                     else if ((insn & 0xffe00000) == 0xf8000000 && (insn & 0x800) == 0)
                     {
                         int rt = insn & 0x1f;
-                        *(uint64_t *)rw_addr = state.__x[rt];
+                        *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
                         emulated = 1;
                         /* Post-index (bits 11:10 = 01) / pre-index (bits 11:10 = 11):
                          * MUST update Rn += signed imm9. Without this, memcpy-style
@@ -2614,7 +2643,7 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xffe00000) == 0xb8000000 && (insn & 0x800) == 0)
                     {
                         int rt = insn & 0x1f;
-                        *(uint32_t *)rw_addr = (uint32_t)state.__x[rt];
+                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
                         emulated = 1;
                         int idx_mode = (insn >> 10) & 3;
                         if (idx_mode == 1 || idx_mode == 3)
@@ -2632,7 +2661,7 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xffe00000) == 0x38000000 && (insn & 0x800) == 0)
                     {
                         int rt = insn & 0x1f;
-                        *(uint8_t *)rw_addr = (uint8_t)state.__x[rt];
+                        *(uint8_t *)rw_addr = (uint8_t)IOS_STORE_SRC(rt);
                         emulated = 1;
                         int idx_mode = (insn >> 10) & 3;
                         if (idx_mode == 1 || idx_mode == 3)
@@ -2647,7 +2676,7 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xffe00000) == 0x78000000 && (insn & 0x800) == 0)
                     {
                         int rt = insn & 0x1f;
-                        *(uint16_t *)rw_addr = (uint16_t)state.__x[rt];
+                        *(uint16_t *)rw_addr = (uint16_t)IOS_STORE_SRC(rt);
                         emulated = 1;
                         int idx_mode = (insn >> 10) & 3;
                         if (idx_mode == 1 || idx_mode == 3)
@@ -2744,7 +2773,7 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xffc00000) == 0xf9000000)
                     {
                         int rt = insn & 0x1f;
-                        *(uint64_t *)rw_addr = state.__x[rt];
+                        *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
                         emulated = 1;
                     }
                     /* GPR STR (immediate, unsigned offset, 32-bit W-reg):
@@ -2753,7 +2782,7 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xffc00000) == 0xb9000000)
                     {
                         int rt = insn & 0x1f;
-                        *(uint32_t *)rw_addr = (uint32_t)state.__x[rt];
+                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
                         emulated = 1;
                     }
                     /* SIMD/FP STR (immediate, unsigned offset, D-reg): 11 111 1 01 00 imm12 Rn Rt */
@@ -2795,16 +2824,18 @@ static void *ios_mach_exception_thread( void *arg )
                     else if ((insn & 0xffe00c00) == 0x38200800)
                     {
                         int rt = insn & 0x1f;
-                        *(uint8_t *)rw_addr = (uint8_t)state.__x[rt];
+                        *(uint8_t *)rw_addr = (uint8_t)IOS_STORE_SRC(rt);
                         emulated = 1;
                     }
                     /* ml350: STRH (register offset): 0111 1000 001 ... (val 0x78200800) */
                     else if ((insn & 0xffe00c00) == 0x78200800)
                     {
                         int rt = insn & 0x1f;
-                        *(uint16_t *)rw_addr = (uint16_t)state.__x[rt];
+                        *(uint16_t *)rw_addr = (uint16_t)IOS_STORE_SRC(rt);
                         emulated = 1;
                     }
+                    
+
                     /* iOS-Mythic ml626: SWP{A}{L}{B,H} — ATOMIC SWAP.
                      *
                      * Encoding (atomic memory operation, o3=1 opc=000):
@@ -7506,7 +7537,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                                 (void *)(uintptr_t)base, ok_base,
                                 (ok_sp && ok_base && base && sp >= base && sp < base + 0x1000000));
                             if (ok_ent)
-                                ERR("[callret] top: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                                ERR("[callret] top (PREDICTION HISTORY — stale/completed frames expected, NOT an unwind): %llx %llx %llx %llx %llx %llx %llx %llx\n",
                                     (unsigned long long)ent[0], (unsigned long long)ent[1],
                                     (unsigned long long)ent[2], (unsigned long long)ent[3],
                                     (unsigned long long)ent[4], (unsigned long long)ent[5],

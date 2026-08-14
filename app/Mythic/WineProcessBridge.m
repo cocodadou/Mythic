@@ -99,25 +99,180 @@ static int mythic_prune_keep_tree(const char *dir, int depth)
     return survivors;
 }
 
+/* ---- ml666: PROFILE REPAIR — the "usersmythic" escaping bug -------------
+ *
+ * The shipped .reg files wrote  "C:\\users\mythic\\AppData\\Roaming"  with a
+ * SINGLE backslash before `mythic`. In .reg syntax `\\` is a literal backslash
+ * and a lone `\` starts an escape; `\m` is not a valid escape, so the backslash
+ * was dropped and every shell folder resolved to  C:\usersmythic\...  -- a
+ * directory that never existed. 57 sites across user.reg/userdef.reg plus 3
+ * already-collapsed in system.reg.
+ *
+ * It degraded silently for months: %TEMP% pointed there too, so Wine happily
+ * CREATED C:\usersmythic\AppData\Local\Temp and filled it (683 files and a CEF
+ * cache on the dev device). Only paths whose parents are NOT auto-created broke
+ * -- notably LocalLow, where Unity's log CreateDirectory failed, which left
+ * stdout closed at _file=-1 and fast-failed the CRT inside _isatty.
+ *
+ * The template is fixed, but an existing prefix keeps the collapsed strings in
+ * its own user.reg (Wine rewrote them after parsing). So repair on disk, before
+ * __wine_main, once:
+ *   1. rewrite  C:\\usersmythic  ->  C:\\users\\mythic  in the three .reg files
+ *   2. MOVE (never delete) drive_c/usersmythic/* into drive_c/users/mythic/*
+ *   3. ensure the AppData skeleton exists
+ * Idempotent and marker-gated. Step 2 merges and refuses to clobber: if a
+ * destination already exists the source is left in place for manual review,
+ * because that tree holds real user data. */
+
+static int ios_reg_unmangle(const char *path)
+{
+    FILE *f = fopen( path, "rb" );
+    if (!f) return 0;
+    fseek( f, 0, SEEK_END ); long n = ftell( f ); fseek( f, 0, SEEK_SET );
+    if (n <= 0 || n > (64 << 20)) { fclose( f ); return 0; }
+    char *buf = malloc( (size_t)n + 1 );
+    if (!buf) { fclose( f ); return 0; }
+    size_t got = fread( buf, 1, (size_t)n, f );
+    fclose( f );
+    if (got != (size_t)n) { free( buf ); return 0; }
+    buf[n] = 0;
+
+    /* ml667: anchored on "C:" originally, which MISSED the one value that has
+     * no drive letter -- HOMEPATH = "\\usersmythic". HOMEDRIVE+HOMEPATH is a
+     * standard way to reach the profile, so that single miss left the default
+     * path broken while everything else looked repaired. Match the collapsed
+     * token itself; it reconstructs correctly with or without a drive prefix. */
+    static const char BAD[]  = "usersmythic";
+    static const char GOOD[] = "users\\\\mythic";
+    const size_t bl = sizeof(BAD) - 1, gl = sizeof(GOOD) - 1;
+    size_t hits = 0;
+    for (char *q = buf; (q = strstr( q, BAD )); q += bl) hits++;
+    if (!hits) { free( buf ); return 0; }
+
+    char *out = malloc( (size_t)n + hits * (gl - bl) + 1 ), *w;
+    if (!out) { free( buf ); return 0; }
+    w = out;
+    for (const char *r = buf; *r; )
+    {
+        if (!strncmp( r, BAD, bl )) { memcpy( w, GOOD, gl ); w += gl; r += bl; }
+        else *w++ = *r++;
+    }
+    *w = 0;
+
+    /* write via temp + rename so a kill mid-write cannot truncate the registry */
+    char tmp[PATH_MAX];
+    snprintf( tmp, sizeof(tmp), "%s.ml666", path );
+    FILE *o = fopen( tmp, "wb" );
+    int ok = 0;
+    if (o)
+    {
+        ok = fwrite( out, 1, (size_t)(w - out), o ) == (size_t)(w - out);
+        if (fclose( o ) != 0) ok = 0;
+        if (ok && rename( tmp, path ) != 0) ok = 0;
+        if (!ok) unlink( tmp );
+    }
+    LOG( "profile-repair: %{public}s %zu path(s) %{public}s", path, hits, ok ? "rewritten" : "FAILED" );
+    free( buf ); free( out );
+    return ok ? (int)hits : 0;
+}
+
+/* Move src into dst, merging. Existing destinations are never overwritten. */
+static void ios_merge_move(const char *src, const char *dst, int depth)
+{
+    DIR *d;
+    struct dirent *ent;
+    if (depth <= 0) return;
+    if (rename( src, dst ) == 0) { LOG( "profile-repair: moved %{public}s", src ); return; }
+    if (errno != ENOTEMPTY && errno != EEXIST && errno != ENOTDIR) return;
+    if (!(d = opendir( src ))) return;
+    while ((ent = readdir( d )))
+    {
+        char sp[PATH_MAX], dp[PATH_MAX];
+        struct stat st;
+        if (!strcmp( ent->d_name, "." ) || !strcmp( ent->d_name, ".." )) continue;
+        if (snprintf( sp, sizeof(sp), "%s/%s", src, ent->d_name ) >= (int)sizeof(sp)) continue;
+        if (snprintf( dp, sizeof(dp), "%s/%s", dst, ent->d_name ) >= (int)sizeof(dp)) continue;
+        if (lstat( dp, &st ) != 0) { if (rename( sp, dp ) == 0) continue; }
+        if (lstat( sp, &st ) == 0 && S_ISDIR( st.st_mode ))
+        {
+            mkdir( dp, 0755 );
+            ios_merge_move( sp, dp, depth - 1 );
+        }
+        /* a colliding FILE is left alone -- never clobber real user data */
+    }
+    closedir( d );
+    rmdir( src );                       /* only succeeds once genuinely empty */
+}
+
+static void mythic_repair_profile(NSString *prefix)
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *marker = [prefix stringByAppendingPathComponent:@".mythic-profile-repaired-ml667"];
+    if ([fm fileExistsAtPath:marker]) return;
+
+    int fixed = 0;
+    for (NSString *reg in @[ @"user.reg", @"userdef.reg", @"system.reg" ])
+        fixed += ios_reg_unmangle( [prefix stringByAppendingPathComponent:reg].fileSystemRepresentation );
+
+    NSString *bad  = [prefix stringByAppendingPathComponent:@"drive_c/usersmythic"];
+    NSString *good = [prefix stringByAppendingPathComponent:@"drive_c/users/mythic"];
+    if ([fm fileExistsAtPath:bad])
+    {
+        [fm createDirectoryAtPath:good withIntermediateDirectories:YES attributes:nil error:nil];
+        ios_merge_move( bad.fileSystemRepresentation, good.fileSystemRepresentation, 12 );
+    }
+
+    /* The skeleton Wine's existence checks gate on. Creating it is safe here --
+     * unlike the ml581 mistake, these are the REGISTERED profile paths. */
+    for (NSString *leaf in @[ @"AppData/Roaming", @"AppData/Local", @"AppData/LocalLow",
+                              @"AppData/Roaming/Microsoft/Windows/Start Menu/Programs" ])
+        [fm createDirectoryAtPath:[good stringByAppendingPathComponent:leaf]
+      withIntermediateDirectories:YES attributes:nil error:nil];
+
+    /* ml667: only claim completion once the collapsed tree is actually gone.
+     * ios_merge_move refuses to clobber, so a colliding file leaves the source
+     * alive -- marking done there would strand that data forever. */
+    if (![fm fileExistsAtPath:bad])
+        [@"ml667" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    else
+        LOG( "profile-repair: %{public}s still present -- will retry next launch", bad.UTF8String );
+    LOG( "profile-repair: complete (%d registry path(s) rewritten)", fixed );
+}
+
 static void mythic_undo_appdata_skeleton(NSString *prefix)
 {
-    NSString *users = [prefix stringByAppendingPathComponent:@"drive_c/users"];
-    NSArray *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:users error:nil];
-    for (NSString *user in names)
+    /* ml666: SCOPED DOWN. As written this walked EVERY user and removed ANY
+     * empty tree, which made it far more destructive than its own comment
+     * claimed. Two consequences, both observed:
+     *
+     *   - It deleted the legitimate, registered users/mythic AppData skeleton
+     *     that prefix-template.tar.gz ships -- the very directories Wine's
+     *     population and Unity's log path depend on.
+     *   - Given a freshly created empty Roaming/LocalLow it removed those too,
+     *     and nothing recreates them, so the profile stayed permanently absent.
+     *
+     * It also never actually worked on the artifacts it was written for: the
+     * ml581 devicectl push left those directories owned by uid 0, so unlink()
+     * inside them always failed. It has been a silent no-op since it shipped.
+     *
+     * Now: users/mobile ONLY (the sole path the ml581 experiment touched), the
+     * three leaf roots are never themselves removed, and the whole thing is
+     * marker-gated so it runs once instead of on every launch. */
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *marker = [prefix stringByAppendingPathComponent:@".mythic-keepprune-done-ml666"];
+    if ([fm fileExistsAtPath:marker]) return;
+
+    NSString *appdata = [prefix stringByAppendingPathComponent:@"drive_c/users/mobile/AppData"];
+    for (NSString *leaf in @[ @"Roaming", @"LocalLow", @"Local" ])
     {
-        NSString *appdata = [NSString stringWithFormat:@"%@/%@/AppData", users, user];
         /* depth 6 covers Roaming/<Vendor>/<Product>/<...> comfortably; the
-         * recursion is bounded so a symlink loop can't run away. */
-        for (NSString *leaf in @[ @"Roaming", @"LocalLow", @"Local" ])
-        {
-            NSString *path = [appdata stringByAppendingPathComponent:leaf];
-            if (mythic_prune_keep_tree( path.fileSystemRepresentation, 6 ) == 0)
-            {
-                if (rmdir( path.fileSystemRepresentation ) == 0)
-                    LOG( "keep-prune: rmdir %{public}s", path.UTF8String );
-            }
-        }
+         * recursion is bounded so a symlink loop can't run away. Only the
+         * .keep placeholders and the empty dirs they propped up are removed --
+         * the leaf root itself always stays. */
+        NSString *path = [appdata stringByAppendingPathComponent:leaf];
+        mythic_prune_keep_tree( path.fileSystemRepresentation, 6 );
     }
+    [@"ml666" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
 
@@ -180,6 +335,9 @@ void mythic_seed_prefix_if_needed(const char *prefix_path) {
         [fm removeItemAtPath:cLink error:nil];
         [fm createSymbolicLinkAtPath:cLink withDestinationPath:@"../drive_c" error:nil];
 
+        /* ml666: repair the usersmythic escaping damage BEFORE anything reads
+         * the registry, then the (now scoped) ml581 legacy cleanup. */
+        mythic_repair_profile( prefix );
         /* ml581: see mythic_undo_appdata_skeleton() above. */
         mythic_undo_appdata_skeleton( prefix );
     }

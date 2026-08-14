@@ -1529,6 +1529,505 @@ done:
 }
 
 
+#ifdef WINE_IOS
+/******************************************************************************
+ * iOS-Mythic ml661: REAL BOUNDED x64 UNWIND (.pdata / UNWIND_INFO)
+ *
+ * WHY THIS REPLACES THE TWO THINGS WE HAD.
+ *
+ * 1. ml660's stack scan is a CALL-validated *heuristic*. It walks raw qwords and
+ *    keeps the ones with a CALL in front. That turns address soup into something
+ *    readable, but it cannot separate a live frame from a dead one, so it can
+ *    never name "the caller".
+ *
+ * 2. FEX's callret buffer is NOT an unwind stack. It is a return-address
+ *    PREDICTOR, and its "used=N entries" is occupancy/history, not N live
+ *    frames. Proof from the Book of the Dead ml660 run: its top entry was
+ *    UnityPlayer+0x1162463 — the return address of the `call
+ *    IsProcessorFeaturePresent` that had ALREADY COMPLETED two instructions
+ *    before the fatal `int 0x29`. Guest calls and returns are not guaranteed to
+ *    balance there. Anything read out of it is a lead, never a frame.
+ *
+ * So: walk the real x64 unwind metadata instead. Diagnostic only — this never
+ * changes control flow, it only prints.
+ *
+ * BOUNDS (every one of these exists because an unwinder that runs away inside a
+ * dying process turns a diagnosable crash into a hang or a second fault):
+ *   - at most IOS_UNW_MAX frames
+ *   - RSP must strictly INCREASE every frame (x64 stacks grow down)
+ *   - RSP must stay inside the window we started in
+ *   - every read goes through mach_vm_read_overwrite, so unmapped metadata ends
+ *     the walk instead of faulting us
+ *   - a repeated PC or a repeated RSP ends the walk
+ *
+ * ⚠️ The stack window is derived from the entry RSP plus a fixed span, not from
+ * the guest TEB — a pseudo-process does not give us a trustworthy stack base
+ * here. It bounds the walk; it is not a claim about the real stack extent.
+ */
+#define IOS_UNW_MAX 32
+#define IOS_UNW_STACK_SPAN (8ULL * 1024 * 1024)
+
+static int ios_unw_read( uint64_t addr, void *buf, unsigned int len )
+{
+    mach_vm_size_t got = 0;
+    if (!addr || addr < 0x10000ULL || addr >= 0x800000000000ULL) return 0;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)addr,
+                                len, (mach_vm_address_t)buf, &got ) != KERN_SUCCESS)
+        return 0;
+    return got == len;
+}
+
+static int ios_unw_rd32( uint64_t a, unsigned int *v ) { return ios_unw_read( a, v, 4 ); }
+static int ios_unw_rd64( uint64_t a, uint64_t *v )     { return ios_unw_read( a, v, 8 ); }
+
+/* Locate the RUNTIME_FUNCTION covering `rva` in module `base`. Returns 1 and
+ * fills *rf (3 dwords) on success; 0 means "no entry" == leaf function. */
+static int ios_unw_find_rf( uint64_t base, unsigned int rva, unsigned int rf[3] )
+{
+    unsigned int e_lfanew = 0, pdata_rva = 0, pdata_size = 0;
+    unsigned short magic = 0;
+    int lo, hi;
+
+    if (!ios_unw_rd32( base + 0x3c, &e_lfanew ) || e_lfanew < 0x40 || e_lfanew > 0x1000) return 0;
+    if (!ios_unw_read( base + e_lfanew + 0x18, &magic, 2 ) || magic != 0x20b) return 0; /* PE32+ only */
+    /* data directory 3 = IMAGE_DIRECTORY_ENTRY_EXCEPTION; dir[0] sits at +0x88 */
+    if (!ios_unw_rd32( base + e_lfanew + 0x88 + 3 * 8,     &pdata_rva  )) return 0;
+    if (!ios_unw_rd32( base + e_lfanew + 0x88 + 3 * 8 + 4, &pdata_size )) return 0;
+    if (!pdata_rva || pdata_size < 12) return 0;
+
+    lo = 0; hi = (int)(pdata_size / 12) - 1;
+    while (lo <= hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        unsigned int e[3];
+        if (!ios_unw_read( base + pdata_rva + (unsigned int)mid * 12, e, 12 )) return 0;
+        if (rva < e[0])      hi = mid - 1;
+        else if (rva >= e[1]) lo = mid + 1;
+        else { rf[0] = e[0]; rf[1] = e[1]; rf[2] = e[2]; return 1; }
+    }
+    return 0;
+}
+
+/* Undo one frame. On entry *rsp/regs describe the frame at `pc`; on success they
+ * describe the caller and *ret_pc is its PC. Returns 0 if the frame cannot be
+ * decoded (caller should stop). */
+static int ios_unw_step( uint64_t base, uint64_t pc, uint64_t *rsp, uint64_t regs[16], uint64_t *ret_pc,
+                         uint64_t *fn_start, uint64_t *fn_end )
+{
+    unsigned int rf[3];
+    unsigned int rva = (unsigned int)(pc - base);
+    unsigned int off_in_func;
+    uint64_t frame_base;
+    int chain_guard = 0;
+
+    if (fn_start) *fn_start = 0;
+    if (fn_end)   *fn_end   = 0;
+    if (!ios_unw_find_rf( base, rva, rf ))
+    {
+        /* Leaf: nothing pushed, return address sits at [rsp]. */
+        if (!ios_unw_rd64( *rsp, ret_pc )) return 0;
+        *rsp += 8;
+        return 1;
+    }
+
+    off_in_func = rva - rf[0];
+    if (fn_start) *fn_start = base + rf[0];
+    if (fn_end)   *fn_end   = base + rf[1];
+again:
+    {
+        unsigned char ui[4];
+        unsigned char codes[2 * 256];
+        unsigned short u16 = 0;
+        unsigned int u32 = 0;
+        int n, i;
+
+        if (!ios_unw_read( base + rf[2], ui, 4 )) return 0;
+        if ((ui[0] & 0x7) != 1) return 0;                 /* version must be 1 */
+        n = ui[2];                                         /* CountOfCodes */
+        if (n > 256) return 0;
+        if (n && !ios_unw_read( base + rf[2] + 4, codes, (unsigned int)n * 2 )) return 0;
+
+        /* Frame base: with a frame register the prologue has already established
+         * it, so it is authoritative; without one, RSP past the prologue IS it. */
+        if (ui[3] & 0xf) frame_base = regs[ui[3] & 0xf] - (uint64_t)((ui[3] >> 4) & 0xf) * 16;
+        else             frame_base = *rsp;
+
+        for (i = 0; i < n; )
+        {
+            unsigned char coff = codes[i * 2];
+            unsigned char op   = codes[i * 2 + 1] & 0xf;
+            unsigned char info = (codes[i * 2 + 1] >> 4) & 0xf;
+            int adv = 1;
+
+            /* Codes are sorted by descending prologue offset. Anything the CPU
+             * has not executed yet must not be undone. */
+            if (op == 1) adv = (info == 0) ? 2 : 3;
+            else if (op == 4 || op == 8) adv = 2;
+            else if (op == 5 || op == 9) adv = 3;
+
+            /* An operand slot we never read is a truncated/garbage UNWIND_INFO.
+             * Stop rather than read past the codes we actually fetched. */
+            if (i + adv > n) return 0;
+
+            /* Codes are sorted by descending prologue offset. Anything the CPU
+             * has not executed yet must not be undone. */
+            if (coff > off_in_func) { i += adv; continue; }
+
+            memcpy( &u16, &codes[(i + 1) * 2], 2 );
+            if (adv >= 3) memcpy( &u32, &codes[(i + 1) * 2], 4 );
+
+            switch (op)
+            {
+            case 0: /* UWOP_PUSH_NONVOL */
+                if (!ios_unw_rd64( *rsp, &regs[info] )) return 0;
+                *rsp += 8;
+                break;
+            case 1: /* UWOP_ALLOC_LARGE */
+                if (info == 0) *rsp += (uint64_t)u16 * 8;
+                else           *rsp += (uint64_t)u32;
+                break;
+            case 2: /* UWOP_ALLOC_SMALL */
+                *rsp += (uint64_t)info * 8 + 8;
+                break;
+            case 3: /* UWOP_SET_FPREG */
+                *rsp = frame_base;
+                break;
+            case 4: /* UWOP_SAVE_NONVOL */
+                ios_unw_rd64( frame_base + (uint64_t)u16 * 8, &regs[info] );
+                break;
+            case 5: /* UWOP_SAVE_NONVOL_FAR */
+                ios_unw_rd64( frame_base + (uint64_t)u32, &regs[info] );
+                break;
+            case 8: case 9: break;                         /* XMM saves: no RSP effect */
+            case 10:                                       /* UWOP_PUSH_MACHFRAME  */
+                if (info) *rsp += 8;
+                if (!ios_unw_rd64( *rsp, ret_pc )) return 0;
+                if (!ios_unw_rd64( *rsp + 24, rsp )) return 0;
+                return 1;
+            default: break;                                /* 6/7 carry no RSP effect here */
+            }
+            i += adv;
+        }
+
+        /* UNW_FLAG_CHAININFO: the real unwind data continues in a parent entry. */
+        if ((ui[0] >> 3) & 0x4)
+        {
+            unsigned int pad = (unsigned int)((n + 1) & ~1);
+            unsigned int par[3];
+            if (++chain_guard > 8) return 0;
+            if (!ios_unw_read( base + rf[2] + 4 + pad * 2, par, 12 )) return 0;
+            rf[0] = par[0]; rf[1] = par[1]; rf[2] = par[2];
+            if (rva < rf[0] || rva >= rf[1]) off_in_func = 0xffffffffu; /* apply all parent codes */
+            goto again;
+        }
+    }
+
+    if (!ios_unw_rd64( *rsp, ret_pc )) return 0;
+    *rsp += 8;
+    return 1;
+}
+
+/* iOS-Mythic ml663: [runtime-info] — the MSVCRT inherited-fd blob.
+ *
+ * Layout (x64):  DWORD count; BYTE flags[count]; HANDLE handles[count];
+ * UCRT's lowio init consumes this BEFORE it consults GetStdHandle. If it finds
+ * entries here it stores their handles into __pioinfo[fd].osfhnd, and the
+ * std-handle loop then takes its "already inherited" branch, which ORs FTEXT
+ * and NEVER sets FOPEN. A stream whose fd lacks FOPEN is invalidated to
+ * _file = -1 at stdio init -- which is exactly the state Book of the Dead dies
+ * on. So a malformed blob here reproduces the failure precisely.
+ *
+ * Logged at BOTH ends of the handoff so a good-parent/bad-child result
+ * separates "the producer is wrong" from "our serialisation is wrong". */
+void ios_dump_runtime_info( const char *when, const void *buf, unsigned int len )
+{
+    const unsigned char *b = buf;
+    unsigned int count = 0, need, hash = 2166136261u, i, n;
+
+    if (!b || !len)
+    {
+        dprintf( 2, "[runtime-info] ml663 %s EMPTY (len=%u) -> UCRT takes the GetStdHandle path\n",
+                 when, len );
+        return;
+    }
+    n = len > 4096 ? 4096 : len;
+    for (i = 0; i < n; i++) { hash ^= b[i]; hash *= 16777619u; }
+    if (len >= 4) memcpy( &count, b, 4 );
+    need = 4 + count + count * 8;
+    dprintf( 2, "[runtime-info] ml663 %s len=%u count=%u needs=%u %s hash=0x%08x\n",
+             when, len, count, need,
+             (need <= len) ? "OK" : "*** TOO SHORT FOR ITS OWN CLAIM ***", hash );
+    if (count > 1024 || need > len) return;
+    for (i = 0; i < 3 && i < count; i++)
+    {
+        unsigned char fl = b[4 + i];
+        uint64_t h = 0;
+        memcpy( &h, b + 4 + count + i * 8, 8 );
+        dprintf( 2, "[runtime-info] ml663 %s   fd%u flags=0x%02x FOPEN=%d handle=%llx\n",
+                 when, i, fl, !!(fl & 0x01), (unsigned long long)h );
+    }
+}
+
+/* iOS-Mythic ml662: [std-handles] — the thing we have NEVER logged.
+ *
+ * Book of the Dead dies inside UCRT `_isatty(fd)` on a descriptor that is
+ * neither valid nor -2. `_isatty` TOLERATES -2 (the documented "no handle"
+ * sentinel) and returns quietly; it only fast-fails on fd<0 (other than -2) or
+ * fd >= _nhandle. So the guest CRT is holding a stream fd we gave it no way to
+ * form correctly — and we have no visibility at all into what standard handles
+ * a pseudo-process actually receives. Every process gets this line now.
+ *
+ * Deliberately NOT a fix: converting a bad fd to -2 would satisfy the CRT
+ * invariant while leaving initialisation broken and hiding the real defect. */
+void ios_dump_std_handles_ex( const char *when, void *peb, HANDLE hin, HANDLE hout,
+                              HANDLE herr, HANDLE console )
+{
+    static const struct { DWORD access; const char *nm; } S[] = {
+        { FILE_READ_DATA,  "stdin " }, { FILE_WRITE_DATA, "stdout" },
+        { FILE_WRITE_DATA, "stderr" } };
+    int i;
+
+    dprintf( 2, "[std-handles] ml662 %s peb=%p console=%p\n", when, peb, (void *)console );
+    for (i = 0; i < 3; i++)
+    {
+        HANDLE h = (i == 0) ? hin : (i == 1) ? hout : herr;
+        int fd = -1;
+        NTSTATUS st = STATUS_INVALID_HANDLE;
+
+        if (h) st = wine_server_handle_to_fd( h, S[i].access, &fd, NULL );
+        dprintf( 2, "[std-handles] ml662 %s   %s handle=%p%s%s -> %s fd=%d\n",
+                 when, S[i].nm, (void *)h,
+                 h ? "" : " (NULL => CRT should store -2, which _isatty tolerates)",
+                 (h && ((UINT_PTR)h & 1)) ? " CONSOLE-marked" : "",
+                 st ? "FAILED" : "ok", fd );
+        if (!st && fd != -1) close( fd );
+    }
+}
+
+void ios_dump_std_handles( const char *when )
+{
+    PEB *peb = NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL;
+    RTL_USER_PROCESS_PARAMETERS *pp = peb ? peb->ProcessParameters : NULL;
+    if (!pp) { dprintf( 2, "[std-handles] ml662 %s peb=%p NO ProcessParameters\n", when, (void *)peb ); return; }
+    ios_dump_std_handles_ex( when, peb, pp->hStdInput, pp->hStdOutput, pp->hStdError, pp->ConsoleHandle );
+}
+
+/* ml662: dump a small window at a recovered pointer. Bounded + mach-read, so a
+ * garbage register costs a line of output, never a fault. */
+static void ios_unw_peek( const char *tag, const char *what, uint64_t addr )
+{
+    unsigned char b[32];
+    if (!ios_unw_read( addr, b, sizeof(b) )) return;
+    dprintf( 2, "[unwind] %s ml662   %s=%llx: "
+             "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
+             "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
+             tag, what, (unsigned long long)addr,
+             b[0],b[1],b[2],b[3],    b[4],b[5],b[6],b[7],
+             b[8],b[9],b[10],b[11],  b[12],b[13],b[14],b[15],
+             b[16],b[17],b[18],b[19],b[20],b[21],b[22],b[23],
+             b[24],b[25],b[26],b[27],b[28],b[29],b[30],b[31] );
+}
+
+/* ml662: resolve the RIP-relative GLOBALS a small function reads.
+ *
+ * Why this is general and not a per-app hack: `cmp/mov r32, [rip+disp32]` is a
+ * fixed 6-byte encoding (opcode, modrm with mod=00 rm=101, disp32), so the
+ * target resolves exactly with no length decoder. Any bounds/limit global a
+ * validating CRT routine compares against shows up this way. In the Book of the
+ * Dead chain this is what exposes UCRT's `_nhandle` — an ordinary fd=1 still
+ * fast-fails inside _isatty if `_nhandle` is wrongly 0, and nothing else we
+ * print can tell those two worlds apart. */
+static void ios_unw_globals( const char *tag, uint64_t fn_start, uint64_t fn_end, int *budget )
+{
+    unsigned char code[192];
+    unsigned int len = (unsigned int)(fn_end - fn_start);
+    unsigned int i;
+    int per_frame = 0;
+
+    if (fn_end <= fn_start) return;
+    if (len > sizeof(code)) len = sizeof(code);
+    if (len < 6 || !ios_unw_read( fn_start, code, len )) return;
+
+    for (i = 0; i + 7 <= len && per_frame < 4 && *budget > 0; i++)
+    {
+        unsigned char op = code[i], modrm = code[i + 1];
+        int disp, ilen;
+        uint64_t tgt;
+        unsigned int v = 0;
+        uint64_t pv = 0;
+
+        if (op == 0x48 && code[i + 1] == 0x8D)          /* ml663: REX.W LEA r64,[rip+d32] */
+        {
+            modrm = code[i + 2];
+            if ((modrm & 0xC7) != 0x05) continue;
+            memcpy( &disp, &code[i + 3], 4 );
+            ilen = 7;
+        }
+        else if (op == 0x39 || op == 0x3B || op == 0x8B || op == 0x89)
+        {
+            if ((modrm & 0xC7) != 0x05) continue;       /* mod=00 rm=101 => RIP-relative */
+            memcpy( &disp, &code[i + 2], 4 );
+            ilen = 6;
+        }
+        else continue;
+
+        tgt = fn_start + i + ilen + (int64_t)disp;
+        if (!ios_unw_read( tgt, &v, 4 )) continue;
+        dprintf( 2, "[unwind] %s ml662   global @+0x%02x -> %llx = 0x%08x (%d)\n",
+                 tag, i, (unsigned long long)tgt, v, (int)v );
+        per_frame++; (*budget)--;
+
+        /* ml663: follow ONE pointer level. A validating routine's bounds live in
+         * a scalar; its TABLE lives behind a pointer. UCRT's __pioinfo is the
+         * case that matters here — _isatty indexes it to read the FOPEN bit,
+         * and that bit is the difference between a usable stream and the -1 we
+         * are dying on. */
+        if (ios_unw_rd64( tgt, &pv ) && pv >= 0x10000ULL && pv < 0x800000000000ULL && !(pv & 7))
+        {
+            int e;
+            unsigned char blk[0xC0];
+            if (!ios_unw_read( pv, blk, sizeof(blk) )) continue;
+            /* ml664: print the RAW bytes too. Last run this block was printed
+             * ONLY through the lowio interpretation, so when the followed
+             * pointer was __piob[1] (-> the stdout FILE) the real contents were
+             * discarded and shown as nonsense lowio fields. Raw first, then the
+             * interpretation: 0xC0 bytes covers two 0x58-stride UCRT streams,
+             * i.e. _iob[1] AND _iob[2] in one dump. */
+            {
+                int rw;
+                for (rw = 0; rw < 0xC0; rw += 32)
+                    dprintf( 2, "[unwind] %s ml664     raw +0x%02x: "
+                             "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
+                             "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
+                             tag, rw,
+                             blk[rw+0],blk[rw+1],blk[rw+2],blk[rw+3],     blk[rw+4],blk[rw+5],blk[rw+6],blk[rw+7],
+                             blk[rw+8],blk[rw+9],blk[rw+10],blk[rw+11],   blk[rw+12],blk[rw+13],blk[rw+14],blk[rw+15],
+                             blk[rw+16],blk[rw+17],blk[rw+18],blk[rw+19], blk[rw+20],blk[rw+21],blk[rw+22],blk[rw+23],
+                             blk[rw+24],blk[rw+25],blk[rw+26],blk[rw+27], blk[rw+28],blk[rw+29],blk[rw+30],blk[rw+31] );
+                /* If this pointer is a UCRT __piob entry, these are streams. */
+                for (rw = 0; rw + 0x58 <= 0xC0; rw += 0x58)
+                {
+                    int fl, fi;
+                    memcpy( &fl, &blk[rw + 0x14], 4 );
+                    memcpy( &fi, &blk[rw + 0x18], 4 );
+                    dprintf( 2, "[unwind] %s ml664     if-stream @+0x%02x: _flags=0x%08x _file=%d%s\n",
+                             tag, rw, fl, fi,
+                             fi == -2 ? "  (-2 = UCRT 'no handle', _isatty TOLERATES)" :
+                             fi == -1 ? "  (-1 = CLOSED/invalid, _isatty FAST-FAILS)" : "" );
+                }
+            }
+            /* Interpreted with the UCRT lowio layout: 0x40 stride, osfhnd@+0x28,
+             * osfile@+0x38. That layout is an MSVC ABI constant shared by every
+             * statically-linked-UCRT binary, not a fact about this game. If the
+             * pointer is not __pioinfo the numbers are meaningless -- hence the
+             * explicit "if lowio" label. */
+            for (e = 0; e < 3; e++)
+            {
+                uint64_t osfhnd;
+                unsigned char osfile;
+                memcpy( &osfhnd, &blk[e * 0x40 + 0x28], 8 );
+                osfile = blk[e * 0x40 + 0x38];
+                dprintf( 2, "[unwind] %s ml663     if-lowio fd%d: osfhnd=%llx osfile=0x%02x "
+                         "FOPEN=%d FDEV=%d FPIPE=%d FTEXT=%d\n", tag, e,
+                         (unsigned long long)osfhnd, osfile,
+                         !!(osfile & 0x01), !!(osfile & 0x40), !!(osfile & 0x08), !!(osfile & 0x80) );
+            }
+        }
+        i += ilen - 1;
+    }
+}
+
+/* Print the bounded unwind. `regs` is FEX's greg file (RAX,RCX,RDX,RBX,RSP,RBP,RSI,RDI,R8..R15). */
+static void ios_unwind_dump( uint64_t rip, const uint64_t *gregs, const char *tag )
+{
+    extern unsigned long long ios_jit_module_base_for_va( unsigned long long va, unsigned long long *size_out );
+    uint64_t regs[16], rsp, pc, lo, hi, prev_pc = 0, prev_rsp = 0;
+    int frame, glob_budget = 8, peek_budget = 10;
+    static const struct { int idx; const char *nm; } NV[] = {
+        { 3, "rbx" }, { 5, "rbp" }, { 6, "rsi" }, { 7, "rdi" },
+        { 12, "r12" }, { 13, "r13" }, { 14, "r14" }, { 15, "r15" } };
+
+    for (frame = 0; frame < 16; frame++) regs[frame] = gregs[frame];
+    rsp = regs[4];
+    pc  = rip;
+    lo  = rsp;
+    hi  = rsp + IOS_UNW_STACK_SPAN;
+
+    dprintf( 2, "[unwind] %s ml661 begin rip=%llx rsp=%llx window=[%llx..%llx) max=%d\n",
+             tag, (unsigned long long)pc, (unsigned long long)rsp,
+             (unsigned long long)lo, (unsigned long long)hi, IOS_UNW_MAX );
+
+    for (frame = 0; frame < IOS_UNW_MAX; frame++)
+    {
+        unsigned long long msz = 0;
+        unsigned long long mbase = ios_jit_module_base_for_va( pc, &msz );
+        const char *mname = "?";
+        uint64_t next_pc = 0, fn_start = 0, fn_end = 0;
+
+        if (mbase)
+        {
+            unsigned char hdr[2];
+            unsigned int e_lf = 0, exp_rva = 0, name_rva = 0;
+            static char nb[64];
+            if (ios_unw_read( mbase, hdr, 2 ) && hdr[0] == 'M' && hdr[1] == 'Z')
+            {
+                mname = "(exe)";
+                if (ios_unw_rd32( mbase + 0x3c, &e_lf ) && e_lf < 0x1000 &&
+                    ios_unw_rd32( mbase + e_lf + 0x88, &exp_rva ) && exp_rva && exp_rva < msz &&
+                    ios_unw_rd32( mbase + exp_rva + 0x0c, &name_rva ) && name_rva && name_rva < msz &&
+                    ios_unw_read( mbase + name_rva, nb, sizeof(nb) - 1 ))
+                { nb[sizeof(nb) - 1] = 0; mname = nb; }
+            }
+            dprintf( 2, "[unwind] %s ml661 #%02d pc=%llx rsp=%llx  %.40s+0x%llx\n",
+                     tag, frame, (unsigned long long)pc, (unsigned long long)rsp,
+                     mname, (unsigned long long)(pc - mbase) );
+        }
+        else
+        {
+            dprintf( 2, "[unwind] %s ml661 #%02d pc=%llx rsp=%llx  <no module — STOP>\n",
+                     tag, frame, (unsigned long long)pc, (unsigned long long)rsp );
+            break;
+        }
+
+        if (!ios_unw_step( mbase, pc, &rsp, regs, &next_pc, &fn_start, &fn_end ))
+        { dprintf( 2, "[unwind] %s ml661 stop: frame not decodable\n", tag ); break; }
+
+        /* ml662: the nonvolatiles the unwind just RECOVERED belong to this
+         * frame's caller-visible state — that is where a validating routine's
+         * subject object lives (in the Book of the Dead chain, the FILE* is in
+         * rbx). Volatile registers are gone by the time we fault, so these are
+         * the only object pointers we can ever name. */
+        {
+            int k, shown = 0;
+            dprintf( 2, "[unwind] %s ml662 #%02d nv: rbx=%llx rbp=%llx rsi=%llx rdi=%llx "
+                     "r12=%llx r13=%llx r14=%llx r15=%llx\n", tag, frame,
+                     regs[3], regs[5], regs[6], regs[7], regs[12], regs[13], regs[14], regs[15] );
+            for (k = 0; k < 8 && shown < 2 && peek_budget > 0; k++)
+            {
+                uint64_t v = regs[NV[k].idx];
+                if (v < 0x10000ULL || v >= 0x800000000000ULL || (v & 3)) continue;
+                ios_unw_peek( tag, NV[k].nm, v );
+                shown++; peek_budget--;
+            }
+            if (fn_start) ios_unw_globals( tag, fn_start, fn_end, &glob_budget );
+        }
+
+        if (rsp <= prev_rsp && frame)
+        { dprintf( 2, "[unwind] %s ml661 stop: rsp did not increase (%llx)\n", tag, (unsigned long long)rsp ); break; }
+        if (rsp < lo || rsp >= hi)
+        { dprintf( 2, "[unwind] %s ml661 stop: rsp %llx left the window\n", tag, (unsigned long long)rsp ); break; }
+        if (!next_pc || next_pc == prev_pc)
+        { dprintf( 2, "[unwind] %s ml661 stop: ret pc %llx repeats or is null\n", tag, (unsigned long long)next_pc ); break; }
+
+        prev_pc = pc; prev_rsp = rsp;
+        pc = next_pc;
+        regs[4] = rsp;
+    }
+    dprintf( 2, "[unwind] %s ml661 end\n", tag );
+}
+#endif /* WINE_IOS */
+
+
 /******************************************************************************
  *              NtTerminateProcess  (NTDLL.@)
  */
@@ -1584,6 +2083,14 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
                     dprintf(2, "[term-stack] g8-15: %llx %llx %llx %llx %llx %llx %llx %llx\n",
                             gregs[8], gregs[9], gregs[10], gregs[11],
                             gregs[12], gregs[13], gregs[14], gregs[15]);
+
+                    /* ml661: the REAL unwind runs first — it is the only thing
+                     * here that produces frames rather than candidates. The
+                     * ml660 CALL-validated scan below stays as corroboration
+                     * (and as the fallback when .pdata is missing or the guest
+                     * stack is too damaged to walk). */
+                    ios_dump_std_handles( "at-terminate" );
+                    ios_unwind_dump( rip, gregs, "term" );
                     /* rsp: prefer a greg inside the cpuarea's recorded range,
                      * but the live FEX stack can differ (seq-3656 run: rsp
                      * pair 0x1613ffxxx vs recorded [0x1514a0000..0x1514e0000])
@@ -1613,6 +2120,44 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
                                 unsigned long long msz = 0;
                                 unsigned long long mbase = ios_jit_module_base_for_va( v, &msz );
                                 if (!mbase) continue;
+
+                                /* ml660: IS THIS A RETURN ADDRESS, OR JUST A CODE-LIKE VALUE?
+                                 *
+                                 * The old scan printed every stack qword that landed inside a
+                                 * module, which mixes live return addresses with dead frames,
+                                 * spilled function pointers and vtable entries. Book of the
+                                 * Dead's fast-fail produced a dozen such lines and none of them
+                                 * could be trusted as the caller.
+                                 *
+                                 * A REAL return address always has a CALL immediately before it.
+                                 * Check the bytes at v-5 and v-2..v-7 for the two x64 forms:
+                                 *   E8 rel32                     (5 bytes, direct)
+                                 *   FF /2  with modrm.reg == 2   (2-7 bytes, indirect)
+                                 * That single test discards most of the noise. It is a VALIDATED
+                                 * HEURISTIC, not an unwind — a true .pdata/UNWIND_INFO walk is
+                                 * still owed — but it turns address soup into a chain worth
+                                 * reading. Unvalidated entries are still shown, marked, so a
+                                 * missed CALL form cannot hide the real caller. */
+                                const char *kind = "  ?";
+                                {
+                                    unsigned char cb[8];
+                                    mach_vm_size_t cg = 0;
+                                    if (v >= 8 &&
+                                        mach_vm_read_overwrite( mach_task_self(),
+                                            (mach_vm_address_t)(v - 8), sizeof(cb),
+                                            (mach_vm_address_t)cb, &cg ) == KERN_SUCCESS && cg == 8)
+                                    {
+                                        if (cb[3] == 0xE8) kind = "CALL";          /* v-5 */
+                                        else {
+                                            int k;
+                                            for (k = 1; k <= 6; k++) {
+                                                unsigned char op = cb[8 - k], modrm = cb[8 - k + 1];
+                                                if (op == 0xFF && ((modrm >> 3) & 7) == 2) { kind = "call*"; break; }
+                                            }
+                                        }
+                                    }
+                                }
+                                if (kind[0] == ' ' && hits >= 8) continue;   /* keep the log honest but bounded */
                                 /* name via export directory of the map view */
                                 {
                                     const unsigned char *mb = (const unsigned char *)(uintptr_t)mbase;
@@ -1627,8 +2172,8 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
                                         mname = (const char *)(mb + name_rva);
                                     else if (mb[0] == 'M' && mb[1] == 'Z')
                                         mname = "(exe)";
-                                    dprintf(2, "[term-stack] sp+%03x: %llx  %.32s+0x%llx\n",
-                                            wi * 8, (unsigned long long)v, mname,
+                                    dprintf(2, "[term-stack] ml660 sp+%03x: %s %llx  %.32s+0x%llx\n",
+                                            wi * 8, kind, (unsigned long long)v, mname,
                                             (unsigned long long)(v - mbase));
                                 }
                                 hits++;
@@ -1644,24 +2189,37 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
             }
         }
     }
-    /* iOS-Mythic 2026-05-13: stack-cookie failures (STATUS_STACK_BUFFER_OVERRUN
-     * = 0xc0000409) terminate the whole process via __fastfail. On Thumper
-     * we hit these consistently in Thumper's own __report_gsfailure stub
-     * during deep init — root cause is probably FEX miscompiling stack
-     * frames with cookies. Rather than kill the process, kill only the
-     * faulting thread and let the rest of the process continue. Brutal
-     * survival hack; remove once the underlying FEX issue is fixed. */
-    if ((unsigned int)exit_code == 0xc0000409u &&
-        handle == (HANDLE)~(ULONG_PTR)0)  /* current-process pseudo-handle */
-    {
-        static volatile uint64_t g_cookie_skip_count = 0;
-        uint64_t n = ++g_cookie_skip_count;
-        ERR("iOS: STATUS_STACK_BUFFER_OVERRUN — converting process terminate to "
-            "thread terminate (count=%llu). Calling thread dies, game continues.\n",
-            (unsigned long long)n);
-        NtTerminateThread( GetCurrentThread(), exit_code );
-        /* if we somehow return, fall through */
-    }
+    /* iOS-Mythic ml659: THE 0xc0000409 -> THREAD-TERMINATE HACK IS GONE.
+     *
+     * From 2026-05-13 until now this converted a whole-process fast-fail into a
+     * single thread death, so "the game continues". Its own comment called it a
+     * brutal survival hack to be removed once the underlying FEX issue was fixed.
+     * It was never removed, and it silently violates Windows fast-fail semantics
+     * for EVERY guest.
+     *
+     * What it actually costs: Book of the Dead executes a DELIBERATE
+     *     mov ecx, 5        ; FAST_FAIL_INVALID_ARG
+     *     int 0x29
+     * at UnityPlayer.dll+0x116246c. Wine correctly called NtTerminateProcess,
+     * this hack killed only tid 007c — Unity's MAIN thread — and left ~60 job
+     * workers blocked in ordinary waits forever. The app looked FROZEN while it
+     * was really a zombie process. Diagnosing that cost a run, and would have
+     * cost more: nothing in the log says "the process should have died here".
+     *
+     * ⚠️ 0xc0000409 is STATUS_STACK_BUFFER_OVERRUN by NAME ONLY. It is the
+     * generic __fastfail status; the real reason is the fast-fail CODE in ecx.
+     * Code 5 is FAST_FAIL_INVALID_ARG (an MSVC/CRT invalid-parameter failure),
+     * NOT a stack overrun. Reading the name as "stack cookie" is what led to the
+     * FEX-miscompiles-cookies theory that justified this hack.
+     *
+     * ⛔ NOT restricted to one title. A game-specific carve-out would be a
+     * per-app hack, which this project does not do — fix the accuracy gap.
+     *
+     * ⚠️ RISK, STATED PLAINLY: Thumper has depended on this since May. If its
+     * fast-fail is genuinely spurious (a real FEX bug with stack cookies) it may
+     * now die during init. That regression is INFORMATION — it exposes the bug
+     * this hack has been hiding — but it is a regression. The [term-stack] dump
+     * above still fires and names the faulting module. */
     /* iOS: if THIS pseudo-process is already exiting and this is the
      * self-terminate call (the -1 pseudo-handle from RtlExitUserProcess),
      * go directly to exit_process. The server may return self=false because

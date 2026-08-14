@@ -3181,6 +3181,40 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
     if (fd != -1) close( fd );
 
     if (ret != STATUS_INVALID_HANDLE || !handle) return ret;
+
+#ifdef WINE_IOS
+    /* iOS-Mythic ml669: [bad-close] — Book of the Dead died on an UNHANDLED
+     * c0000008 (STATUS_INVALID_HANDLE) at KiRaiseUserExceptionDispatcher, and
+     * this is the only path that reaches that dispatcher.
+     *
+     * Note what gates it: an invalid NtClose is normally a RETURNED status and
+     * nothing more. It only becomes a raised, process-killing exception when the
+     * guest believes a debugger is attached (BeingDebugged + a non-zero
+     * ProcessDebugPort) -- that is Windows' "let the debugger see the bad close"
+     * behaviour. We run under StikDebug, so if we report either of those as true
+     * when no WINDOWS debugger is present, we convert every harmless double-close
+     * in every app into a fatal exception. That would be our bug, not the game's.
+     *
+     * Log both halves before deciding: the handle and whether the fd cache ever
+     * knew it (double-close vs never-valid), and the debug state that decides
+     * whether it is fatal. Deliberately does NOT suppress the raise -- doing that
+     * now would hide whichever of the two defects this turns out to be. */
+    {
+        static int bad_close_n;
+        if (bad_close_n < 32)
+        {
+            ULONG_PTR dbg_port = 0;
+            NTSTATUS qs = NtQueryInformationProcess( NtCurrentProcess(), ProcessDebugPort,
+                                                     &dbg_port, sizeof(dbg_port), NULL );
+            dprintf( 2, "[bad-close] ml669 #%d handle=%p fd_was_cached=%d BeingDebugged=%d "
+                     "ProcessDebugPort=%p (q=%08x) => %s\n",
+                     ++bad_close_n, handle, fd != -1, (int)peb->BeingDebugged,
+                     (void *)dbg_port, (unsigned int)qs,
+                     (peb->BeingDebugged && !qs && dbg_port) ? "WILL RAISE (fatal)" : "returns status" );
+        }
+    }
+#endif
+
     if (!peb->BeingDebugged) return ret;
     if (!NtQueryInformationProcess( NtCurrentProcess(), ProcessDebugPort, &port, sizeof(port), NULL) && port)
     {

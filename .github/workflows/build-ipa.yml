@@ -1,0 +1,241 @@
+name: Build Mythic IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-15
+
+    env:
+      IOS_DEPLOYMENT_TARGET: "17.0"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Install build dependencies
+        run: |
+          brew update
+          brew install \
+            cmake \
+            ninja \
+            meson \
+            pkg-config \
+            autoconf \
+            automake \
+            libtool \
+            llvm \
+            ccache
+
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+      - name: Initialize nested submodules
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      # ------------------------------------------------------------------
+      # FEX
+      # ------------------------------------------------------------------
+
+      - name: Configure FEX for iOS
+        run: |
+          rm -rf FEX/build-ios
+
+          cmake \
+            -S FEX \
+            -B FEX/build-ios \
+            -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_FEX_LINUX_TESTS=OFF \
+            -DBUILD_FEXCONFIG=OFF \
+            -DBUILD_THUNKS=OFF \
+            -DENABLE_CCACHE=OFF \
+            -DENABLE_LTO=OFF
+
+      - name: Build FEX
+        run: |
+          cmake --build FEX/build-ios --parallel "$(sysctl -n hw.logicalcpu)"
+
+      # ------------------------------------------------------------------
+      # Check repository-generated libraries.
+      #
+      # Mythic currently contains individual build scripts for Wine/DXMT.
+      # Some of them depend on toolchains/prebuilt Wine build directories.
+      # ------------------------------------------------------------------
+
+      - name: Build available Mythic native dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          run_build() {
+            local script="$1"
+
+            if [ -f "$script" ]; then
+              echo "========================================"
+              echo "Running: $script"
+              echo "========================================"
+              chmod +x "$script"
+              "$script"
+            fi
+          }
+
+          # Build only scripts whose prerequisites are already available.
+          # Additional dependencies are checked below.
+          run_build build/freetype-ios/build.sh || true
+          run_build build/gnutls-ios/build.sh || true
+          run_build build/crypto-unix/build.sh || true
+          run_build build/ntdll-unix/build.sh || true
+          run_build build/win32u-unix/build.sh || true
+          run_build build/dxmt-ios/build.sh || true
+
+      - name: Check required static libraries
+        run: |
+          echo "FEX libraries:"
+          find FEX/build-ios -name '*.a' -maxdepth 8 -print || true
+
+          echo
+          echo "Mythic libraries:"
+          find app/Mythic -maxdepth 1 -name '*.a' -print || true
+
+          REQUIRED=(
+            "FEX/build-ios/FEXCore/Source/libFEXCore.a"
+            "FEX/build-ios/FEXCore/Source/libFEXCore_Base.a"
+            "FEX/build-ios/External/fmt/libfmt.a"
+            "FEX/build-ios/External/cephes/libcephes_128bit.a"
+            "FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a"
+            "FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a"
+            "FEX/build-ios/FEXCore/Source/libJemallocLibs.a"
+            "app/Mythic/libwineserver.a"
+            "app/Mythic/libntdll_unix.a"
+            "app/Mythic/libwin32u_unix.a"
+            "app/Mythic/libdxmt_combined.a"
+            "app/Mythic/libgnutls.a"
+            "app/Mythic/libhogweed.a"
+            "app/Mythic/libnettle.a"
+            "app/Mythic/libgmp.a"
+          )
+
+          MISSING=0
+
+          for file in "${REQUIRED[@]}"; do
+            if [ -f "$file" ]; then
+              echo "[OK] $file"
+            else
+              echo "[MISSING] $file"
+              MISSING=1
+            fi
+          done
+
+          if [ "$MISSING" -ne 0 ]; then
+            echo
+            echo "One or more required static libraries are missing."
+            echo "See the build logs above."
+            exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # Xcode
+      # ------------------------------------------------------------------
+
+      - name: Show Xcode project information
+        working-directory: app
+        run: |
+          xcodebuild \
+            -project Mythic.xcodeproj \
+            -list
+
+      - name: Build Mythic for iPhone
+        working-directory: app
+        run: |
+          rm -rf build
+
+          xcodebuild \
+            -project Mythic.xcodeproj \
+            -target Mythic \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$PWD/build/DerivedData" \
+            CONFIGURATION_BUILD_DIR="$PWD/build/Release-iphoneos" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            ONLY_ACTIVE_ARCH=NO \
+            ARCHS=arm64 \
+            clean build
+
+      - name: Verify application
+        run: |
+          APP="app/build/Release-iphoneos/Mythic.app"
+
+          if [ ! -d "$APP" ]; then
+            echo "Mythic.app was not generated."
+            find app/build -maxdepth 4 -print || true
+            exit 1
+          fi
+
+          echo "Application:"
+          du -sh "$APP"
+
+          echo
+          echo "Executable architectures:"
+          lipo -info "$APP/Mythic" || true
+
+      # ------------------------------------------------------------------
+      # IPA
+      # ------------------------------------------------------------------
+
+      - name: Create unsigned IPA
+        run: |
+          rm -rf ipa
+          mkdir -p ipa/Payload
+
+          cp -R \
+            app/build/Release-iphoneos/Mythic.app \
+            ipa/Payload/
+
+          cd ipa
+          /usr/bin/zip -qry Mythic-unsigned.ipa Payload
+
+          ls -lh Mythic-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mythic-unsigned-ipa
+          path: ipa/Mythic-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mythic-build-debug
+          path: |
+            build/**/obj/*.err
+            build/**/obj/err-*.txt
+            app/build
+          if-no-files-found: ignore
+          retention-days: 7

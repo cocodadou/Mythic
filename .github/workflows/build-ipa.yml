@@ -2,6 +2,7 @@ name: Build Mythic IPA
 
 on:
   workflow_dispatch:
+
   push:
     branches:
       - main
@@ -15,20 +16,31 @@ jobs:
       IOS_DEPLOYMENT_TARGET: "17.0"
 
     steps:
+      # ------------------------------------------------------------
+      # Checkout
+      # ------------------------------------------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: false
           fetch-depth: 1
 
       - name: Show Xcode version
         run: |
+          set -e
+
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
 
+      # ------------------------------------------------------------
+      # Homebrew dependencies
+      # ------------------------------------------------------------
+
       - name: Install build dependencies
         run: |
-          brew update
+          set -e
+
           brew install \
             cmake \
             ninja \
@@ -38,21 +50,155 @@ jobs:
             automake \
             libtool \
             llvm \
-            ccache
+            ccache || true
 
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
 
-      - name: Initialize nested submodules
-        run: |
-          git submodule sync --recursive
-          git submodule update --init --recursive
+      # ------------------------------------------------------------
+      # Mythic top-level submodules
+      #
+      # Do NOT use recursive checkout here because the FEX fork
+      # references an rpmalloc commit that is no longer fetchable.
+      # ------------------------------------------------------------
 
-      # ------------------------------------------------------------------
+      - name: Initialize Mythic submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git submodule sync
+
+          git submodule update --init FEX
+          git submodule update --init wine
+          git submodule update --init research/dxmt
+
+          echo
+          echo "Top-level submodules:"
+          git submodule status
+
+      # ------------------------------------------------------------
+      # FEX nested submodules
+      #
+      # Initialize everything except External/rpmalloc.
+      # ------------------------------------------------------------
+
+      - name: Initialize FEX submodules except rpmalloc
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd FEX
+
+          git submodule sync
+
+          echo "FEX commit:"
+          git rev-parse HEAD
+
+          echo
+          echo "FEX nested submodules:"
+
+          mapfile -t SUBMODULES < <(
+            git config \
+              --file .gitmodules \
+              --get-regexp path |
+            awk '{print $2}' |
+            grep -v '^External/rpmalloc$'
+          )
+
+          printf '%s\n' "${SUBMODULES[@]}"
+
+          for submodule in "${SUBMODULES[@]}"; do
+            echo
+            echo "========================================"
+            echo "Initializing $submodule"
+            echo "========================================"
+
+            git submodule update \
+              --init \
+              --recursive \
+              "$submodule"
+          done
+
+      # ------------------------------------------------------------
+      # rpmalloc workaround
+      #
+      # The Mythic FEX revision references:
+      # a4d4185f226b2209b5eb4a13a7817766f89fdea1
+      #
+      # That object currently cannot be fetched from the configured
+      # FEX-Emu/rpmalloc remote. Use the current FEX rpmalloc fork.
+      # ------------------------------------------------------------
+
+      - name: Install rpmalloc workaround
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd FEX
+
+          echo "Removing broken rpmalloc submodule working tree..."
+
+          git submodule deinit -f External/rpmalloc 2>/dev/null || true
+
+          rm -rf External/rpmalloc
+          rm -rf .git/modules/External/rpmalloc
+
+          echo "Cloning FEX-Emu/rpmalloc..."
+
+          git clone \
+            --depth 1 \
+            https://github.com/FEX-Emu/rpmalloc.git \
+            External/rpmalloc
+
+          echo
+          echo "rpmalloc commit:"
+          git -C External/rpmalloc rev-parse HEAD
+
+          echo
+          echo "rpmalloc contents:"
+          ls -la External/rpmalloc
+
+      # ------------------------------------------------------------
+      # Verify nested repositories
+      # ------------------------------------------------------------
+
+      - name: Verify FEX dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUIRED_DIRS=(
+            "FEX/External/fmt"
+            "FEX/External/xxhash"
+            "FEX/External/rpmalloc"
+            "FEX/External/jemalloc_glibc"
+            "FEX/External/range-v3"
+          )
+
+          FAILED=0
+
+          for directory in "${REQUIRED_DIRS[@]}"; do
+            if [ -d "$directory" ]; then
+              echo "[OK] $directory"
+            else
+              echo "[MISSING] $directory"
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            exit 1
+          fi
+
+      # ------------------------------------------------------------
       # FEX
-      # ------------------------------------------------------------------
+      # ------------------------------------------------------------
 
       - name: Configure FEX for iOS
+        shell: bash
         run: |
+          set -euo pipefail
+
           rm -rf FEX/build-ios
 
           cmake \
@@ -72,50 +218,102 @@ jobs:
             -DENABLE_LTO=OFF
 
       - name: Build FEX
-        run: |
-          cmake --build FEX/build-ios --parallel "$(sysctl -n hw.logicalcpu)"
-
-      # ------------------------------------------------------------------
-      # Check repository-generated libraries.
-      #
-      # Mythic currently contains individual build scripts for Wine/DXMT.
-      # Some of them depend on toolchains/prebuilt Wine build directories.
-      # ------------------------------------------------------------------
-
-      - name: Build available Mythic native dependencies
         shell: bash
         run: |
           set -euo pipefail
 
-          run_build() {
+          cmake \
+            --build FEX/build-ios \
+            --parallel "$(sysctl -n hw.logicalcpu)"
+
+      # ------------------------------------------------------------
+      # Show generated FEX libraries
+      # ------------------------------------------------------------
+
+      - name: Find FEX static libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Generated FEX libraries:"
+          find FEX/build-ios \
+            -type f \
+            -name '*.a' \
+            -print |
+            sort
+
+      # ------------------------------------------------------------
+      # Mythic dependency build scripts
+      #
+      # These scripts do not all have the same prerequisites.
+      # They are therefore attempted individually.
+      # ------------------------------------------------------------
+
+      - name: Run available Mythic dependency scripts
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          run_script() {
             local script="$1"
 
-            if [ -f "$script" ]; then
-              echo "========================================"
-              echo "Running: $script"
-              echo "========================================"
-              chmod +x "$script"
-              "$script"
+            if [ ! -f "$script" ]; then
+              echo "[SKIP] $script does not exist"
+              return 0
+            fi
+
+            echo
+            echo "========================================"
+            echo "Running $script"
+            echo "========================================"
+
+            chmod +x "$script"
+
+            if "$script"; then
+              echo "[OK] $script"
+            else
+              echo "[WARNING] $script failed"
             fi
           }
 
-          # Build only scripts whose prerequisites are already available.
-          # Additional dependencies are checked below.
-          run_build build/freetype-ios/build.sh || true
-          run_build build/gnutls-ios/build.sh || true
-          run_build build/crypto-unix/build.sh || true
-          run_build build/ntdll-unix/build.sh || true
-          run_build build/win32u-unix/build.sh || true
-          run_build build/dxmt-ios/build.sh || true
+          run_script build/freetype-ios/build.sh
+          run_script build/gnutls-ios/build.sh
+          run_script build/crypto-unix/build.sh
+          run_script build/wineserver/build.sh
+          run_script build/ntdll-unix/build.sh
+          run_script build/win32u-unix/build.sh
+          run_script build/dxmt-ios/build.sh
 
-      - name: Check required static libraries
+      # ------------------------------------------------------------
+      # Dependency diagnostics
+      # ------------------------------------------------------------
+
+      - name: Show generated Mythic libraries
+        shell: bash
         run: |
-          echo "FEX libraries:"
-          find FEX/build-ios -name '*.a' -maxdepth 8 -print || true
+          echo "Libraries under app:"
+          find app \
+            -type f \
+            -name '*.a' \
+            -print |
+            sort || true
 
           echo
-          echo "Mythic libraries:"
-          find app/Mythic -maxdepth 1 -name '*.a' -print || true
+          echo "Libraries under build:"
+          find build \
+            -type f \
+            -name '*.a' \
+            -print |
+            sort || true
+
+      # ------------------------------------------------------------
+      # Check the libraries referenced by Mythic.xcodeproj
+      # ------------------------------------------------------------
+
+      - name: Check required static libraries
+        shell: bash
+        run: |
+          set -euo pipefail
 
           REQUIRED=(
             "FEX/build-ios/FEXCore/Source/libFEXCore.a"
@@ -137,6 +335,9 @@ jobs:
 
           MISSING=0
 
+          echo "Checking static libraries..."
+          echo
+
           for file in "${REQUIRED[@]}"; do
             if [ -f "$file" ]; then
               echo "[OK] $file"
@@ -146,27 +347,40 @@ jobs:
             fi
           done
 
+          echo
+
           if [ "$MISSING" -ne 0 ]; then
+            echo "Some required Mythic libraries have not been generated."
             echo
-            echo "One or more required static libraries are missing."
-            echo "See the build logs above."
+            echo "This means the Git/submodule stage is now working,"
+            echo "but additional Wine/DXMT dependencies still need to be built."
             exit 1
           fi
 
-      # ------------------------------------------------------------------
-      # Xcode
-      # ------------------------------------------------------------------
+      # ------------------------------------------------------------
+      # Xcode diagnostics
+      # ------------------------------------------------------------
 
       - name: Show Xcode project information
         working-directory: app
+        shell: bash
         run: |
+          set -euo pipefail
+
           xcodebuild \
             -project Mythic.xcodeproj \
             -list
 
+      # ------------------------------------------------------------
+      # Build Mythic without code signing
+      # ------------------------------------------------------------
+
       - name: Build Mythic for iPhone
         working-directory: app
+        shell: bash
         run: |
+          set -euo pipefail
+
           rm -rf build
 
           xcodebuild \
@@ -185,13 +399,26 @@ jobs:
             ARCHS=arm64 \
             clean build
 
+      # ------------------------------------------------------------
+      # Verify app bundle
+      # ------------------------------------------------------------
+
       - name: Verify application
+        shell: bash
         run: |
+          set -euo pipefail
+
           APP="app/build/Release-iphoneos/Mythic.app"
 
           if [ ! -d "$APP" ]; then
             echo "Mythic.app was not generated."
-            find app/build -maxdepth 4 -print || true
+
+            echo
+            echo "Build directory:"
+            find app/build \
+              -maxdepth 5 \
+              -print || true
+
             exit 1
           fi
 
@@ -200,25 +427,45 @@ jobs:
 
           echo
           echo "Executable architectures:"
-          lipo -info "$APP/Mythic" || true
 
-      # ------------------------------------------------------------------
-      # IPA
-      # ------------------------------------------------------------------
+          if [ -f "$APP/Mythic" ]; then
+            lipo -info "$APP/Mythic" || true
+            file "$APP/Mythic" || true
+          fi
+
+      # ------------------------------------------------------------
+      # Create unsigned IPA
+      # ------------------------------------------------------------
 
       - name: Create unsigned IPA
+        shell: bash
         run: |
+          set -euo pipefail
+
+          APP="app/build/Release-iphoneos/Mythic.app"
+
           rm -rf ipa
+
           mkdir -p ipa/Payload
 
           cp -R \
-            app/build/Release-iphoneos/Mythic.app \
+            "$APP" \
             ipa/Payload/
 
           cd ipa
-          /usr/bin/zip -qry Mythic-unsigned.ipa Payload
 
+          /usr/bin/zip \
+            -qry \
+            Mythic-unsigned.ipa \
+            Payload
+
+          echo
+          echo "IPA:"
           ls -lh Mythic-unsigned.ipa
+
+      # ------------------------------------------------------------
+      # Artifact
+      # ------------------------------------------------------------
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
@@ -228,14 +475,20 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload build logs on failure
+      # ------------------------------------------------------------
+      # Debug artifacts
+      # ------------------------------------------------------------
+
+      - name: Upload build diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: Mythic-build-debug
           path: |
-            build/**/obj/*.err
-            build/**/obj/err-*.txt
-            app/build
+            FEX/build-ios/CMakeCache.txt
+            FEX/build-ios/**/*.log
+            build/**/*.log
+            build/**/*.err
+            app/build/**/*.log
           if-no-files-found: ignore
           retention-days: 7

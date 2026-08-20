@@ -56,9 +56,6 @@ jobs:
 
       # ------------------------------------------------------------
       # Mythic top-level submodules
-      #
-      # Do NOT use recursive checkout here because the FEX fork
-      # references an rpmalloc commit that is no longer fetchable.
       # ------------------------------------------------------------
 
       - name: Initialize Mythic submodules
@@ -79,7 +76,8 @@ jobs:
       # ------------------------------------------------------------
       # FEX nested submodules
       #
-      # Initialize everything except External/rpmalloc.
+      # Compatible with macOS Bash 3.2.
+      # rpmalloc is intentionally skipped here.
       # ------------------------------------------------------------
 
       - name: Initialize FEX submodules except rpmalloc
@@ -97,17 +95,16 @@ jobs:
           echo
           echo "FEX nested submodules:"
 
-          mapfile -t SUBMODULES < <(
-            git config \
-              --file .gitmodules \
-              --get-regexp path |
-            awk '{print $2}' |
-            grep -v '^External/rpmalloc$'
-          )
+          git config \
+            --file .gitmodules \
+            --get-regexp path |
+          awk '{print $2}' |
+          while IFS= read -r submodule; do
+            if [ "$submodule" = "External/rpmalloc" ]; then
+              echo "[SKIP] $submodule"
+              continue
+            fi
 
-          printf '%s\n' "${SUBMODULES[@]}"
-
-          for submodule in "${SUBMODULES[@]}"; do
             echo
             echo "========================================"
             echo "Initializing $submodule"
@@ -121,12 +118,6 @@ jobs:
 
       # ------------------------------------------------------------
       # rpmalloc workaround
-      #
-      # The Mythic FEX revision references:
-      # a4d4185f226b2209b5eb4a13a7817766f89fdea1
-      #
-      # That object currently cannot be fetched from the configured
-      # FEX-Emu/rpmalloc remote. Use the current FEX rpmalloc fork.
       # ------------------------------------------------------------
 
       - name: Install rpmalloc workaround
@@ -138,7 +129,10 @@ jobs:
 
           echo "Removing broken rpmalloc submodule working tree..."
 
-          git submodule deinit -f External/rpmalloc 2>/dev/null || true
+          git submodule deinit \
+            -f \
+            External/rpmalloc \
+            2>/dev/null || true
 
           rm -rf External/rpmalloc
           rm -rf .git/modules/External/rpmalloc
@@ -167,17 +161,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          REQUIRED_DIRS=(
-            "FEX/External/fmt"
-            "FEX/External/xxhash"
-            "FEX/External/rpmalloc"
-            "FEX/External/jemalloc_glibc"
-            "FEX/External/range-v3"
-          )
-
           FAILED=0
 
-          for directory in "${REQUIRED_DIRS[@]}"; do
+          for directory in \
+            "FEX/External/fmt" \
+            "FEX/External/xxhash" \
+            "FEX/External/rpmalloc" \
+            "FEX/External/jemalloc_glibc" \
+            "FEX/External/range-v3"
+          do
             if [ -d "$directory" ]; then
               echo "[OK] $directory"
             else
@@ -236,17 +228,15 @@ jobs:
           set -euo pipefail
 
           echo "Generated FEX libraries:"
+
           find FEX/build-ios \
             -type f \
             -name '*.a' \
             -print |
-            sort
+          sort
 
       # ------------------------------------------------------------
       # Mythic dependency build scripts
-      #
-      # These scripts do not all have the same prerequisites.
-      # They are therefore attempted individually.
       # ------------------------------------------------------------
 
       - name: Run available Mythic dependency scripts
@@ -255,7 +245,7 @@ jobs:
           set -uo pipefail
 
           run_script() {
-            local script="$1"
+            script="$1"
 
             if [ ! -f "$script" ]; then
               echo "[SKIP] $script does not exist"
@@ -292,22 +282,24 @@ jobs:
         shell: bash
         run: |
           echo "Libraries under app:"
+
           find app \
             -type f \
             -name '*.a' \
             -print |
-            sort || true
+          sort || true
 
           echo
           echo "Libraries under build:"
+
           find build \
             -type f \
             -name '*.a' \
             -print |
-            sort || true
+          sort || true
 
       # ------------------------------------------------------------
-      # Check the libraries referenced by Mythic.xcodeproj
+      # Check required static libraries
       # ------------------------------------------------------------
 
       - name: Check required static libraries
@@ -315,45 +307,43 @@ jobs:
         run: |
           set -euo pipefail
 
-          REQUIRED=(
-            "FEX/build-ios/FEXCore/Source/libFEXCore.a"
-            "FEX/build-ios/FEXCore/Source/libFEXCore_Base.a"
-            "FEX/build-ios/External/fmt/libfmt.a"
-            "FEX/build-ios/External/cephes/libcephes_128bit.a"
-            "FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a"
-            "FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a"
-            "FEX/build-ios/FEXCore/Source/libJemallocLibs.a"
-            "app/Mythic/libwineserver.a"
-            "app/Mythic/libntdll_unix.a"
-            "app/Mythic/libwin32u_unix.a"
-            "app/Mythic/libdxmt_combined.a"
-            "app/Mythic/libgnutls.a"
-            "app/Mythic/libhogweed.a"
-            "app/Mythic/libnettle.a"
-            "app/Mythic/libgmp.a"
-          )
-
           MISSING=0
 
-          echo "Checking static libraries..."
-          echo
+          check_library() {
+            file="$1"
 
-          for file in "${REQUIRED[@]}"; do
             if [ -f "$file" ]; then
               echo "[OK] $file"
             else
               echo "[MISSING] $file"
               MISSING=1
             fi
-          done
+          }
+
+          echo "Checking static libraries..."
+          echo
+
+          check_library "FEX/build-ios/FEXCore/Source/libFEXCore.a"
+          check_library "FEX/build-ios/FEXCore/Source/libFEXCore_Base.a"
+          check_library "FEX/build-ios/External/fmt/libfmt.a"
+          check_library "FEX/build-ios/External/cephes/libcephes_128bit.a"
+          check_library "FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a"
+          check_library "FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a"
+          check_library "FEX/build-ios/FEXCore/Source/libJemallocLibs.a"
+
+          check_library "app/Mythic/libwineserver.a"
+          check_library "app/Mythic/libntdll_unix.a"
+          check_library "app/Mythic/libwin32u_unix.a"
+          check_library "app/Mythic/libdxmt_combined.a"
+          check_library "app/Mythic/libgnutls.a"
+          check_library "app/Mythic/libhogweed.a"
+          check_library "app/Mythic/libnettle.a"
+          check_library "app/Mythic/libgmp.a"
 
           echo
 
           if [ "$MISSING" -ne 0 ]; then
             echo "Some required Mythic libraries have not been generated."
-            echo
-            echo "This means the Git/submodule stage is now working,"
-            echo "but additional Wine/DXMT dependencies still need to be built."
             exit 1
           fi
 
@@ -372,7 +362,7 @@ jobs:
             -list
 
       # ------------------------------------------------------------
-      # Build Mythic without code signing
+      # Build Mythic
       # ------------------------------------------------------------
 
       - name: Build Mythic for iPhone
@@ -415,6 +405,7 @@ jobs:
 
             echo
             echo "Build directory:"
+
             find app/build \
               -maxdepth 5 \
               -print || true
@@ -445,7 +436,6 @@ jobs:
           APP="app/build/Release-iphoneos/Mythic.app"
 
           rm -rf ipa
-
           mkdir -p ipa/Payload
 
           cp -R \
@@ -464,7 +454,7 @@ jobs:
           ls -lh Mythic-unsigned.ipa
 
       # ------------------------------------------------------------
-      # Artifact
+      # Upload IPA
       # ------------------------------------------------------------
 
       - name: Upload IPA
@@ -476,7 +466,7 @@ jobs:
           retention-days: 14
 
       # ------------------------------------------------------------
-      # Debug artifacts
+      # Diagnostics
       # ------------------------------------------------------------
 
       - name: Upload build diagnostics on failure

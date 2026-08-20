@@ -84,9 +84,6 @@ jobs:
 
       # ------------------------------------------------------------
       # Nested FEX submodules
-      #
-      # rpmalloc is intentionally skipped because the revision
-      # referenced by the Mythic FEX fork is no longer fetchable.
       # ------------------------------------------------------------
 
       - name: Initialize FEX submodules except rpmalloc
@@ -198,6 +195,96 @@ jobs:
           fi
 
       # ------------------------------------------------------------
+      # Patch broken Win32-only diagnostic in the iOS FEX fork
+      #
+      # The fork calls VirtualQuery and uses MEMORY_BASIC_INFORMATION
+      # from a host-iOS translation unit. Those Win32 APIs are not
+      # available while compiling FEXCore for iOS.
+      #
+      # The affected function is diagnostic only. Keep its useful
+      # address/alignment logging and remove only the Win32 query.
+      # ------------------------------------------------------------
+
+      - name: Patch FEX CASPAL iOS diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp"
+
+          echo "Patching:"
+          echo "$FILE"
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp")
+          source = path.read_text()
+
+          pattern = re.compile(
+              r'static void IosLogUnimplementedCASPAL'
+              r'\(uint32_t Size, uint64_t\* GPRs, uint32_t AddressReg\) \{'
+              r'.*?'
+              r'\n\}'
+              r'(?=\nstatic bool HandleCASPAL)',
+              re.DOTALL,
+          )
+
+          replacement = r'''static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t AddressReg) {
+            static int reports;
+
+            if (Size == 0 || (GPRs[AddressReg] & 15) == 0 || reports >= 8) {
+              return;
+            }
+
+            reports++;
+
+            LogMan::Msg::EFmt(
+              "[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} "
+              "misalign={} crosses16B={}",
+              Size,
+              AddressReg,
+              GPRs[AddressReg],
+              GPRs[AddressReg] & 15,
+              (GPRs[AddressReg] & 15) ? "yes" : "no");
+          }'''
+
+          patched, count = pattern.subn(replacement, source, count=1)
+
+          if count != 1:
+              raise SystemExit(
+                  "Failed to locate IosLogUnimplementedCASPAL in Arm64.cpp"
+              )
+
+          path.write_text(patched)
+
+          print("FEX CASPAL diagnostic successfully patched.")
+          PY
+
+          echo
+          echo "Checking that Win32 diagnostic symbols are gone..."
+
+          if grep -n \
+            -E 'MEMORY_BASIC_INFORMATION|VirtualQuery|MEM_IMAGE|MEM_MAPPED|LPCVOID' \
+            "$FILE"; then
+
+            echo
+            echo "One or more unsupported Win32 diagnostic references remain."
+            exit 1
+          fi
+
+          echo "[OK] No unsupported Win32 diagnostic references remain."
+
+          echo
+          echo "Patched function:"
+          grep \
+            -A 25 \
+            -B 2 \
+            "static void IosLogUnimplementedCASPAL" \
+            "$FILE"
+
+      # ------------------------------------------------------------
       # FEX diagnostics
       # ------------------------------------------------------------
 
@@ -208,6 +295,10 @@ jobs:
 
           echo "FEX commit:"
           git -C FEX rev-parse HEAD
+
+          echo
+          echo "FEX working tree changes:"
+          git -C FEX diff --stat
 
           echo
           echo "CMake version:"
@@ -235,14 +326,6 @@ jobs:
 
       # ------------------------------------------------------------
       # Configure FEX
-      #
-      # Important:
-      #
-      # The willfaust iOS fork contains iOS-specific code guarded by
-      # FEX_IOS_HOST. CMAKE_SYSTEM_NAME=iOS does NOT define this
-      # automatically.
-      #
-      # We therefore pass FEX_IOS_HOST to C, C++ and ASM.
       # ------------------------------------------------------------
 
       - name: Configure FEX for iOS
@@ -265,6 +348,7 @@ jobs:
             -DCMAKE_OSX_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DCMAKE_C_FLAGS="-DFEX_IOS_HOST=1" \
             -DCMAKE_CXX_FLAGS="-DFEX_IOS_HOST=1" \
             -DCMAKE_ASM_FLAGS="-DFEX_IOS_HOST=1" \
@@ -294,7 +378,7 @@ jobs:
             FEX/build-ios/CMakeCache.txt || true
 
       # ------------------------------------------------------------
-      # Verify FEX_IOS_HOST reached the compiler
+      # Verify FEX_IOS_HOST
       # ------------------------------------------------------------
 
       - name: Verify FEX iOS compiler flags
@@ -302,14 +386,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Checking compile_commands.json for FEX_IOS_HOST..."
+          FILE="FEX/build-ios/compile_commands.json"
 
-          if [ ! -f "FEX/build-ios/compile_commands.json" ]; then
+          if [ ! -f "$FILE" ]; then
             echo "compile_commands.json was not generated."
             exit 1
           fi
 
-          if grep -q "FEX_IOS_HOST" FEX/build-ios/compile_commands.json; then
+          if grep -q "FEX_IOS_HOST" "$FILE"; then
             echo "[OK] FEX_IOS_HOST is present in compiler commands."
           else
             echo "[ERROR] FEX_IOS_HOST is missing from compiler commands."
@@ -318,8 +402,11 @@ jobs:
 
           echo
           echo "Example compiler command:"
-          grep -m 1 "FEX_IOS_HOST" \
-            FEX/build-ios/compile_commands.json || true
+
+          grep \
+            -m 1 \
+            "FEX_IOS_HOST" \
+            "$FILE" || true
 
       # ------------------------------------------------------------
       # Build FEX
@@ -513,7 +600,7 @@ jobs:
             clean build
 
       # ------------------------------------------------------------
-      # Verify app
+      # Verify app bundle
       # ------------------------------------------------------------
 
       - name: Verify application
@@ -548,7 +635,7 @@ jobs:
           fi
 
       # ------------------------------------------------------------
-      # Create IPA
+      # Create unsigned IPA
       # ------------------------------------------------------------
 
       - name: Create unsigned IPA

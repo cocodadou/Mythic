@@ -98,9 +98,6 @@ jobs:
           echo "FEX commit:"
           git rev-parse HEAD
 
-          echo
-          echo "FEX nested submodules:"
-
           git config \
             --file .gitmodules \
             --get-regexp path |
@@ -112,9 +109,7 @@ jobs:
             fi
 
             echo
-            echo "========================================"
             echo "Initializing $submodule"
-            echo "========================================"
 
             git submodule update \
               --init \
@@ -133,8 +128,6 @@ jobs:
 
           cd FEX
 
-          echo "Removing broken rpmalloc submodule working tree..."
-
           git submodule deinit \
             -f \
             External/rpmalloc \
@@ -147,9 +140,6 @@ jobs:
           rm -rf \
             "${GIT_DIR_PATH}/modules/External/rpmalloc" \
             2>/dev/null || true
-
-          echo
-          echo "Cloning current FEX-Emu/rpmalloc..."
 
           git clone \
             --depth 1 \
@@ -189,20 +179,15 @@ jobs:
           done
 
           if [ "$FAILED" -ne 0 ]; then
-            echo
-            echo "One or more FEX dependencies are missing."
             exit 1
           fi
 
       # ------------------------------------------------------------
-      # Patch broken Win32-only diagnostic in the iOS FEX fork
+      # Patch the Win32-only CASPAL diagnostic
       #
-      # The fork calls VirtualQuery and uses MEMORY_BASIC_INFORMATION
-      # from a host-iOS translation unit. Those Win32 APIs are not
-      # available while compiling FEXCore for iOS.
-      #
-      # The affected function is diagnostic only. Keep its useful
-      # address/alignment logging and remove only the Win32 query.
+      # This replaces only the MEMORY_BASIC_INFORMATION /
+      # VirtualQuery diagnostic section. The actual CASPAL handling
+      # remains untouched.
       # ------------------------------------------------------------
 
       - name: Patch FEX CASPAL iOS diagnostic
@@ -212,117 +197,118 @@ jobs:
 
           FILE="FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp"
 
-          echo "Patching:"
-          echo "$FILE"
+          echo "Checking source before patch..."
+
+          grep -n \
+            "static void IosLogUnimplementedCASPAL" \
+            "$FILE"
+
+          grep -n \
+            "MEMORY_BASIC_INFORMATION" \
+            "$FILE"
 
           python3 <<'PY'
           from pathlib import Path
-          import re
 
           path = Path("FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp")
           source = path.read_text()
 
-          pattern = re.compile(
-              r'static void IosLogUnimplementedCASPAL'
-              r'\(uint32_t Size, uint64_t\* GPRs, uint32_t AddressReg\) \{'
-              r'.*?'
-              r'\n\}'
-              r'(?=\nstatic bool HandleCASPAL)',
-              re.DOTALL,
-          )
-
-          replacement = r'''static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t AddressReg) {
-            static int reports;
-
-            if (Size == 0 || (GPRs[AddressReg] & 15) == 0 || reports >= 8) {
-              return;
+          old = '''  MEMORY_BASIC_INFORMATION mbi {};
+            const char* type = "?";
+            if (VirtualQuery(reinterpret_cast<LPCVOID>(GPRs[AddressReg]), &mbi, sizeof(mbi))) {
+              type = mbi.Type == MEM_IMAGE ? "MEM_IMAGE" : mbi.Type == MEM_MAPPED ? "MEM_MAPPED" : "MEM_PRIVATE";
             }
+            LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "
+                              "crosses16B={} | region base={} size={:#x} prot={:#x} type={} state={:#x}",
+                              Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
+                              (GPRs[AddressReg] & 15) ? "yes" : "no", mbi.BaseAddress, mbi.RegionSize,
+                              mbi.Protect, type, mbi.State);
+          '''
 
-            reports++;
+          new = '''  LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "
+                              "crosses16B={}",
+                              Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
+                              (GPRs[AddressReg] & 15) ? "yes" : "no");
+          '''
 
-            LogMan::Msg::EFmt(
-              "[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} "
-              "misalign={} crosses16B={}",
-              Size,
-              AddressReg,
-              GPRs[AddressReg],
-              GPRs[AddressReg] & 15,
-              (GPRs[AddressReg] & 15) ? "yes" : "no");
-          }'''
+          if old not in source:
+              print("Exact block was not found. Trying line-based patch.")
 
-          patched, count = pattern.subn(replacement, source, count=1)
+              lines = source.splitlines()
+              output = []
 
-          if count != 1:
-              raise SystemExit(
-                  "Failed to locate IosLogUnimplementedCASPAL in Arm64.cpp"
-              )
+              i = 0
+              patched = False
 
-          path.write_text(patched)
+              while i < len(lines):
+                  if "MEMORY_BASIC_INFORMATION mbi {};" in lines[i]:
+                      start = i
 
-          print("FEX CASPAL diagnostic successfully patched.")
+                      while start > 0 and "/* ml223:" not in lines[start]:
+                          start -= 1
+
+                      end = i
+
+                      while end < len(lines) and "mbi.State);" not in lines[end]:
+                          end += 1
+
+                      if end >= len(lines):
+                          raise SystemExit(
+                              "Found MEMORY_BASIC_INFORMATION but could not "
+                              "find the end of its logging block."
+                          )
+
+                      # Preserve the comment preceding the Win32 section only
+                      # up to the MEMORY_BASIC_INFORMATION declaration.
+                      for j in range(start, i):
+                          output.append(lines[j])
+
+                      output.extend([
+                          '  LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "',
+                          '                    "crosses16B={}",',
+                          '                    Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,',
+                          '                    (GPRs[AddressReg] & 15) ? "yes" : "no");',
+                      ])
+
+                      i = end + 1
+                      patched = True
+                      continue
+
+                  output.append(lines[i])
+                  i += 1
+
+              if not patched:
+                  raise SystemExit(
+                      "Failed to locate the Win32 CASPAL diagnostic block."
+                  )
+
+              source = "\n".join(output) + "\n"
+
+          else:
+              source = source.replace(old, new, 1)
+
+          path.write_text(source)
+
+          print("CASPAL diagnostic patched successfully.")
           PY
 
           echo
-          echo "Checking that Win32 diagnostic symbols are gone..."
+          echo "Checking patched source..."
 
           if grep -n \
-            -E 'MEMORY_BASIC_INFORMATION|VirtualQuery|MEM_IMAGE|MEM_MAPPED|LPCVOID' \
+            -E 'MEMORY_BASIC_INFORMATION|VirtualQuery|LPCVOID|MEM_IMAGE|MEM_MAPPED' \
             "$FILE"; then
 
             echo
-            echo "One or more unsupported Win32 diagnostic references remain."
+            echo "Unsupported Win32 symbols remain in Arm64.cpp."
             exit 1
           fi
 
-          echo "[OK] No unsupported Win32 diagnostic references remain."
+          echo "[OK] Win32 CASPAL diagnostic removed."
 
           echo
-          echo "Patched function:"
-          grep \
-            -A 25 \
-            -B 2 \
-            "static void IosLogUnimplementedCASPAL" \
-            "$FILE"
-
-      # ------------------------------------------------------------
-      # FEX diagnostics
-      # ------------------------------------------------------------
-
-      - name: Show FEX configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "FEX commit:"
-          git -C FEX rev-parse HEAD
-
-          echo
-          echo "FEX working tree changes:"
-          git -C FEX diff --stat
-
-          echo
-          echo "CMake version:"
-          cmake --version
-
-          echo
-          echo "Ninja version:"
-          ninja --version
-
-          echo
-          echo "iOS SDK:"
-          xcrun --sdk iphoneos --show-sdk-path
-
-          echo
-          echo "Deployment target:"
-          echo "${IOS_DEPLOYMENT_TARGET}"
-
-          echo
-          echo "Target processor:"
-          echo "arm64"
-
-          echo
-          echo "iOS FEX host mode:"
-          echo "FEX_IOS_HOST=1"
+          echo "Current CASPAL diagnostic:"
+          sed -n '630,675p' "$FILE"
 
       # ------------------------------------------------------------
       # Configure FEX
@@ -367,18 +353,8 @@ jobs:
             -DENABLE_VIXL_DISASSEMBLER=OFF \
             -DENABLE_ZYDIS=OFF
 
-          echo
-          echo "CMake configuration completed."
-
-          echo
-          echo "Relevant CMake values:"
-
-          grep -E \
-            '^(CMAKE_SYSTEM_NAME|CMAKE_SYSTEM_PROCESSOR|CMAKE_OSX_ARCHITECTURES|CMAKE_OSX_SYSROOT|CMAKE_OSX_DEPLOYMENT_TARGET|CMAKE_C_FLAGS|CMAKE_CXX_FLAGS|CMAKE_ASM_FLAGS|TUNE_CPU|TUNE_ARCH):' \
-            FEX/build-ios/CMakeCache.txt || true
-
       # ------------------------------------------------------------
-      # Verify FEX_IOS_HOST
+      # Verify compiler flags
       # ------------------------------------------------------------
 
       - name: Verify FEX iOS compiler flags
@@ -394,19 +370,11 @@ jobs:
           fi
 
           if grep -q "FEX_IOS_HOST" "$FILE"; then
-            echo "[OK] FEX_IOS_HOST is present in compiler commands."
+            echo "[OK] FEX_IOS_HOST is present."
           else
-            echo "[ERROR] FEX_IOS_HOST is missing from compiler commands."
+            echo "[ERROR] FEX_IOS_HOST is missing."
             exit 1
           fi
-
-          echo
-          echo "Example compiler command:"
-
-          grep \
-            -m 1 \
-            "FEX_IOS_HOST" \
-            "$FILE" || true
 
       # ------------------------------------------------------------
       # Build FEX
@@ -422,16 +390,13 @@ jobs:
             --parallel "$(sysctl -n hw.logicalcpu)"
 
       # ------------------------------------------------------------
-      # Find generated FEX libraries
+      # Find FEX libraries
       # ------------------------------------------------------------
 
       - name: Find FEX static libraries
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "Generated FEX libraries:"
-          echo
 
           find FEX/build-ios \
             -type f \
@@ -479,15 +444,13 @@ jobs:
           run_script build/dxmt-ios/build.sh
 
       # ------------------------------------------------------------
-      # Dependency diagnostics
+      # Show generated Mythic libraries
       # ------------------------------------------------------------
 
       - name: Show generated Mythic libraries
         shell: bash
         run: |
           echo "Libraries under app:"
-          echo
-
           find app \
             -type f \
             -name '*.a' \
@@ -496,8 +459,6 @@ jobs:
 
           echo
           echo "Libraries under build:"
-          echo
-
           find build \
             -type f \
             -name '*.a' \
@@ -505,7 +466,7 @@ jobs:
           sort || true
 
       # ------------------------------------------------------------
-      # Check required static libraries
+      # Check required libraries
       # ------------------------------------------------------------
 
       - name: Check required static libraries
@@ -526,9 +487,6 @@ jobs:
             fi
           }
 
-          echo "Checking FEX libraries..."
-          echo
-
           check_library "FEX/build-ios/FEXCore/Source/libFEXCore.a"
           check_library "FEX/build-ios/FEXCore/Source/libFEXCore_Base.a"
           check_library "FEX/build-ios/External/fmt/libfmt.a"
@@ -536,10 +494,6 @@ jobs:
           check_library "FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a"
           check_library "FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a"
           check_library "FEX/build-ios/FEXCore/Source/libJemallocLibs.a"
-
-          echo
-          echo "Checking Mythic/Wine/DXMT libraries..."
-          echo
 
           check_library "app/Mythic/libwineserver.a"
           check_library "app/Mythic/libntdll_unix.a"
@@ -550,15 +504,12 @@ jobs:
           check_library "app/Mythic/libnettle.a"
           check_library "app/Mythic/libgmp.a"
 
-          echo
-
           if [ "$MISSING" -ne 0 ]; then
-            echo "Some required Mythic libraries have not been generated."
             exit 1
           fi
 
       # ------------------------------------------------------------
-      # Xcode diagnostics
+      # Xcode project
       # ------------------------------------------------------------
 
       - name: Show Xcode project information
@@ -600,7 +551,7 @@ jobs:
             clean build
 
       # ------------------------------------------------------------
-      # Verify app bundle
+      # Verify app
       # ------------------------------------------------------------
 
       - name: Verify application
@@ -613,9 +564,6 @@ jobs:
           if [ ! -d "$APP" ]; then
             echo "Mythic.app was not generated."
 
-            echo
-            echo "Build directory:"
-
             find app/build \
               -maxdepth 5 \
               -print || true
@@ -623,11 +571,7 @@ jobs:
             exit 1
           fi
 
-          echo "Application:"
           du -sh "$APP"
-
-          echo
-          echo "Executable architectures:"
 
           if [ -f "$APP/Mythic" ]; then
             lipo -info "$APP/Mythic" || true
@@ -635,7 +579,7 @@ jobs:
           fi
 
       # ------------------------------------------------------------
-      # Create unsigned IPA
+      # Create IPA
       # ------------------------------------------------------------
 
       - name: Create unsigned IPA
@@ -659,8 +603,6 @@ jobs:
             Mythic-unsigned.ipa \
             Payload
 
-          echo
-          echo "IPA:"
           ls -lh Mythic-unsigned.ipa
 
       # ------------------------------------------------------------
@@ -676,7 +618,7 @@ jobs:
           retention-days: 14
 
       # ------------------------------------------------------------
-      # Failure diagnostics
+      # Diagnostics
       # ------------------------------------------------------------
 
       - name: Upload build diagnostics on failure
@@ -687,8 +629,6 @@ jobs:
           path: |
             FEX/build-ios/CMakeCache.txt
             FEX/build-ios/compile_commands.json
-            FEX/build-ios/CMakeFiles/CMakeError.log
-            FEX/build-ios/CMakeFiles/CMakeOutput.log
             FEX/build-ios/**/*.log
             build/**/*.log
             build/**/*.err

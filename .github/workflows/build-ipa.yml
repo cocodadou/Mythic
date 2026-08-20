@@ -42,7 +42,7 @@ jobs:
           uname -m
 
       # ------------------------------------------------------------
-      # Homebrew dependencies
+      # Build dependencies
       # ------------------------------------------------------------
 
       - name: Install build dependencies
@@ -64,7 +64,7 @@ jobs:
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
 
       # ------------------------------------------------------------
-      # Mythic top-level submodules
+      # Top-level Mythic submodules
       # ------------------------------------------------------------
 
       - name: Initialize Mythic submodules
@@ -83,10 +83,10 @@ jobs:
           git submodule status
 
       # ------------------------------------------------------------
-      # FEX nested submodules
+      # Nested FEX submodules
       #
-      # rpmalloc is skipped because the FEX revision used by Mythic
-      # references an unavailable historical commit.
+      # rpmalloc is intentionally skipped because the revision
+      # referenced by the Mythic FEX fork is no longer fetchable.
       # ------------------------------------------------------------
 
       - name: Initialize FEX submodules except rpmalloc
@@ -152,7 +152,7 @@ jobs:
             2>/dev/null || true
 
           echo
-          echo "Cloning FEX-Emu/rpmalloc..."
+          echo "Cloning current FEX-Emu/rpmalloc..."
 
           git clone \
             --depth 1 \
@@ -198,7 +198,7 @@ jobs:
           fi
 
       # ------------------------------------------------------------
-      # FEX configuration diagnostics
+      # FEX diagnostics
       # ------------------------------------------------------------
 
       - name: Show FEX configuration
@@ -229,15 +229,20 @@ jobs:
           echo "Target processor:"
           echo "arm64"
 
+          echo
+          echo "iOS FEX host mode:"
+          echo "FEX_IOS_HOST=1"
+
       # ------------------------------------------------------------
-      # FEX
+      # Configure FEX
       #
-      # CMAKE_SYSTEM_PROCESSOR is explicitly required because CMake
-      # leaves it empty for this iOS configuration and this FEX fork
-      # directly reads it during configuration.
+      # Important:
       #
-      # TUNE_CPU=none prevents FEX from attempting Linux-style
-      # host CPU detection using /proc/cpuinfo.
+      # The willfaust iOS fork contains iOS-specific code guarded by
+      # FEX_IOS_HOST. CMAKE_SYSTEM_NAME=iOS does NOT define this
+      # automatically.
+      #
+      # We therefore pass FEX_IOS_HOST to C, C++ and ASM.
       # ------------------------------------------------------------
 
       - name: Configure FEX for iOS
@@ -260,6 +265,9 @@ jobs:
             -DCMAKE_OSX_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DCMAKE_C_FLAGS="-DFEX_IOS_HOST=1" \
+            -DCMAKE_CXX_FLAGS="-DFEX_IOS_HOST=1" \
+            -DCMAKE_ASM_FLAGS="-DFEX_IOS_HOST=1" \
             -DTUNE_CPU=none \
             -DTUNE_ARCH=generic \
             -DBUILD_TESTING=OFF \
@@ -282,8 +290,36 @@ jobs:
           echo "Relevant CMake values:"
 
           grep -E \
-            '^(CMAKE_SYSTEM_NAME|CMAKE_SYSTEM_PROCESSOR|CMAKE_OSX_ARCHITECTURES|CMAKE_OSX_SYSROOT|CMAKE_OSX_DEPLOYMENT_TARGET|TUNE_CPU|TUNE_ARCH):' \
+            '^(CMAKE_SYSTEM_NAME|CMAKE_SYSTEM_PROCESSOR|CMAKE_OSX_ARCHITECTURES|CMAKE_OSX_SYSROOT|CMAKE_OSX_DEPLOYMENT_TARGET|CMAKE_C_FLAGS|CMAKE_CXX_FLAGS|CMAKE_ASM_FLAGS|TUNE_CPU|TUNE_ARCH):' \
             FEX/build-ios/CMakeCache.txt || true
+
+      # ------------------------------------------------------------
+      # Verify FEX_IOS_HOST reached the compiler
+      # ------------------------------------------------------------
+
+      - name: Verify FEX iOS compiler flags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking compile_commands.json for FEX_IOS_HOST..."
+
+          if [ ! -f "FEX/build-ios/compile_commands.json" ]; then
+            echo "compile_commands.json was not generated."
+            exit 1
+          fi
+
+          if grep -q "FEX_IOS_HOST" FEX/build-ios/compile_commands.json; then
+            echo "[OK] FEX_IOS_HOST is present in compiler commands."
+          else
+            echo "[ERROR] FEX_IOS_HOST is missing from compiler commands."
+            exit 1
+          fi
+
+          echo
+          echo "Example compiler command:"
+          grep -m 1 "FEX_IOS_HOST" \
+            FEX/build-ios/compile_commands.json || true
 
       # ------------------------------------------------------------
       # Build FEX
@@ -299,7 +335,7 @@ jobs:
             --parallel "$(sysctl -n hw.logicalcpu)"
 
       # ------------------------------------------------------------
-      # Show generated FEX libraries
+      # Find generated FEX libraries
       # ------------------------------------------------------------
 
       - name: Find FEX static libraries
@@ -317,7 +353,7 @@ jobs:
           sort
 
       # ------------------------------------------------------------
-      # Mythic dependency build scripts
+      # Mythic dependency scripts
       # ------------------------------------------------------------
 
       - name: Run available Mythic dependency scripts
@@ -477,7 +513,7 @@ jobs:
             clean build
 
       # ------------------------------------------------------------
-      # Verify app bundle
+      # Verify app
       # ------------------------------------------------------------
 
       - name: Verify application
@@ -512,7 +548,7 @@ jobs:
           fi
 
       # ------------------------------------------------------------
-      # Create unsigned IPA
+      # Create IPA
       # ------------------------------------------------------------
 
       - name: Create unsigned IPA
@@ -553,7 +589,7 @@ jobs:
           retention-days: 14
 
       # ------------------------------------------------------------
-      # Diagnostics
+      # Failure diagnostics
       # ------------------------------------------------------------
 
       - name: Upload build diagnostics on failure
@@ -563,6 +599,7 @@ jobs:
           name: Mythic-build-debug
           path: |
             FEX/build-ios/CMakeCache.txt
+            FEX/build-ios/compile_commands.json
             FEX/build-ios/CMakeFiles/CMakeError.log
             FEX/build-ios/CMakeFiles/CMakeOutput.log
             FEX/build-ios/**/*.log

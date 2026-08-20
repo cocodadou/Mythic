@@ -27,19 +27,28 @@ jobs:
           fetch-depth: 1
 
       - name: Show Xcode version
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           xcodebuild -version
+
+          echo
+          echo "iPhoneOS SDK:"
           xcrun --sdk iphoneos --show-sdk-path
+
+          echo
+          echo "Host architecture:"
+          uname -m
 
       # ------------------------------------------------------------
       # Homebrew dependencies
       # ------------------------------------------------------------
 
       - name: Install build dependencies
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           brew install \
             cmake \
@@ -76,8 +85,8 @@ jobs:
       # ------------------------------------------------------------
       # FEX nested submodules
       #
-      # Compatible with macOS Bash 3.2.
-      # rpmalloc is intentionally skipped here.
+      # rpmalloc is skipped because the FEX revision used by Mythic
+      # references an unavailable historical commit.
       # ------------------------------------------------------------
 
       - name: Initialize FEX submodules except rpmalloc
@@ -135,8 +144,14 @@ jobs:
             2>/dev/null || true
 
           rm -rf External/rpmalloc
-          rm -rf .git/modules/External/rpmalloc
 
+          GIT_DIR_PATH="$(git rev-parse --git-dir)"
+
+          rm -rf \
+            "${GIT_DIR_PATH}/modules/External/rpmalloc" \
+            2>/dev/null || true
+
+          echo
           echo "Cloning FEX-Emu/rpmalloc..."
 
           git clone \
@@ -148,12 +163,8 @@ jobs:
           echo "rpmalloc commit:"
           git -C External/rpmalloc rev-parse HEAD
 
-          echo
-          echo "rpmalloc contents:"
-          ls -la External/rpmalloc
-
       # ------------------------------------------------------------
-      # Verify nested repositories
+      # Verify FEX dependencies
       # ------------------------------------------------------------
 
       - name: Verify FEX dependencies
@@ -168,7 +179,9 @@ jobs:
             "FEX/External/xxhash" \
             "FEX/External/rpmalloc" \
             "FEX/External/jemalloc_glibc" \
-            "FEX/External/range-v3"
+            "FEX/External/range-v3" \
+            "FEX/External/SoftFloat-3e" \
+            "FEX/External/cephes"
           do
             if [ -d "$directory" ]; then
               echo "[OK] $directory"
@@ -179,11 +192,52 @@ jobs:
           done
 
           if [ "$FAILED" -ne 0 ]; then
+            echo
+            echo "One or more FEX dependencies are missing."
             exit 1
           fi
 
       # ------------------------------------------------------------
+      # FEX configuration diagnostics
+      # ------------------------------------------------------------
+
+      - name: Show FEX configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "FEX commit:"
+          git -C FEX rev-parse HEAD
+
+          echo
+          echo "CMake version:"
+          cmake --version
+
+          echo
+          echo "Ninja version:"
+          ninja --version
+
+          echo
+          echo "iOS SDK:"
+          xcrun --sdk iphoneos --show-sdk-path
+
+          echo
+          echo "Deployment target:"
+          echo "${IOS_DEPLOYMENT_TARGET}"
+
+          echo
+          echo "Target processor:"
+          echo "arm64"
+
+      # ------------------------------------------------------------
       # FEX
+      #
+      # CMAKE_SYSTEM_PROCESSOR is explicitly required because CMake
+      # leaves it empty for this iOS configuration and this FEX fork
+      # directly reads it during configuration.
+      #
+      # TUNE_CPU=none prevents FEX from attempting Linux-style
+      # host CPU detection using /proc/cpuinfo.
       # ------------------------------------------------------------
 
       - name: Configure FEX for iOS
@@ -193,21 +247,47 @@ jobs:
 
           rm -rf FEX/build-ios
 
+          IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+
           cmake \
             -S FEX \
             -B FEX/build-ios \
             -G Ninja \
             -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+            -DCMAKE_OSX_SYSROOT="${IOS_SDK}" \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DTUNE_CPU=none \
+            -DTUNE_ARCH=generic \
             -DBUILD_TESTING=OFF \
             -DBUILD_FEX_LINUX_TESTS=OFF \
             -DBUILD_FEXCONFIG=OFF \
             -DBUILD_THUNKS=OFF \
+            -DBUILD_STEAM_SUPPORT=OFF \
             -DENABLE_CCACHE=OFF \
-            -DENABLE_LTO=OFF
+            -DENABLE_LTO=OFF \
+            -DENABLE_GDB_SYMBOLS=OFF \
+            -DENABLE_OFFLINE_TELEMETRY=OFF \
+            -DENABLE_VIXL_SIMULATOR=OFF \
+            -DENABLE_VIXL_DISASSEMBLER=OFF \
+            -DENABLE_ZYDIS=OFF
+
+          echo
+          echo "CMake configuration completed."
+
+          echo
+          echo "Relevant CMake values:"
+
+          grep -E \
+            '^(CMAKE_SYSTEM_NAME|CMAKE_SYSTEM_PROCESSOR|CMAKE_OSX_ARCHITECTURES|CMAKE_OSX_SYSROOT|CMAKE_OSX_DEPLOYMENT_TARGET|TUNE_CPU|TUNE_ARCH):' \
+            FEX/build-ios/CMakeCache.txt || true
+
+      # ------------------------------------------------------------
+      # Build FEX
+      # ------------------------------------------------------------
 
       - name: Build FEX
         shell: bash
@@ -228,6 +308,7 @@ jobs:
           set -euo pipefail
 
           echo "Generated FEX libraries:"
+          echo
 
           find FEX/build-ios \
             -type f \
@@ -282,6 +363,7 @@ jobs:
         shell: bash
         run: |
           echo "Libraries under app:"
+          echo
 
           find app \
             -type f \
@@ -291,6 +373,7 @@ jobs:
 
           echo
           echo "Libraries under build:"
+          echo
 
           find build \
             -type f \
@@ -320,7 +403,7 @@ jobs:
             fi
           }
 
-          echo "Checking static libraries..."
+          echo "Checking FEX libraries..."
           echo
 
           check_library "FEX/build-ios/FEXCore/Source/libFEXCore.a"
@@ -330,6 +413,10 @@ jobs:
           check_library "FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a"
           check_library "FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a"
           check_library "FEX/build-ios/FEXCore/Source/libJemallocLibs.a"
+
+          echo
+          echo "Checking Mythic/Wine/DXMT libraries..."
+          echo
 
           check_library "app/Mythic/libwineserver.a"
           check_library "app/Mythic/libntdll_unix.a"
@@ -476,6 +563,8 @@ jobs:
           name: Mythic-build-debug
           path: |
             FEX/build-ios/CMakeCache.txt
+            FEX/build-ios/CMakeFiles/CMakeError.log
+            FEX/build-ios/CMakeFiles/CMakeOutput.log
             FEX/build-ios/**/*.log
             build/**/*.log
             build/**/*.err
